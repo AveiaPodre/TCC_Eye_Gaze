@@ -1,10 +1,13 @@
 """
-Entrada (câmera / arquivo de vídeo), tamanho da tela e controle do mouse.
+Entrada (câmera / arquivo de vídeo / sessão gravada), gravação de sessões,
+tamanho da tela e controle do mouse.
 """
 
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -48,6 +51,110 @@ class FrameSource:
 
     def release(self):
         self.cap.release()
+
+
+class SessionRecorder:
+    """Grava a sessão para reprodução offline: vídeo da câmera (MJPG, pouca
+    perda de detalhe na região dos olhos) + JSON com o timestamp de cada
+    quadro, as teclas pressionadas (com o índice do quadro) e a tela.
+
+    Tamanho: ~2-4 MB/s em 720p. Ver ReplaySource e ``main.py --reproduzir``.
+    """
+
+    def __init__(self, base_path: Path, fps: float, frame_size: tuple[int, int],
+                 screen_size: tuple[int, int], seed: int):
+        self.base = Path(base_path)
+        self.base.parent.mkdir(parents=True, exist_ok=True)
+        self.video_path = self.base.with_suffix(".avi")
+        self.meta_path = self.base.with_suffix(".json")
+        self._writer = cv2.VideoWriter(str(self.video_path), cv2.VideoWriter_fourcc(*"MJPG"),
+                                       float(fps), tuple(int(v) for v in frame_size))
+        if not self._writer.isOpened():
+            raise RuntimeError(f"Não foi possível gravar {self.video_path}")
+        self.meta = {"versao": 1, "tela": list(screen_size), "camera": list(frame_size),
+                     "fps": fps, "semente": int(seed), "timestamps_ms": [], "teclas": []}
+
+    @property
+    def frame_index(self) -> int:
+        """Índice do último quadro gravado."""
+        return len(self.meta["timestamps_ms"]) - 1
+
+    def write(self, frame: np.ndarray, timestamp_ms: int):
+        self._writer.write(frame)
+        self.meta["timestamps_ms"].append(int(timestamp_ms))
+
+    def log_key(self, key: int):
+        self.meta["teclas"].append([self.frame_index, int(key)])
+
+    def close(self):
+        self._writer.release()
+        self.meta_path.write_text(json.dumps(self.meta), encoding="utf-8")
+        print(f"[Gravação] {len(self.meta['timestamps_ms'])} quadros em {self.video_path}")
+
+
+class ReplaySource:
+    """Lê uma sessão gravada por SessionRecorder com os timestamps originais.
+
+    ``now()`` devolve o tempo do quadro atual (s), para usar como relógio do
+    app: a reprodução é determinística e independe da velocidade do PC.
+    ``keys_for_frame(i)`` devolve as teclas pressionadas depois do quadro i.
+    """
+
+    is_file = True
+
+    def __init__(self, meta_path: Path):
+        meta_path = Path(meta_path).with_suffix(".json")
+        self.meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        self.cap = cv2.VideoCapture(str(meta_path.with_suffix(".avi")))
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Não foi possível abrir {meta_path.with_suffix('.avi')}")
+        self._ts = self.meta["timestamps_ms"]
+        self._keys: dict[int, list[int]] = {}
+        for idx, key in self.meta["teclas"]:
+            self._keys.setdefault(int(idx), []).append(int(key))
+        self.frame_index = -1
+
+    @property
+    def screen_size(self) -> tuple[int, int]:
+        return tuple(self.meta["tela"])
+
+    @property
+    def seed(self) -> int:
+        return int(self.meta["semente"])
+
+    @property
+    def resolution(self) -> tuple[int, int]:
+        return tuple(self.meta["camera"])
+
+    def read(self) -> tuple[np.ndarray | None, int]:
+        ok, frame = self.cap.read()
+        if not ok or self.frame_index + 1 >= len(self._ts):
+            return None, 0
+        self.frame_index += 1
+        return frame, self._ts[self.frame_index]
+
+    def now(self) -> float:
+        return self._ts[max(self.frame_index, 0)] / 1000.0
+
+    def keys_for_frame(self, index: int) -> list[int]:
+        return self._keys.get(index, [])
+
+    def release(self):
+        self.cap.release()
+
+
+class NullMouse:
+    """Mouse que não faz nada (reprodução de sessões gravadas)."""
+
+    def __init__(self):
+        self.enabled = False
+        self.available = True
+
+    def move(self, x: float, y: float):
+        pass
+
+    def click(self):
+        pass
 
 
 def detect_screen_size() -> tuple[int, int] | None:

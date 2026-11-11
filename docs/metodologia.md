@@ -273,33 +273,113 @@ dessa coluna não é amplificado.
 
 ### 5.4 Coleta
 
-**Etapa 1, grade 4×4:** margem de 8%, percorrida em zigue-zague. Para cada
-alvo há 0,9 s de acomodação (nada é coletado) e 1,2 s de coleta das
-amostras válidas. Se o rosto sumir, o alvo espera até juntar pelo menos 8
-amostras. Em cada alvo, amostras com escore-Z modificado (MAD) > 3,5 são
-descartadas (Iglewicz e Hoaglin, 1993). A grade passou de 3×3 para 4×4
-porque o eixo vertical, de sinal mais fraco, precisa de mais linhas.
+**Etapa 1, grade 4×4:** margem de 8%, percorrida em **ordem aleatória**.
+Na ordem linha a linha, o tempo andava junto com a posição vertical: nos
+dados reais, a abertura do olho caiu de 0,27 para 0,16 ao longo dos ~35 s
+da grade (cansaço, olho ressecando), e o modelo aprendia essa deriva como
+"olhar para baixo". Com a ordem aleatória, a deriva vira ruído em vez de
+viés.
 
-**Etapa 2, movimento da cabeça (~9 s):** o alvo fica no centro da tela e
-setas pedem que a pessoa gire a cabeça devagar (esquerda, direita, cima,
-baixo, centro, 1,6 s cada) sem tirar o olho do alvo. Ela determina o
-coeficiente de P_cabeça e pesa o equivalente a 1 alvo.
+Para cada alvo, a coleta começa quando o olhar **fixa** no alvo: depois de
+0,6 s de acomodação, espera-se que 6 quadros seguidos fiquem a menos de 0,8°
+da mediana deles (o ruído típico com o olhar parado, medido nas sessões
+reais, é ~0,2°), com limite de 1,8 s. Assim, as primeiras amostras não são
+mais da sacada ou de um olhar "procurando" o alvo (detecção de fixação por
+dispersão, Salvucci e Goldberg, 2000). Seguem 1,2 s de coleta das amostras
+válidas. Se o rosto sumir, o alvo espera até juntar pelo menos 8 amostras.
+Em cada alvo, amostras com escore-Z modificado (MAD) > 3,5 são descartadas
+(Iglewicz e Hoaglin, 1993). A grade passou de 3×3 para 4×4 porque o eixo
+vertical, de sinal mais fraco, precisa de mais linhas.
+
+**Etapa 2, movimento da cabeça (guiada):** o alvo fica no centro da tela e
+uma seta pede que a pessoa gire a cabeça para a direita, a esquerda, para
+cima e para baixo, sem tirar o olho do alvo, e depois volte ao centro. A
+seta enche conforme a cabeça gira (medida em relação à pose média durante a
+grade) e fica verde ao chegar a 80% do ângulo pedido (10° de yaw e 8° de
+pitch). Depois de 0,6 s ali, passa à próxima direção. Quem não alcança o
+ângulo segue depois de 4 s, e quem não pode mover a cabeça só continua
+olhando o ponto. Se a cabeça passar da faixa aproveitada (15° de yaw, 12° de
+pitch), a seta fica vermelha e aparece "girou demais". A etapa determina o
+coeficiente de P_cabeça e pesa o equivalente a 1 alvo. No ajuste entram só
+as amostras dentro dessa faixa: na versão anterior, sem guia, as pessoas
+giravam até 30° (yaw) e 40° (pitch). Nesses ângulos os landmarks do olho
+deixam de ser confiáveis e o erro do modelo na própria etapa chegava a
+~210 px (mediana).
+
+**Repetição de alvos ruins:** depois do ajuste, alvos com erro na validação
+cruzada acima de 2,5× a mediana e acima de 8% da largura da tela (até 3
+alvos) são coletados de novo, uma vez, e o modelo é reajustado. Isso cobre
+piscadas longas, distração ou olhar fora do alvo.
 
 As medidas brutas de cada calibração e validação são gravadas em
-`results/*.npz`. O script `tools/reavaliar.py` reajusta o modelo com
-outras configurações e mede o erro na validação gravada. Assim dá para
-comparar alternativas com os mesmos dados, sem refazer a sessão.
+`results/*.npz`. `tools/benchmark.py` reajusta variantes do modelo em todas
+as sessões gravadas e compara o erro em alvos novos, em poses novas da
+cabeça e na validação. `tools/reavaliar.py` detalha uma sessão. Assim dá
+para comparar alternativas com os mesmos dados, sem refazer as sessões.
 
-### 5.5 Escolha da regularização e erro em pontos novos
+### 5.5 Escolha do modelo e erro em pontos e poses novos
 
-A força do ridge (α ∈ {10⁻⁴, …, 1}) é escolhida por **validação cruzada
-deixando um alvo de fora**: para cada alvo, o modelo é ajustado sem ele e
-o erro é medido nele. A etapa da cabeça fica sempre no treino. O erro
-médio dessa validação aparece na tela de resultado como "erro estimado em
-pontos novos". Ele é mais honesto que o erro de ajuste, que esconde
-sobreajuste.
+A força do ridge (α ∈ {10⁻⁴, …, 1}), o grau dos termos do olho (1 ou 2) e a
+fonte da posição da íris (MediaPipe ou refinada na imagem) são escolhidos por
+validação cruzada com dois tipos de dobra:
 
-### 5.6 Efeito (simulação)
+- **alvos**: cada alvo da grade fica fora do ajuste por vez, e o erro é a
+  distância da mediana das previsões a ele (pontos novos, cabeça parada);
+- **direções da cabeça**: as amostras da etapa da cabeça são separadas pela
+  direção dominante do desvio de pose (direita, esquerda, cima, baixo).
+  Cada direção fica fora por vez, e o erro é a mediana das distâncias de suas
+  amostras ao alvo central (poses novas da cabeça). Amostras a menos de 2°
+  da pose da grade ficam sempre no treino.
+
+O critério é a média simples dos dois erros. A escolha só pelo erro dos
+alvos ignorava o problema principal com usuários reais, a invariância à
+cabeça, porque durante a grade a cabeça fica quase parada. Os dois erros
+aparecem na tela de resultado ("erro estimado em pontos novos" e "com a
+cabeça em poses novas"), junto com uma classificação da qualidade (boa até
+4,5% da largura da tela, razoável até 8%, ruim acima disso). Eles são mais
+honestos que o erro de ajuste, que esconde sobreajuste.
+
+### 5.6 Análise das sessões reais
+
+Quatro sessões de calibração (duas com validação) foram reanalisadas
+offline antes da versão atual. Resultados principais:
+
+- **A acurácia era ruim, a precisão não.** Na validação, o erro médio ficava
+  em 180–235 px, mas a dispersão das estimativas era de ~33 px. O problema
+  era viés do modelo, não tremor.
+- **A íris do MediaPipe se move muito pouco.** A tela inteira corresponde
+  a uma variação de só ~0,09 na posição horizontal da íris (em larguras de
+  olho). Uma mudança de 0,009, causada por 2–3° de giro de cabeça ou por
+  deriva dos landmarks, já desloca o cursor 150–180 px.
+- **Girar a cabeça mexe na medida do olho.** Com o olhar parado, 1° de giro
+  de cabeça mudou a medida horizontal da íris 2× mais que 1° de movimento
+  do olho (5× no estimador anterior, que usava o z da íris). Inclinar a
+  cabeça para cima também altera a abertura medida das pálpebras. Por isso
+  a compensação de cabeça precisa ser aprendida na faixa em que a cabeça de
+  fato se move.
+- **A postura muda entre calibrar e usar.** Entre a calibração e a validação,
+  a pessoa girou ~3° e deslocou o rosto 2–3 cm. Numa sessão, 220 dos 236 px
+  de erro eram um deslocamento constante que a recentralização corrige.
+
+Comparação no benchmark (erro médio em px, mesmas sessões):
+
+| Variante | Alvos novos (LOO) | Poses novas da cabeça | Validação |
+|---|---|---|---|
+| Faixa 15°/12° (padrão) | 111 | 376 | 183 |
+| Sem filtro de faixa | 250 | 351 | 213 |
+| Sem etapa da cabeça | 92 | 1010 | 281 |
+
+O erro em poses novas continua alto nessas sessões porque as etapas da
+cabeça foram gravadas sem guia, com giros extremos. Uma das duas validações
+favoreceu o grau 1 e a outra o grau 2, por isso a escolha é feita por
+sessão pela validação cruzada. Sessões novas, com o protocolo guiado, devem
+ser comparadas no benchmark para confirmar essas escolhas.
+
+Para referência: a ~35 cm de um monitor de 34,5 cm de largura (1920 px),
+1° de ângulo visual ≈ 34 px. 100 px ≈ 3°, próximo do que se obtém com
+rastreadores por webcam baseados em landmarks.
+
+### 5.7 Efeito (simulação)
 
 O usuário sintético dos testes reproduz o que foi observado na webcam:
 
@@ -338,11 +418,18 @@ para graus de ângulo visual:
 
 Graus permitem comparar com a literatura e entre telas diferentes.
 
-Cada validação gera dois arquivos em `results/`:
+Também são reportados o **deslocamento médio** (erro constante, igual em
+todos os alvos) e a **acurácia sem ele**. A diferença entre as duas mostra
+quanto do erro a recentralização (seção 7) corrigiria. Nas sessões reais,
+foi a maior parte.
+
+Cada validação gera três arquivos em `results/`:
 
 - `validacao_<data>.csv`: uma linha por amostra (alvo, estimativa, ângulos,
   erro);
-- `validacao_<data>.json`: resumo com as métricas por alvo.
+- `validacao_<data>.json`: resumo com as métricas por alvo e o resumo do
+  modelo usado (fonte da íris, grau, erros da validação cruzada);
+- `validacao_<data>.npz`: medidas brutas e landmarks, para reanálise.
 
 ## 7. Recentralização (`RecenterProcedure`)
 
@@ -351,7 +438,28 @@ pequenos deslocamentos sistemáticos: erro na distância estimada pelo
 MediaPipe, mudança grande de postura, óculos que escorregam. A
 recentralização mostra só o alvo central, mede o deslocamento entre a
 estimativa e o centro e o soma como um *offset* à saída do modelo, sem
-refazer a calibração.
+refazer a calibração. A postura em que se recentralizou passa a ser a
+referência do aviso de postura.
+
+### 7.1 Aviso de postura
+
+O modelo guarda a pose média da cabeça e a posição do rosto durante a
+calibração, além da faixa de giro coberta pela etapa da cabeça. Durante o
+uso, se a cabeça passar mais de 4° além dessa faixa ou o rosto se deslocar
+mais de 4 cm, por mais de 1,5 s seguidos, o HUD mostra "Postura fora da
+calibração: R para recentralizar". Movimentos rápidos não disparam o aviso.
+
+### 7.2 Correção por alvos conhecidos
+
+Quando a interface sabe para onde o usuário estava olhando (por exemplo, o
+centro de uma tecla do teclado virtual que ele acabou de selecionar),
+`EyeGazeApp.confirm_target(alvo)` usa as amostras dos últimos ~0,5 s para
+corrigir o offset. O offset anda 30% do caminho até o erro medido, com
+limite de 80 px por correção. Uma seleção errada desloca pouco o cursor, e
+seleções corretas seguidas eliminam a deriva aos poucos (recalibração
+implícita). Essa função é a base para o teclado virtual. Com o mouse do
+sistema operacional, o app não sabe onde estão os botões e não pode
+usá-la.
 
 ## 8. Controle do mouse e dwell-click (`io_devices.py`, `app.py`)
 
@@ -384,7 +492,22 @@ Cada camada é ligada e desligada por uma tecla, durante a execução:
 As camadas geométricas são desenhadas no frame original e só depois
 espelhadas (tecla `F`), para que textos e minimapa não fiquem invertidos.
 
-## 10. Verificação (`tests/`)
+## 10. Gravação e reprodução de sessões (`io_devices.py`)
+
+`python main.py --gravar` grava o vídeo da câmera (MJPG, ~2–4 MB/s em 720p,
+para preservar o detalhe da região dos olhos) e um JSON com o timestamp de
+cada quadro, as teclas pressionadas (com o índice do quadro), a resolução
+da tela e a semente da ordem aleatória dos alvos.
+`python main.py --reproduzir results/sessao_X.json` roda o aplicativo
+inteiro sobre o vídeo, usando os timestamps gravados como relógio e
+reaplicando as teclas nos mesmos quadros. A sessão (calibração, validação e
+recentralização) é refeita de forma determinística com o código atual, e os
+resultados vão para `results/reproducoes/`, sem tocar na calibração salva.
+Isso permite avaliar mudanças no estimador do olhar (por exemplo, o
+refinamento da íris na imagem) com dados reais, coisa que as medidas
+gravadas em `.npz` não permitem.
+
+## 11. Verificação (`tests/`)
 
 Os testes usam um rosto 3D sintético, com pose da cabeça e direção do olhar
 conhecidas, projetado no mesmo formato de saída do MediaPipe. Eles verificam:
@@ -401,7 +524,14 @@ conhecidas, projetado no mesmo formato de saída do MediaPipe. Eles verificam:
   de 53×30 cm a 60 cm;
 - o fluxo completo do aplicativo com um "usuário simulado" que olha para os
   alvos exibidos, segue as setas da etapa da cabeça e depois usa o cursor
-  com a cabeça girada e deslocada (erro < 70 px, tremor < 4 px/frame).
+  com a cabeça girada e deslocada (erro < 80 px, tremor < 4 px/frame);
+- o protocolo de coleta (`tests/test_procedures.py`): ordem aleatória, coleta
+  só depois da fixação (e no tempo limite se o olhar não estabiliza), etapa
+  da cabeça para quem não move a cabeça e para quem gira demais, repetição
+  de um alvo em que o usuário se distraiu, aviso de postura (sem disparar em
+  giros rápidos) e correção por alvos conhecidos;
+- gravação e reprodução de uma sessão com a mesma ordem de alvos e o mesmo
+  resultado (`tests/test_recording.py`).
 
 Esses testes validam a matemática e o software. A acurácia real depende da
 câmera, da iluminação e do usuário, e deve ser medida com o procedimento de

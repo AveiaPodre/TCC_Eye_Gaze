@@ -42,6 +42,8 @@ python main.py --camera 1           # outra webcam
 python main.py --video sessao.mp4   # roda sobre um vídeo gravado
 python main.py --screen 1920x1080   # se a resolução não for detectada
 python main.py --screen-width-cm 53 --distance-cm 60   # erro em graus na validação
+python main.py --gravar             # grava vídeo + teclas (results/sessao_*.avi/.json)
+python main.py --reproduzir results/sessao_X.json --sem-janela   # refaz a sessão offline
 python main.py --help
 ```
 
@@ -49,26 +51,49 @@ Fluxo recomendado:
 
 1. Sente-se como vai usar o computador, com o rosto bem iluminado e de frente
    para a câmera.
-2. Pressione **ESPAÇO** e olhe para cada um dos 16 alvos. O círculo laranja
-   encolhe enquanto o olho chega ao alvo; o ponto verde com o anel de
-   progresso indica que a coleta está em andamento.
-3. **Etapa da cabeça (~9 s):** um ponto verde fica no centro. Sem tirar os
-   olhos dele, gire a cabeça devagar na direção das setas (esquerda, direita,
-   cima, baixo, centro), só o quanto for confortável. É essa etapa que ensina
-   ao modelo quanto do movimento vem dos olhos e quanto vem da cabeça. Quem
-   não consegue mover a cabeça pode só continuar olhando o ponto; o modelo
-   então usa parâmetros padrão para o olho.
-4. A tela de resultado mostra o erro em cada alvo, o erro durante a etapa da
-   cabeça e o erro estimado em pontos novos (validação cruzada deixando um
-   alvo de fora).
-5. Pressione **T** para validar: 9 alvos novos, que não entram na
+2. Pressione **ESPAÇO** e olhe para cada um dos 16 alvos, que aparecem em
+   ordem aleatória. O círculo laranja encolhe enquanto o olho chega ao alvo.
+   A coleta (ponto verde com anel de progresso) só começa quando o olhar
+   estabiliza no alvo.
+3. **Etapa da cabeça (~10 s):** um ponto verde fica no centro. Sem tirar os
+   olhos dele, gire a cabeça na direção da seta (direita, esquerda, cima,
+   baixo) até a seta ficar **verde** (~10° para os lados, ~8° para cima e
+   para baixo) e depois volte ao centro. Não precisa girar mais que isso:
+   se a seta ficar vermelha, você girou demais. É essa etapa que ensina ao
+   modelo quanto do movimento vem dos olhos e quanto vem da cabeça. Quem não
+   consegue mover a cabeça pode só continuar olhando o ponto (cada direção
+   avança sozinha em 4 s).
+4. Alvos com erro muito alto (piscada longa, distração) são repetidos
+   automaticamente, uma vez.
+5. A tela de resultado mostra o erro em cada alvo, o erro estimado em pontos
+   novos e em poses novas da cabeça (validação cruzada) e uma classificação
+   da qualidade (boa / razoável / ruim).
+6. Pressione **T** para validar: 9 alvos novos, que não entram na
    calibração, medem a acurácia e a precisão. O resultado vai para
-   `results/`.
-6. Pressione **M** para ligar o mouse e **D** para ligar o clique por
+   `results/` e mostra também quanto do erro é um desvio constante, que o
+   **R** corrige.
+7. Pressione **M** para ligar o mouse e **D** para ligar o clique por
    permanência (*dwell-click*).
-7. Se o cursor ficar sistematicamente deslocado (por exemplo, depois de
-   uma mudança grande de postura), pressione **R** e olhe para o centro
+8. Se o HUD mostrar **"Postura fora da calibração"** (você se mexeu ou
+   girou a cabeça além do que foi calibrado) ou o cursor ficar
+   sistematicamente deslocado, pressione **R** e olhe para o centro
    (recentralização de 1 ponto).
+
+### Coletando dados para melhorar o modelo
+
+Para cada sessão de teste, use `python main.py --gravar`, calibre (ESPAÇO),
+valide (T) e saia (Q). Depois:
+
+```bash
+python tools/benchmark.py            # compara variantes do modelo em todas as sessões
+python main.py --reproduzir results/sessao_X.json --sem-janela   # refaz com o código atual
+python tools/benchmark.py --results results/reproducoes/sessao_X
+```
+
+O benchmark mede o erro em alvos novos, em poses novas da cabeça e na
+validação de cada sessão, com o código atual. A reprodução refaz a sessão
+inteira a partir do vídeo, o que permite testar mudanças no estimador do
+olhar (ex.: `TrackerConfig.refine_iris`) com dados reais.
 
 A calibração é salva em `models/calibration.json` e recarregada
 automaticamente. Ela é descartada se a resolução da tela mudar.
@@ -101,6 +126,7 @@ valores iniciais de cada visualização ficam em `DisplayConfig`
 - Se o rosto não for detectado num frame, o cursor fica parado. Depois de
   0,5 s sem rosto o HUD mostra "PAUSADO" e os filtros são reiniciados.
 - Durante piscadas (os dois olhos fechados) o cursor mantém a última posição.
+- Com `--reproduzir`, o mouse nunca é movido.
 
 ## Como funciona (resumo)
 
@@ -110,7 +136,9 @@ webcam -> FaceLandmarker (478 landmarks + matriz de pose)
        -> íris (u, v) e pálpebras (lid_v, abertura) no referencial da cabeça
        -> calibração: ponto para onde a face aponta (E + E_z·tan(cabeça))
                       + medidas do olho escaladas pela distância
-                      -> regressão ridge (validação cruzada) -> (x, y) em pixels
+                      -> regressão ridge (validação cruzada em alvos e em
+                         direções da cabeça) -> (x, y) em pixels
+       -> aviso de postura fora da calibração (R recentraliza)
        -> estabilizador de fixação (cursor parado na fixação, salta na sacada)
        -> mouse + dwell-click
 ```
@@ -132,16 +160,19 @@ eyegaze/
   calibration.py           # regressão: geometria da cabeça + medidas do olho/pálpebras -> pixel
   procedures.py            # calibração (com etapa da cabeça), validação e recentralização
   visualization.py         # landmarks, olhar, pose, minimapa, HUD, ajuda
-  io_devices.py            # câmera/vídeo, resolução da tela, mouse (pynput), dwell-click
+  io_devices.py            # câmera/vídeo, gravação/reprodução de sessões, tela, mouse, dwell-click
   app.py                   # loop principal e teclas
 tests/
   synthetic.py             # rosto 3D sintético (testes sem câmera)
   test_pipeline.py         # geometria, pose, olhar, calibração, invariância à cabeça, tremor
   test_app.py              # ponta a ponta com "usuário simulado"
+  test_procedures.py       # protocolo de coleta, repetição de alvos, aviso de postura
+  test_recording.py        # gravação e reprodução de sessões
 docs/metodologia.md        # método detalhado (base para o texto do TCC)
 models/                    # face_landmarker.task e calibration.json (gerados)
-results/                   # validações (CSV/JSON) e medidas brutas (.npz) das sessões
-tools/reavaliar.py         # reajusta o modelo offline com os .npz e compara variantes
+results/                   # validações (CSV/JSON), medidas brutas (.npz) e sessões gravadas
+tools/benchmark.py         # compara variantes do modelo em TODAS as sessões gravadas
+tools/reavaliar.py         # detalha uma sessão (sinal de cada medida, erro por alvo)
 ```
 
 ## Testes
@@ -163,7 +194,11 @@ pose e olhar conhecidos e conferem:
 - que o estabilizador elimina o tremor na fixação sem atrasar as sacadas;
 - que a calibração generaliza para pontos fora da grade;
 - o fluxo completo do app: calibrar, validar, recentralizar, mouse,
-  dwell-click, perda de rosto e todas as teclas de visualização.
+  dwell-click, perda de rosto e todas as teclas de visualização;
+- o protocolo de coleta: ordem aleatória, espera pela fixação, etapa da
+  cabeça para quem não move a cabeça e para quem gira demais, repetição de
+  alvos ruins, aviso de postura e correção por alvos conhecidos;
+- que uma sessão gravada é reproduzida com a mesma ordem de alvos.
 
 ## Ajustes comuns (`eyegaze/config.py`)
 
@@ -175,7 +210,10 @@ pose e olhar conhecidos e conferem:
 | Cursor desloca quando gira a cabeça | refazer a calibração caprichando na etapa da cabeça (ver o erro com a cabeça em movimento na tela de resultado) |
 | Cliques acidentais | aumentar `DwellClickConfig.dwell_time_s` ou diminuir `tolerance_px` |
 | Piscadas não detectadas / falsas | ajustar `GazeConfig.blink_ratio` |
-| Pular a etapa da cabeça | `CalibrationConfig.head_motion_step_s = 0` |
+| Pular a etapa da cabeça | `CalibrationConfig.head_stage = False` |
+| Etapa da cabeça pede giro demais/de menos | `CalibrationConfig.head_target_deg` (padrão 10°, 8°) |
+| Coleta demora a começar em cada alvo | aumentar `CalibrationConfig.fixation_max_deg` ou diminuir `settle_max_s` |
+| Aviso de postura aparece demais | aumentar `PostureConfig.angle_tol_deg` / `pos_tol_cm` |
 | Alvos muito perto da borda | aumentar `CalibrationConfig.margin_ratio` |
 | Webcam errada | `--camera N` |
 
@@ -187,9 +225,11 @@ que está sendo removido.
 ## Limitações conhecidas
 
 - **Posturas extremas.** A compensação de cabeça é aprendida dentro da
-  faixa de movimento feita na etapa da cabeça. Posturas muito além dela
-  (girar a cabeça 40°, por exemplo) extrapolam o modelo. Faça a etapa da
-  cabeça cobrindo as posições que a pessoa realmente usa.
+  faixa de movimento feita na etapa da cabeça (até ~15°/12°). Posturas
+  muito além dela (girar a cabeça 40°, por exemplo) extrapolam o modelo, e
+  nesses ângulos os landmarks do olho também deixam de ser confiáveis. O
+  HUD avisa quando a postura sai da faixa calibrada; nesse caso, volte à
+  postura ou recentralize (R).
 - **Posição 3D do rosto.** A distância à câmera vem da estimativa métrica do
   MediaPipe, que assume um campo de visão padrão para a câmera. Webcams com
   lente muito diferente geram um pequeno erro de escala. A calibração
@@ -211,9 +251,9 @@ que está sendo removido.
 2. Perfis por usuário (um `calibration.json` por pessoa).
 3. Modos de clique alternativos: piscada longa voluntária ou acionador
    externo.
-4. Recalibração contínua: usar os cliques confirmados (o usuário olhou para
-   onde clicou) como novas amostras de calibração.
+4. Teclado virtual com teclas grandes, usando `EyeGazeApp.confirm_target`
+   (já implementado) a cada tecla selecionada: o centro da tecla é um alvo
+   conhecido, e o offset é corrigido continuamente. Com o mouse do sistema
+   isso não é possível, porque o app não sabe onde estão os botões.
 5. Teste com usuários: aplicar o protocolo de validação (`T`) em várias
    pessoas e condições de luz e reportar acurácia e precisão em graus.
-#   T C C _ E y e _ G a z e  
- 

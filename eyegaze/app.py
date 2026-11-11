@@ -12,6 +12,7 @@ deste mesmo loop (procedures.py), então o rastreamento nunca para.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from collections import deque
 
@@ -36,8 +37,13 @@ GRAY = (200, 200, 200)
 class EyeGazeApp:
     def __init__(self, cfg: AppConfig, tracker, source, screen_size: tuple[int, int],
                  mouse: MouseController | None = None, headless: bool = False,
-                 clock=time.monotonic):
+                 clock=time.monotonic, recorder=None):
         self.cfg = cfg
+        # Gravação da sessão (io_devices.SessionRecorder) ou reprodução de
+        # uma sessão gravada (source com keys_for_frame: as teclas gravadas
+        # são reaplicadas nos mesmos quadros).
+        self.recorder = recorder
+        self._calib_count = 0
         self.clock = clock  # injetável para testes
         self.tracker = tracker
         self.source = source
@@ -87,6 +93,11 @@ class EyeGazeApp:
         self.last_target_view: np.ndarray | None = None
         self._target_window_open = False
         self._last_mouse: np.ndarray | None = None
+        # Amostras recentes (vetor bruto) para correções por alvo conhecido.
+        self.recent_raw: deque = deque(maxlen=cfg.adapt.window_frames)
+        # Aviso de postura fora da calibração.
+        self.posture_off = False
+        self._posture_off_since: float | None = None
 
     # ------------------------------------------------------------ helpers
     def toast(self, message: str, seconds: float = 1.6):
@@ -109,6 +120,34 @@ class EyeGazeApp:
         # Permite sair um pouco da tela antes de estabilizar (não "gruda" na borda).
         return np.array([np.clip(p[0], -0.1 * w, 1.1 * w), np.clip(p[1], -0.1 * h, 1.1 * h)])
 
+    def _update_posture(self, sample: GazeSample, now: float):
+        """Liga ``posture_off`` quando a postura fica fora da faixa calibrada
+        por mais de ``sustain_s`` (um movimento rápido não dispara o aviso)."""
+        if not self.calibrated:
+            self.posture_off, self._posture_off_since = False, None
+            return
+        pc = self.cfg.posture
+        dev = self.model.posture_deviation(sample.raw)
+        off = bool(np.max(dev["ang"]) > pc.angle_tol_deg or dev["pos_cm"] > pc.pos_tol_cm)
+        if not off:
+            self.posture_off, self._posture_off_since = False, None
+        elif self._posture_off_since is None:
+            self._posture_off_since = now
+        elif now - self._posture_off_since >= pc.sustain_s:
+            self.posture_off = True
+
+    def confirm_target(self, target) -> np.ndarray | None:
+        """Informa que o usuário acabou de selecionar algo com centro
+        conhecido (ex.: uma tecla do teclado virtual). Corrige a deriva do
+        offset com as amostras recentes. Devolve a correção aplicada (px)."""
+        if not self.calibrated or len(self.recent_raw) < 3:
+            return None
+        a = self.cfg.adapt
+        step = self.model.correct_with_known_target(np.array(self.recent_raw), target,
+                                                    a.gain, a.max_step_px)
+        self.recent_raw.clear()
+        return step
+
     # --------------------------------------------------------- pipeline
     def process_frame(self, frame: np.ndarray, timestamp_ms: int, now: float):
         if self._last_frame_time is not None:
@@ -124,6 +163,8 @@ class EyeGazeApp:
         face_recent = now - self.last_face_time <= self.cfg.mouse.face_lost_timeout_s
 
         if self.sample is not None and self.sample.valid:
+            self.recent_raw.append(self.sample.raw)
+            self._update_posture(self.sample, now)
             self.features_filtered = self.filter(self.sample.features(), now)
             self.screen_point_raw = self._map_to_screen(self.sample, self.features_filtered)
             w, h = self.screen_size
@@ -134,6 +175,7 @@ class EyeGazeApp:
             # Rosto perdido: zera os filtros para não "puxar" a posição antiga.
             self.filter.reset()
             self.stabilizer.reset()
+            self.recent_raw.clear()
             self.features_filtered = None
             self.screen_point_raw = None
             self.screen_point = None
@@ -162,7 +204,13 @@ class EyeGazeApp:
 
     # ----------------------------------------------------- procedimentos
     def start_calibration(self):
-        self.procedure = CalibrationProcedure(self.screen_size, self.cfg.calibration)
+        cc = self.cfg.calibration
+        if cc.random_seed is not None:
+            # Semente fixa (gravação/reprodução): ordem diferente a cada
+            # calibração da sessão, mas reproduzível.
+            cc = dataclasses.replace(cc, random_seed=cc.random_seed + self._calib_count)
+        self._calib_count += 1
+        self.procedure = CalibrationProcedure(self.screen_size, cc)
         self.toast("Calibracao iniciada")
 
     def start_validation(self):
@@ -189,8 +237,10 @@ class EyeGazeApp:
             self.model.save(self.cfg.calibration.save_path)
             self.toast("Calibracao salva")
         elif isinstance(proc, RecenterProcedure) and proc.succeeded:
+            # A postura nova passa a ser a referência do aviso.
             self.model.save(self.cfg.calibration.save_path)
             self.toast("Recentralizado")
+        self.posture_off, self._posture_off_since = False, None
 
     def cancel_procedure(self):
         if self.procedure is not None:
@@ -286,6 +336,8 @@ class EyeGazeApp:
             lines.append(("Mouse: OFF (M)", GRAY))
         lines.append((f"Dwell-click: {'ON' if self.dwell_enabled else 'OFF'} (D)",
                       GREEN if self.dwell_enabled else GRAY))
+        if self.posture_off:
+            lines.append(("Postura fora da calibracao: R para recentralizar", YELLOW))
         if self.show_gaze and self.features_filtered is not None:
             yaw, pitch = self.features_filtered
             lines.append((f"Olhar  yaw {yaw:+5.1f}  pitch {pitch:+5.1f} graus", YELLOW))
@@ -335,6 +387,8 @@ class EyeGazeApp:
         frame, ts = self.source.read()
         if frame is None:
             return False
+        if self.recorder is not None:
+            self.recorder.write(frame, ts)
         now = self.clock()
         self.process_frame(frame, ts, now)
 
@@ -342,18 +396,29 @@ class EyeGazeApp:
         if self.procedure is not None:
             self.last_target_view = self.procedure.render(now)
 
-        if self.headless:
-            return True
+        keys = []
+        if not self.headless:
+            cv2.imshow(self.cfg.display.window_name, self.last_camera_view)
+            if self.last_target_view is not None:
+                self._open_target_window()
+                cv2.imshow(self.cfg.display.target_window_name, self.last_target_view)
+            key = cv2.waitKey(1)
+            if key != -1 and (key & 0xFF) != 255:
+                keys.append(key & 0xFF)
+        if hasattr(self.source, "keys_for_frame"):
+            keys.extend(self.source.keys_for_frame(self.source.frame_index))
+        return all(self.press(key) for key in keys)
 
-        cv2.imshow(self.cfg.display.window_name, self.last_camera_view)
-        if self.last_target_view is not None:
-            self._open_target_window()
-            cv2.imshow(self.cfg.display.target_window_name, self.last_target_view)
-        key = cv2.waitKey(1)
-        return self.handle_key(key if key == -1 else key & 0xFF)
+    def press(self, key: int) -> bool:
+        """Tecla do usuário: grava (se houver gravação) e executa.
+        Devolve False para encerrar a aplicação."""
+        if self.recorder is not None:
+            self.recorder.log_key(key)
+        return self.handle_key(key)
 
     def run(self):
-        cv2.namedWindow(self.cfg.display.window_name, cv2.WINDOW_NORMAL)
+        if not self.headless:
+            cv2.namedWindow(self.cfg.display.window_name, cv2.WINDOW_NORMAL)
         print("Pronto. ESPACO = calibrar | H = ajuda | Q = sair")
         try:
             while self.step():
@@ -361,4 +426,7 @@ class EyeGazeApp:
         finally:
             self.source.release()
             self.tracker.close()
-            cv2.destroyAllWindows()
+            if self.recorder is not None:
+                self.recorder.close()
+            if not self.headless:
+                cv2.destroyAllWindows()

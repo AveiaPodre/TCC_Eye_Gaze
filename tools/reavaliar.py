@@ -129,27 +129,32 @@ def main(argv=None) -> int:
         for src in (("mediapipe", "refinada") if has_refined else ("mediapipe",)):
             signal_report(data, src)
 
+    # "grau até 2": os graus 1 e 2 são testados e fica o de menor erro na
+    # validação cruzada (alvos + direções da cabeça), como no app.
     variants = [
-        ("grau 2, com etapa da cabeça", dict(degree=2), data),
-        ("grau 1, com etapa da cabeça", dict(degree=1), data),
-        ("grau 2, sem etapa da cabeça", dict(degree=2), CalibrationData(grid=data.grid)),
+        ("grau até 2, com etapa da cabeça", dict(degree=2), data),
+        ("grau 1 fixo, com etapa da cabeça", dict(degree=1), data),
+        ("grau até 2, sem etapa da cabeça", dict(degree=2), CalibrationData(grid=data.grid)),
     ]
-    print(f"\n{'modelo':32s} {'fonte':>10s} {'ajuste':>7s} {'LOO':>6s} {'validação':>10s}"
-          "  (erro médio, px)")
+    print(f"\n{'modelo':34s} {'fonte':>10s} {'grau':>4s} {'ajuste':>7s} {'LOO':>6s} "
+          f"{'cabeça':>7s} {'validação':>10s}  (erro médio, px)")
     for name, kw, d in variants:
         model, results, stats = fit_from_samples(d, screen, kw["degree"], None, args.mad)
         fit_err = np.mean([r.error_px for r in results])
         loo = stats.get("erro_loo_medio_px", float("nan"))
+        head = stats.get("erro_cv_cabeca_px", float("nan"))
         val = validation_error(model, valid, args.mad)[0] if valid else float("nan")
-        print(f"{name:32s} {model.eye_source:>10s} {fit_err:7.0f} {loo:6.0f} {val:10.0f}")
-        others = [(k, v) for k, v in stats.items() if k.startswith("erro_loo_") and k != "erro_loo_medio_px"
-                  and k != "erro_loo_por_alvo_px"]
-        if len(others) > 1:
-            print("      LOO por fonte: " + ", ".join(f"{k[9:-3]} {v:.0f}" for k, v in others))
+        print(f"{name:34s} {model.eye_source:>10s} {model.degree:4d} {fit_err:7.0f} {loo:6.0f} "
+              f"{head:7.0f} {val:10.0f}")
+        if len(stats.get("candidatos", [])) > 1:
+            print("      candidatos: " + ", ".join(
+                f"{c['fonte']}/grau {c['grau']}: LOO {c['erro_loo_px']:.0f}"
+                + (f", cabeça {c['erro_cv_cabeca_px']:.0f}" if c["erro_cv_cabeca_px"] else "")
+                for c in stats["candidatos"] if c["erro_loo_px"] is not None))
 
     if valid:
         model, *_ = fit_from_samples(data, screen, 2, None, args.mad)
-        print("\nValidação por alvo (grau 2, com cabeça):")
+        print(f"\nValidação por alvo (modelo padrão: grau {model.degree}, com etapa da cabeça):")
         for t, pred, e in validation_error(model, valid, args.mad)[1]:
             print(f"  alvo ({t[0]:5.0f}, {t[1]:5.0f}) -> ({pred[0]:5.0f}, {pred[1]:5.0f})  "
                   f"erro {e:4.0f} px")

@@ -176,7 +176,10 @@ def _fit(data, **kw):
 def test_calibration_generalizes_to_unseen_points():
     user = SimUser(1)
     model, results, _ = _fit(user.calibration_data())
-    assert max(r.error_px for r in results) < 30
+    # O critério de escolha também pesa o erro com a cabeça em poses novas,
+    # então aceita um ajuste um pouco pior nos próprios alvos (~31 px) em
+    # troca de ~16% menos erro com a cabeça girada.
+    assert max(r.error_px for r in results) < 35
     assert user.mean_error(model) < 25
 
 

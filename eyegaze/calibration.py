@@ -32,6 +32,21 @@ do erro de ajuste, que esconde sobreajuste.
 A etapa em que a pessoa mantém o olhar no centro e gira a cabeça é o que
 determina o coeficiente de P_cabeça. Sem ela, o modelo continua funcionando
 com a cabeça parada.
+
+Versão 4 (robustez com dados reais). A análise das sessões gravadas mostrou:
+
+* Na etapa da cabeça as pessoas giravam até ±30° (yaw) e 40° (pitch). Nesses
+  ângulos os landmarks da íris e das pálpebras deixam de ser confiáveis e o
+  modelo linear não consegue ajustá-los (erro mediano ~210 px na própria
+  etapa). Como cada alvo e a etapa inteira pesam o mesmo, esses pontos
+  distorciam os coeficientes justamente na faixa pequena (2-8°) que ocorre
+  no uso. Agora só entram amostras dentro de uma faixa útil em torno da pose
+  média da grade (``head_max_deg``).
+* Escolher o modelo só pelo LOO dos alvos ignora o problema principal, a
+  invariância à cabeça: na grade a cabeça fica quase parada. A etapa da
+  cabeça é dividida em 4 direções (direita, esquerda, cima, baixo) e cada
+  uma é deixada de fora por vez (validação cruzada da cabeça). A escolha de
+  ridge, grau e fonte da íris minimiza a média dos dois erros.
 """
 
 from __future__ import annotations
@@ -57,8 +72,34 @@ ALPHAS = (1e-4, 1e-3, 1e-2, 0.1, 1.0)   # candidatos de ridge (features padroniz
 HEAD_STD_FLOOR_CM = 1.0
 EYE_STD_FLOOR = 1e-3
 
+# Grupos especiais na validação cruzada (``groups`` em CalibrationModel.fit):
+# >= 0 é o índice do alvo; ALWAYS_TRAIN entra sempre no treino; as direções
+# da etapa da cabeça são HEAD_GROUP_BASE - k (k = 0..3, ver head_direction).
+ALWAYS_TRAIN = -1
+HEAD_GROUP_BASE = -2
+HEAD_DIRECTIONS = ("direita", "esquerda", "cima", "baixo")
+HEAD_STILL_DEG = 2.0       # desvio abaixo disto não é "pose nova" (sempre no treino)
+MIN_HEAD_FOLD = 5          # amostras mínimas para uma direção virar dobra da validação
+
 
 # ------------------------------------------------------------------ geometria
+def head_angles(raw: np.ndarray) -> np.ndarray:
+    """(n, 2) yaw e pitch da cabeça em graus (mesma convenção de HeadPose.euler_deg)."""
+    raw = np.atleast_2d(raw)
+    fwd = -raw[:, :9].reshape(-1, 3, 3)[:, :, 2]
+    yaw = np.degrees(np.arctan2(-fwd[:, 0], -fwd[:, 2]))
+    pitch = np.degrees(np.arctan2(-fwd[:, 1], np.hypot(fwd[:, 0], fwd[:, 2])))
+    return np.column_stack([yaw, pitch])
+
+
+def head_direction(delta: np.ndarray) -> np.ndarray:
+    """Direção dominante de cada desvio de pose (n, 2) -> índice em HEAD_DIRECTIONS."""
+    delta = np.atleast_2d(delta)
+    horiz = np.abs(delta[:, 0]) >= np.abs(delta[:, 1])
+    return np.where(horiz, np.where(delta[:, 0] > 0, 0, 1),
+                    np.where(delta[:, 1] > 0, 2, 3))
+
+
 def head_screen_point(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Ponto para onde a face aponta no plano z = 0 da câmera (cm) e as
     tangentes (tan yaw, tan pitch) da direção da face.
@@ -138,7 +179,7 @@ def reject_outliers(samples: np.ndarray, threshold: float) -> np.ndarray:
 
 def build_grid(screen_w: int, screen_h: int, cols: int, rows: int,
                margin_ratio: float) -> list[tuple[float, float]]:
-    """Alvos de calibração em pixels, percorridos em zigue-zague."""
+    """Alvos de calibração em pixels, em zigue-zague (a calibração sorteia a ordem de visita)."""
     xs = np.linspace(margin_ratio, 1 - margin_ratio, cols) * screen_w
     ys = np.linspace(margin_ratio, 1 - margin_ratio, rows) * screen_h
     points = []
@@ -183,6 +224,15 @@ def _ridge_predict(X, coef, mean, std):
     return coef[0] + ((X - mean) / std) @ coef[1:]
 
 
+def cv_score(target_errs: list[float], head_errs: list[float]) -> float:
+    """Erro em pontos novos e, se houver etapa da cabeça, em poses novas
+    (média simples dos dois: os dois tipos de erro importam no uso)."""
+    if not target_errs:
+        return float("inf")
+    loo = float(np.mean(target_errs))
+    return loo if not head_errs else 0.5 * (loo + float(np.mean(head_errs)))
+
+
 class CalibrationModel:
     def __init__(self, degree: int = 2, ridge_alpha: float | None = None,
                  eye_source: str = "mediapipe"):
@@ -195,10 +245,46 @@ class CalibrationModel:
         self.screen_size: tuple[int, int] | None = None
         self.created_at: str | None = None
         self.info: dict = {}
+        # Postura da calibração: pose média da cabeça na grade (yaw, pitch em
+        # graus), posição média do rosto (cm) e o quanto a cabeça se afastou
+        # dela na etapa da cabeça (graus). Usados para avisar quando a
+        # postura sai da faixa em que o modelo foi ajustado.
+        self.head_ref = np.zeros(2)
+        self.pos_ref = np.zeros(3)
+        self.head_span = np.zeros(2)
 
     @property
     def is_fitted(self) -> bool:
         return self.params is not None
+
+    def posture_deviation(self, raw: np.ndarray) -> dict:
+        """Quanto a postura atual se afasta da calibração.
+
+        Devolve ``ang`` (yaw, pitch: graus além da faixa calibrada, >= 0) e
+        ``pos_cm`` (deslocamento do rosto em cm em relação à calibração).
+        """
+        raw = np.atleast_2d(raw)
+        delta = np.abs(head_angles(raw)[0] - self.head_ref)
+        beyond = np.maximum(delta - self.head_span, 0.0)
+        return {"ang": beyond, "pos_cm": float(np.linalg.norm(raw[0, 9:12] - self.pos_ref))}
+
+    def correct_with_known_target(self, raw: np.ndarray, target, gain: float = 0.3,
+                                  max_step_px: float = 80.0) -> np.ndarray:
+        """Corrige o offset com amostras de um momento em que o usuário
+        olhava para um ponto CONHECIDO (ex.: centro da tecla selecionada).
+
+        Move o offset ``gain`` do caminho até o erro medido (mediana das
+        amostras), limitado a ``max_step_px``: uma seleção errada desloca
+        pouco o cursor, e seleções corretas seguidas corrigem a deriva.
+        Devolve a correção aplicada (px).
+        """
+        pred = np.median(np.atleast_2d(self.predict(np.atleast_2d(raw))), axis=0)
+        step = gain * (np.asarray(target, dtype=float) - pred)
+        norm = float(np.linalg.norm(step))
+        if norm > max_step_px:
+            step *= max_step_px / norm
+        self.offset = self.offset + step
+        return step
 
     # -------------------------------------------------------------- ajuste
     def _fit_xy(self, raw, Y, w, alpha):
@@ -211,32 +297,55 @@ class CalibrationModel:
         return np.column_stack([_ridge_predict(Xx, *params[0]),
                                 _ridge_predict(Xy, *params[1])])
 
+    def _cv_errors(self, raw, Y, w, groups, alpha) -> tuple[list[float], list[float], list[int]]:
+        """Erros da validação cruzada para um valor de ridge.
+
+        * alvos (groups >= 0): cada alvo fica fora do ajuste por vez; erro =
+          distância da mediana das previsões ao alvo;
+        * direções da cabeça (groups <= HEAD_GROUP_BASE): cada direção fica
+          fora por vez; erro = mediana das distâncias de cada amostra ao alvo
+          (a cabeça se move durante a etapa, então cada amostra conta).
+
+        Devolve (erros dos alvos, erros das direções, índices dos alvos).
+        """
+        target_errs, head_errs, target_ids = [], [], []
+        for g in np.unique(groups):
+            if g == ALWAYS_TRAIN:
+                continue
+            tr, te = groups != g, groups == g
+            if g <= HEAD_GROUP_BASE and te.sum() < MIN_HEAD_FOLD:
+                continue
+            params = self._fit_xy(raw[tr], Y[tr], w[tr], alpha)
+            pred = self._predict_with(params, raw[te])
+            if g >= 0:
+                target_errs.append(float(np.hypot(*(np.median(pred, axis=0) - Y[te][0]))))
+                target_ids.append(int(g))
+            else:
+                head_errs.append(float(np.median(np.hypot(*(pred - Y[te]).T))))
+        return target_errs, head_errs, target_ids
+
     def fit(self, raw: np.ndarray, Y: np.ndarray, weights: np.ndarray | None,
             screen_size: tuple[int, int], groups: np.ndarray | None = None):
         """raw: (n, 20); Y: (n, 2) pixels-alvo; weights: (n,) ou None.
 
-        groups: (n,) índice do alvo de cada amostra (-1 = sempre no treino,
-        ex.: etapa da cabeça). Usado na validação cruzada que escolhe o ridge
-        e estima o erro em pontos não vistos.
+        groups: (n,) grupo de cada amostra para a validação cruzada que
+        escolhe o ridge e estima o erro em pontos e poses não vistos:
+        índice do alvo (>= 0), ALWAYS_TRAIN, ou HEAD_GROUP_BASE - direção.
         """
         raw = np.asarray(raw, dtype=np.float64)
         Y = np.asarray(Y, dtype=np.float64)
         w = np.ones(len(raw)) if weights is None else np.asarray(weights, dtype=np.float64)
+        groups = (np.full(len(raw), ALWAYS_TRAIN) if groups is None
+                  else np.asarray(groups, dtype=int))
 
         self.eye_ref = np.average(raw[:, EYE_COLS[self.eye_source]], axis=0, weights=w)
-        loo: dict[float, list[float]] = {}
-        ids = [] if groups is None else [g for g in np.unique(groups) if g >= 0]
-        if len(ids) >= 5:
+        n_targets = int(np.sum(np.unique(groups) >= 0))
+        cv: dict[float, tuple[list[float], list[float], list[int]]] = {}
+        if n_targets >= 5:
             candidates = ALPHAS if self.ridge_alpha is None else (self.ridge_alpha,)
             for alpha in candidates:
-                errs = []
-                for g in ids:
-                    tr, te = groups != g, groups == g
-                    params = self._fit_xy(raw[tr], Y[tr], w[tr], alpha)
-                    pred = np.median(self._predict_with(params, raw[te]), axis=0)
-                    errs.append(float(np.hypot(*(pred - Y[te][0]))))
-                loo[alpha] = errs
-            alpha = min(loo, key=lambda a: np.mean(loo[a]))
+                cv[alpha] = self._cv_errors(raw, Y, w, groups, alpha)
+            alpha = min(cv, key=lambda a: cv_score(*cv[a][:2]))
         else:
             alpha = self.ridge_alpha if self.ridge_alpha is not None else 1e-2
 
@@ -247,9 +356,19 @@ class CalibrationModel:
         self.screen_size = tuple(int(v) for v in screen_size)
         self.created_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self.info = {"rmse_ajuste_px": float(np.sqrt(mse)), "ridge_alpha": float(alpha)}
-        if loo:
-            self.info["erro_loo_medio_px"] = float(np.mean(loo[alpha]))
-            self.info["erro_loo_por_alvo_px"] = [float(e) for e in loo[alpha]]
+        if cv:
+            target_errs, head_errs, target_ids = cv[alpha]
+            self.info["erro_loo_medio_px"] = float(np.mean(target_errs))
+            self.info["erro_loo_por_alvo_px"] = [float(e) for e in target_errs]
+            self.info["erro_loo_alvos"] = target_ids   # índice do alvo de cada erro acima
+            if head_errs:
+                self.info["erro_cv_cabeca_px"] = float(np.mean(head_errs))
+            self.info["pontuacao_cv_px"] = cv_score(target_errs, head_errs)
+
+    @property
+    def cv_score(self) -> float:
+        """Critério de escolha entre modelos (inf se não houve validação cruzada)."""
+        return float(self.info.get("pontuacao_cv_px", np.inf))
 
     def predict(self, raw: np.ndarray) -> np.ndarray:
         """Aceita (20,) ou (n, 20); devolve (2,) ou (n, 2) em pixels."""
@@ -269,6 +388,9 @@ class CalibrationModel:
             "params": [[c.tolist(), m.tolist(), s.tolist()] for c, m, s in self.params],
             "eye_ref": self.eye_ref.tolist(),
             "offset": self.offset.tolist(),
+            "head_ref": self.head_ref.tolist(),
+            "pos_ref": self.pos_ref.tolist(),
+            "head_span": self.head_span.tolist(),
             "screen_size": list(self.screen_size),
             "created_at": self.created_at,
             "info": self.info,
@@ -299,6 +421,9 @@ class CalibrationModel:
         m.params = [tuple(np.array(a) for a in p) for p in d["params"]]
         m.eye_ref = np.array(d["eye_ref"])
         m.offset = np.array(d.get("offset", [0.0, 0.0]))
+        m.head_ref = np.array(d.get("head_ref", [0.0, 0.0]))
+        m.pos_ref = np.array(d.get("pos_ref", [0.0, 0.0, 0.0]))
+        m.head_span = np.array(d.get("head_span", [0.0, 0.0]))
         m.screen_size = tuple(d["screen_size"])
         m.created_at = d.get("created_at")
         m.info = d.get("info", {})
@@ -393,6 +518,25 @@ def _unpack_obs(z, key: str) -> list:
     return out
 
 
+def split_head_stage(head_raw: np.ndarray, grid_raw: np.ndarray,
+                     max_deg: tuple[float, float] | None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Separa as amostras da etapa da cabeça.
+
+    Devolve (máscara das amostras usadas, grupo de validação de cada amostra,
+    desvio de pose (n, 2) em relação à pose média da grade, em graus).
+    Amostras com desvio acima de ``max_deg`` (yaw, pitch) são descartadas:
+    nesses ângulos os landmarks do olho deixam de ser confiáveis.
+    """
+    base = np.median(head_angles(grid_raw), axis=0)
+    delta = head_angles(head_raw) - base
+    keep = np.ones(len(delta), bool)
+    if max_deg is not None:
+        keep = (np.abs(delta[:, 0]) <= max_deg[0]) & (np.abs(delta[:, 1]) <= max_deg[1])
+    groups = HEAD_GROUP_BASE - head_direction(delta)
+    groups[np.max(np.abs(delta), axis=1) < HEAD_STILL_DEG] = ALWAYS_TRAIN
+    return keep, groups, delta
+
+
 def fit_from_samples(
     data: CalibrationData,
     screen_size: tuple[int, int],
@@ -400,28 +544,51 @@ def fit_from_samples(
     ridge_alpha: float | None,
     mad_threshold: float,
     head_weight_points: float = 1.0,
+    head_max_deg: tuple[float, float] | None = (15.0, 12.0),
 ) -> tuple[CalibrationModel, list[PointResult], dict]:
-    """Ajusta o modelo. Devolve (modelo, resultados por alvo, estatísticas)."""
+    """Ajusta o modelo. Devolve (modelo, resultados por alvo, estatísticas).
+
+    degree: grau MÁXIMO dos termos do olho; graus 1..degree são testados
+    (com cada fonte da íris disponível) e fica o de menor erro na validação
+    cruzada (alvos + direções da cabeça).
+    head_max_deg: faixa (yaw, pitch) da etapa da cabeça aproveitada, em
+    graus em torno da pose média da grade; None usa todas as amostras.
+    """
     raws, Ys, ws, gs, cleaned = [], [], [], [], []
     for i, (target, feats, raw) in enumerate(data.grid):
+        raw = np.atleast_2d(raw)
+        if len(raw) < 3:
+            continue   # alvo sem amostras suficientes (rosto perdido): ignora
         keep = outlier_mask(feats, mad_threshold)
-        r = np.atleast_2d(raw)[keep]
+        r = raw[keep]
         cleaned.append((target, r))
         raws.append(r)
         Ys.append(np.tile(target, (len(r), 1)))
         ws.append(np.full(len(r), 1.0 / len(r)))   # cada alvo pesa 1
         gs.append(np.full(len(r), i))
+    if not raws:
+        raise ValueError("Nenhum alvo com amostras suficientes para calibrar.")
+    grid_raw = np.vstack(raws)
 
-    has_head = data.head_raw is not None and len(data.head_raw) >= 5
-    if has_head:
-        hr = np.atleast_2d(data.head_raw)
-        raws.append(hr)
-        Ys.append(np.tile(data.head_target, (len(hr), 1)))
-        # A etapa de cabeça pesa o equivalente a `head_weight_points` alvos.
-        ws.append(np.full(len(hr), head_weight_points / len(hr)))
-        gs.append(np.full(len(hr), -1))
+    stats_head: dict = {}
+    hr = None
+    if data.head_raw is not None and len(data.head_raw) >= 5:
+        hr_all = np.atleast_2d(data.head_raw)
+        keep, hgroups, delta = split_head_stage(hr_all, grid_raw, head_max_deg)
+        stats_head = {"n_cabeca_total": int(len(hr_all)), "n_cabeca_usadas": int(keep.sum())}
+        if keep.sum() >= 5:
+            hr = hr_all[keep]
+            raws.append(hr)
+            Ys.append(np.tile(data.head_target, (len(hr), 1)))
+            # A etapa de cabeça pesa o equivalente a `head_weight_points` alvos.
+            ws.append(np.full(len(hr), head_weight_points / len(hr)))
+            gs.append(hgroups[keep])
+            head_span = np.percentile(np.abs(delta[keep]), 95, axis=0)
+        else:
+            head_span = np.zeros(2)
+    has_head = hr is not None
 
-    if len(data.grid) < 9:
+    if len(cleaned) < 9:
         degree = 1  # poucos alvos para os termos quadráticos
 
     raw_all, Y_all = np.vstack(raws), np.vstack(Ys)
@@ -432,18 +599,32 @@ def fit_from_samples(
         sources.append("refinada")
     candidates = []
     for src in sources:
-        m = CalibrationModel(degree, ridge_alpha, src)
-        m.fit(raw_all, Y_all, w_all, screen_size, groups=g_all)
-        candidates.append(m)
-    # Escolhe pelo erro em alvos não vistos (LOO); sem LOO, fica no MediaPipe.
-    model = min(candidates, key=lambda m: m.info.get("erro_loo_medio_px", np.inf))
-    if "erro_loo_medio_px" not in model.info:
+        for deg in range(degree, 0, -1):
+            m = CalibrationModel(deg, ridge_alpha, src)
+            m.fit(raw_all, Y_all, w_all, screen_size, groups=g_all)
+            candidates.append(m)
+    # Escolhe pelo erro da validação cruzada; sem ela, o primeiro candidato
+    # (MediaPipe, grau máximo).
+    model = min(candidates, key=lambda m: m.cv_score)
+    if not np.isfinite(model.cv_score):
         model = candidates[0]
     model.info["usa_etapa_cabeca"] = bool(has_head)
     model.info["fonte_iris"] = model.eye_source
-    for m in candidates:
-        if "erro_loo_medio_px" in m.info:
-            model.info[f"erro_loo_{m.eye_source}_px"] = m.info["erro_loo_medio_px"]
+    model.info["grau"] = model.degree
+    model.info["candidatos"] = [
+        {"fonte": m.eye_source, "grau": m.degree,
+         "erro_loo_px": m.info.get("erro_loo_medio_px"),
+         "erro_cv_cabeca_px": m.info.get("erro_cv_cabeca_px")} for m in candidates]
+    model.info.update(stats_head)
+
+    # Postura de referência (aviso de postura fora da calibração).
+    grid_delta = head_angles(grid_raw) - np.median(head_angles(grid_raw), axis=0)
+    span = np.percentile(np.abs(grid_delta), 95, axis=0)
+    if has_head:
+        span = np.maximum(span, head_span)
+    model.head_ref = np.median(head_angles(grid_raw), axis=0)
+    model.pos_ref = np.median(grid_raw[:, 9:12], axis=0)
+    model.head_span = span
 
     results = []
     for target, r in cleaned:
@@ -452,8 +633,7 @@ def fit_from_samples(
 
     stats = dict(model.info)
     if has_head:
-        preds = model.predict(np.atleast_2d(data.head_raw))
-        err = np.hypot(*(preds - np.asarray(data.head_target)).T)
+        err = np.hypot(*(model.predict(hr) - np.asarray(data.head_target)).T)
         stats["erro_mediano_cabeca_px"] = float(np.median(err))
     return model, results, stats
 

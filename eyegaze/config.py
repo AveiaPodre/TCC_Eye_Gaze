@@ -90,9 +90,30 @@ class CalibrationConfig:
     grid_cols: int = 4
     grid_rows: int = 4
     margin_ratio: float = 0.08     # distância dos alvos à borda (fração da tela)
-    settle_s: float = 0.9          # tempo para o olho chegar ao alvo (não coleta)
+    # Ordem aleatória dos alvos. Na ordem linha a linha, o tempo (cansaço,
+    # olho ressecando, postura escorregando) andava junto com a posição
+    # vertical: nos dados reais a abertura do olho caiu de 0,27 para 0,16 ao
+    # longo da grade e o modelo aprendia isso como "olhar para baixo".
+    shuffle_targets: bool = True
+    random_seed: int | None = None
+    # Coleta por fixação: depois de ``settle_s`` (o olho chega ao alvo), a
+    # coleta começa quando o olhar estabiliza (``fixation_window`` quadros
+    # seguidos a menos de ``fixation_max_deg`` da mediana; o ruído típico
+    # medido é ~0,2°) ou, no máximo, em ``settle_max_s``.
+    settle_s: float = 0.6
+    settle_max_s: float = 1.8
+    fixation_window: int = 6
+    fixation_max_deg: float = 0.8
     collect_s: float = 1.2         # tempo de coleta de amostras por alvo
     min_samples_per_point: int = 8
+    # Repetição automática de alvos ruins: depois do ajuste, alvos cujo erro
+    # na validação cruzada passa de ``retry_ratio`` x a mediana (e de
+    # ``retry_min_frac`` da largura da tela) são coletados de novo, uma vez
+    # (piscada longa, distração, olhar fora do alvo).
+    retry_bad_targets: bool = True
+    retry_max_targets: int = 3
+    retry_ratio: float = 2.5
+    retry_min_frac: float = 0.08
     polynomial_degree: int = 2     # 1 = só termos lineares do olho, 2 = + quadráticos
     # Regularização ridge (features padronizadas). None = escolhida por
     # validação cruzada deixando um alvo de fora.
@@ -104,11 +125,23 @@ class CalibrationConfig:
     results_dir: Path = PROJECT_ROOT / "results"
 
     # Etapa de movimento da cabeça (após os alvos): o usuário mantém o
-    # olhar no alvo central e gira a cabeça devagar seguindo as setas. É o
-    # que permite separar movimento de olho de movimento de cabeça.
-    # 0 desliga a etapa.
-    head_motion_step_s: float = 1.6   # duração de cada direção (5 direções)
+    # olhar no alvo central e gira a cabeça seguindo as setas. É o que
+    # permite separar movimento de olho de movimento de cabeça.
+    head_stage: bool = True
+    # Quanto girar em cada direção (yaw, pitch em graus, em relação à pose
+    # da grade). A seta enche conforme a cabeça gira e fica verde ao chegar
+    # a ``head_reach_frac`` do alvo; depois de ``head_hold_s`` ali, passa
+    # para a próxima direção. Quem não alcança segue após o tempo limite.
+    # Nos dados reais, sem guia, as pessoas giravam até 30-40°, faixa em
+    # que os landmarks do olho não são confiáveis.
+    head_target_deg: tuple = (10.0, 8.0)
+    head_reach_frac: float = 0.8
+    head_hold_s: float = 0.6
+    head_step_timeout_s: float = 4.0
+    head_center_s: float = 1.0        # etapa final com a cabeça de volta ao centro
     head_motion_settle_s: float = 0.8
+    # Faixa aproveitada no ajuste (amostras além dela são descartadas).
+    head_max_deg: tuple = (15.0, 12.0)
     head_motion_weight: float = 1.0   # peso da etapa, em "número de alvos"
 
     # Mapeamento usado ANTES de calibrar (só para visualização): ângulo de
@@ -146,6 +179,27 @@ class MouseConfig:
 
 
 @dataclass
+class PostureConfig:
+    # Aviso de postura fora da calibração. O modelo só é confiável perto da
+    # postura em que foi ajustado; nas sessões reais, a pessoa mudava de
+    # posição entre calibrar e validar e a maior parte do erro (até 220 px)
+    # era um desvio constante que a recentralização (R) corrige.
+    angle_tol_deg: float = 4.0     # graus ALÉM da faixa coberta na calibração
+    pos_tol_cm: float = 4.0        # deslocamento do rosto
+    sustain_s: float = 1.5         # tempo fora da faixa antes de avisar
+
+
+@dataclass
+class AdaptConfig:
+    # Correção contínua por alvos conhecidos (ex.: tecla do teclado virtual
+    # selecionada): o offset anda ``gain`` do caminho até o erro medido,
+    # limitado a ``max_step_px`` por correção.
+    gain: float = 0.3
+    max_step_px: float = 80.0
+    window_frames: int = 15        # amostras recentes usadas (~0,5 s)
+
+
+@dataclass
 class DwellClickConfig:
     enabled_at_start: bool = False
     dwell_time_s: float = 1.0
@@ -174,5 +228,7 @@ class AppConfig:
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     mouse: MouseConfig = field(default_factory=MouseConfig)
+    posture: PostureConfig = field(default_factory=PostureConfig)
+    adapt: AdaptConfig = field(default_factory=AdaptConfig)
     dwell: DwellClickConfig = field(default_factory=DwellClickConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
