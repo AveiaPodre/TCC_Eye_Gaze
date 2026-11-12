@@ -47,12 +47,6 @@ class GazeConfig:
     # verificação de coerência) ou "landmarks" (eixos geométricos).
     head_pose_source: str = "matrix"
 
-    # Raio do globo ocular expresso em "larguras de olho" (distância entre os
-    # cantos do olho). Anatomicamente: raio ~12 mm / largura da fenda
-    # palpebral ~30 mm = 0.4. Erros neste valor são absorvidos em grande
-    # parte pela calibração (afetam só a escala do ângulo).
-    eyeball_radius_ratio: float = 0.40
-
     # Detecção de piscada pelo EAR (eye aspect ratio = altura/largura do
     # olho). O limiar é RELATIVO ao EAR típico do usuário com o olho aberto
     # (estimado de forma contínua), então não precisa ser ajustado por pessoa.
@@ -60,15 +54,6 @@ class GazeConfig:
     blink_ratio: float = 0.5
     ear_open_initial: float = 0.28   # chute inicial do EAR com olho aberto
     ear_baseline_alpha: float = 0.02  # velocidade de adaptação da linha de base
-
-
-@dataclass
-class FilterConfig:
-    # One-Euro Filter (Casiez et al., 2012) aplicado aos ângulos de olhar
-    # exibidos no HUD e ao mapeamento usado antes de calibrar.
-    min_cutoff: float = 0.5   # menor = mais suave quando o olhar está parado
-    beta: float = 0.005       # maior = menos atraso em movimentos rápidos
-    d_cutoff: float = 1.0
 
 
 @dataclass
@@ -128,10 +113,9 @@ class CalibrationConfig:
     retry_max_targets: int = 3
     retry_ratio: float = 2.5
     retry_min_frac: float = 0.08
-    polynomial_degree: int = 2     # 1 = só termos lineares do olho, 2 = + quadráticos
-    # Regularização ridge (features padronizadas). None = escolhida por
-    # validação cruzada deixando um alvo de fora.
-    ridge_alpha: float | None = None
+    # Grau máximo da correção monitor virtual -> real (calibration.py):
+    # 1 = até afim; 2 = também quadrática. A validação cruzada escolhe.
+    polynomial_degree: int = 2
     outlier_mad_threshold: float = 3.5
     save_path: Path = PROJECT_ROOT / "models" / "calibration.json"
     # Medidas brutas de cada calibração (.npz), para reanálise offline
@@ -175,16 +159,13 @@ class CalibrationConfig:
     # eixo) não são aplicados; a mensagem pede para recalibrar.
     recenter_max_frac: float = 0.25
 
-    # Largura física da tela (cm). Com ela, o ganho da cabeça é fixado pela
-    # geometria (px/cm da tela) em vez de aprendido (calibration.py, versão
-    # 6). Preenchida por --screen-width-cm ou detectada no Windows; None =
-    # ganho da cabeça aprendido na etapa da cabeça.
+    # Largura física da tela (cm): tamanho do MONITOR VIRTUAL onde o olhar é
+    # projetado (geometry.VirtualScreen). Preenchida por --screen-width-cm ou
+    # detectada no Windows. Sem ela, usa-se ``assumed_screen_width_cm``
+    # (34,5 cm = notebook de 15,6" 16:9) e a correção monitor virtual -> real
+    # absorve a diferença de escala.
     screen_width_cm: float | None = None
-
-    # Mapeamento usado ANTES de calibrar (só para visualização): ângulo de
-    # olhar que corresponderia à borda da tela.
-    uncalibrated_half_range_yaw_deg: float = 20.0
-    uncalibrated_half_range_pitch_deg: float = 12.0
+    assumed_screen_width_cm: float = 34.5
 
 
 @dataclass
@@ -263,11 +244,8 @@ class DisplayConfig:
     show_head_pose: bool = False
     show_minimap: bool = True
     show_help: bool = True
-    # Vista 3D (scene3d.py): rosto, globos oculares, raios do olhar e tela.
+    # Vista 3D (scene3d.py): rosto, globos oculares, feixes, intersecção e tela.
     show_scene3d: bool = False
-    # Largura física suposta da tela na vista 3D quando --screen-width-cm
-    # não é informado (34,5 cm = notebook de 15,6" 16:9).
-    assumed_screen_width_cm: float = 34.5
     window_name: str = "Eye Gaze - camera"
     target_window_name: str = "Eye Gaze - alvos"
     scene3d_window_name: str = "Eye Gaze - 3D"
@@ -278,7 +256,6 @@ class AppConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     gaze: GazeConfig = field(default_factory=GazeConfig)
-    filter: FilterConfig = field(default_factory=FilterConfig)
     stabilizer: StabilizerConfig = field(default_factory=StabilizerConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)

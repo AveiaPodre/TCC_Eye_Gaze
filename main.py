@@ -36,8 +36,9 @@ def parse_args(argv=None):
     p.add_argument("--reset-calibration", action="store_true",
                    help="ignora a calibração salva")
     p.add_argument("--screen-width-cm", type=float, default=None,
-                   help="largura física da tela em cm (padrão: detecta no Windows). Fixa o "
-                        "ganho da cabeça na calibração e dá o erro em graus na validação")
+                   help="largura física da tela em cm (padrão: detecta no Windows). É o "
+                        "tamanho do monitor virtual onde o olhar é projetado e dá o erro em "
+                        "graus na validação")
     p.add_argument("--distance-cm", type=float, default=None,
                    help="distância olho-tela (para erro em graus na validação)")
     p.add_argument("--gravar", action="store_true",
@@ -51,7 +52,7 @@ def parse_args(argv=None):
 
 
 def _set_screen_width(cfg: AppConfig, width_cm: float | None):
-    """A largura física serve à calibração (ganho da cabeça), à validação
+    """A largura física serve à calibração (monitor virtual), à validação
     (erro em graus) e à vista 3D."""
     cfg.calibration.screen_width_cm = width_cm
     cfg.validation.screen_width_cm = width_cm
@@ -104,9 +105,9 @@ def main(argv=None) -> int:
         origem = "informada" if args.screen_width_cm else "detectada"
         print(f"[Tela] {screen_size[0]}x{screen_size[1]}, {width_cm:.1f} cm de largura ({origem})")
     else:
-        print(f"[Tela] {screen_size[0]}x{screen_size[1]}. Largura física desconhecida: o ganho "
-              "da cabeça será aprendido na calibração. Para fixá-lo pela geometria, use "
-              "--screen-width-cm.")
+        print(f"[Tela] {screen_size[0]}x{screen_size[1]}. Largura física desconhecida: o "
+              f"monitor virtual usa {cfg.calibration.assumed_screen_width_cm} cm e a calibração "
+              "corrige a escala. Para a geometria exata, use --screen-width-cm.")
 
     if args.reset_calibration and cfg.calibration.save_path.exists():
         cfg.calibration.save_path.unlink()

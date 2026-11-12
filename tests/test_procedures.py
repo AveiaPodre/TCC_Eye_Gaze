@@ -6,6 +6,7 @@ repetição de alvos ruins, filtro de faixa da cabeça e aviso de postura.
 
 import numpy as np
 
+from eyegaze.gaze import RAW_SIZE
 from eyegaze.calibration import (ALWAYS_TRAIN, HEAD_GROUP_BASE,
                                  fit_from_samples, split_head_stage)
 from eyegaze.config import CalibrationConfig
@@ -22,7 +23,7 @@ class StubSample:
     def __init__(self, yaw, pitch):
         self._f = np.array([yaw, pitch], float)
         self.valid = True
-        self.raw = np.zeros(20)
+        self.raw = np.zeros(RAW_SIZE)
         self.obs = None
 
     def features(self):
@@ -205,9 +206,9 @@ def test_split_head_stage_groups_and_range():
     user = SimUser(11)
     data = user.calibration_data()
     grid = np.vstack([r for _, _, r in data.grid])
-    keep, groups, delta = split_head_stage(data.head_raw, grid, (12.0, 8.0))
-    assert np.all(np.abs(delta[keep, 0]) <= 12) and np.all(np.abs(delta[keep, 1]) <= 8)
-    assert (~keep).any()                     # a etapa sintética vai a ±15°/±10°
+    keep, groups, delta = split_head_stage(data.head_raw, grid, (8.0, 6.0))
+    assert np.all(np.abs(delta[keep, 0]) <= 8) and np.all(np.abs(delta[keep, 1]) <= 6)
+    assert (~keep).any()                     # a etapa sintética vai a ±10°/±8°
     assert set(np.unique(groups)) <= {ALWAYS_TRAIN, *range(HEAD_GROUP_BASE - 3, HEAD_GROUP_BASE + 1)}
     still = np.max(np.abs(delta), axis=1) < 2.0
     assert np.all(groups[still] == ALWAYS_TRAIN)
@@ -215,15 +216,17 @@ def test_split_head_stage_groups_and_range():
 
 def test_model_reports_head_cv_and_candidates():
     user = SimUser(12)
-    model, _, stats = fit_from_samples(user.calibration_data(), (1920, 1080), 2, None, 3.5)
+    model, _, stats = fit_from_samples(user.calibration_data(), (1920, 1080), 53.0)
     assert stats["erro_cv_cabeca_px"] > 0
-    assert {c["grau"] for c in stats["candidatos"]} == {1, 2}
-    assert stats["pontuacao_cv_px"] == model.cv_score
+    assert {c["correcao"] for c in stats["candidatos"]} == {
+        "nenhuma", "deslocamento", "afim", "quadratica"}
+    assert stats["erro_loo_medio_px"] == model.cv_score
+    assert stats["erro_loo_medio_px"] == min(c["erro_loo_px"] for c in stats["candidatos"])
 
 
 def test_posture_deviation(tmp_path):
     user = SimUser(13)
-    model, _, _ = fit_from_samples(user.calibration_data(), (1920, 1080), 2, None, 3.5)
+    model, _, _ = fit_from_samples(user.calibration_data(), (1920, 1080), 53.0)
     _, r_ok = user.sample(960, 540, head=(0, 0, 0))
     _, r_far = user.sample(960, 540, head=(30, 0, 0), pos=(10.0, 10.0, 60.0))
     ok, far = model.posture_deviation(r_ok), model.posture_deviation(r_far)
@@ -253,7 +256,7 @@ def test_validation_reports_constant_offset(tmp_path):
     s = proc.summary
     assert s["deslocamento_medio_px"][0] > 120
     assert s["acuracia_sem_deslocamento_px"] < s["acuracia_media_px"] - 100
-    assert "fonte_iris" in s["calibracao"]
+    assert "fonte_pupila" in s["calibracao"] and "correcao" in s["calibracao"]
 
 
 # ---------------------------------------------------- deriva durante o uso

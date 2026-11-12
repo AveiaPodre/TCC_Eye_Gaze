@@ -3,12 +3,21 @@
 Programa em Python para pessoas com deficiência motora controlarem o cursor
 com os olhos, usando só uma webcam (interna ou externa). Os landmarks do rosto
 e das íris vêm do **MediaPipe FaceLandmarker** (Tasks API). O olhar é modelado
-geometricamente: um raio sai da posição 3D do olho, na direção dada pela
-rotação da cabeça somada à rotação do globo ocular, e é intersectado com o
-plano da tela. A calibração tem 16 pontos (grade 4×4) e uma etapa curta de movimento da
-cabeça. Com isso, a pessoa pode girar ou deslocar a cabeça para uma posição
-confortável sem perder a pontaria. Um estabilizador de fixação mantém o
-cursor parado enquanto o olhar está parado.
+geometricamente, em cinco etapas:
+
+1. landmarks do rosto;
+2. centro do globo ocular e centro da pupila de cada olho;
+3. feixe de cada olho (do centro do globo, passando pela pupila) e a
+   intersecção dos dois feixes;
+4. o vetor do olhar até a intersecção é projetado num monitor virtual (o
+   plano da tela, com a geometria suposta);
+5. a calibração com vários pontos (grade 4×4 e uma etapa curta de movimento
+   da cabeça) ajusta o globo de cada olho e a correção entre o monitor
+   virtual e o monitor real.
+
+Como a rotação e a posição da cabeça entram pela geometria, a pessoa pode
+girar ou deslocar a cabeça sem perder toda a pontaria. Um estabilizador de
+fixação mantém o cursor parado enquanto o olhar está parado.
 
 A geometria do olho parte do projeto *Webcam3DTracker* (esfera do olho +
 vetor centro→íris), reescrita para a API atual do MediaPipe. O
@@ -76,8 +85,9 @@ Fluxo recomendado:
 5. Alvos com erro muito alto (piscada longa, distração) são repetidos
    automaticamente, uma vez.
 6. A tela de resultado mostra o erro em cada alvo, o erro estimado em pontos
-   novos e em poses novas da cabeça (validação cruzada) e uma classificação
-   da qualidade (boa / razoável / ruim).
+   novos (validação cruzada), quanto desse erro sobra só com o monitor
+   virtual (sem a correção da etapa 5), o erro com a cabeça em poses novas
+   e uma classificação da qualidade (boa / razoável / ruim).
 7. Pressione **T** para validar: 9 alvos novos, que não entram na
    calibração, medem a acurácia e a precisão. O resultado vai para
    `results/` e mostra também quanto do erro é um desvio constante, que o
@@ -120,10 +130,10 @@ automaticamente. Ela é descartada se a resolução da tela mudar.
 | `D` | liga/desliga o dwell-click |
 | `A` | liga/desliga o **ajuste fino pela cabeça**: o olhar leva o cursor à região e, enquanto você continua olhando, pequenos giros da cabeça (direita/esquerda/cima/baixo) movem o cursor a partir dali com precisão de poucos pixels. Um novo salto do olhar zera o ajuste. Parâmetros em `FineConfig` |
 | `L` | liga/desliga a visualização dos **landmarks** (malha, contorno dos olhos, íris, cantos) |
-| `G` | liga/desliga a visualização do **olhar** (globos oculares, raio de cada olho, raio combinado, ângulos) |
+| `G` | liga/desliga a visualização do **olhar** (centro do globo e pupila de cada olho, feixe de cada olho, vetor do olhar, ângulos e posição da intersecção dos feixes) |
 | `P` | liga/desliga os **eixos da cabeça** e os ângulos de pose |
 | `V` | liga/desliga o **minimapa** da tela com o ponto estimado em tempo real |
-| `3` | liga/desliga a **vista 3D** (janela própria): rosto, globos oculares, raio de cada olho, plano da tela com o cursor (amarelo), o raio geométrico (magenta; calibrado depois da calibração, cru antes) e a direção do rosto corrigida (verde). Arraste para girar, use a roda para zoom e o botão direito para voltar à vista inicial. Informe `--screen-width-cm` para a tela ficar em escala |
+| `3` | liga/desliga a **vista 3D** (janela própria), com as etapas do pipeline: rosto, globo e pupila de cada olho, feixes até a tela (azul claro), intersecção dos feixes (branco), vetor do olhar até o monitor virtual (magenta) e cursor no monitor real depois da calibração (amarelo). Arraste para girar, use a roda para zoom e o botão direito para voltar à vista inicial. Informe `--screen-width-cm` para a tela ficar em escala |
 | `F` | espelha ou não a imagem exibida (o processamento não muda) |
 | `H` | mostra/oculta a ajuda |
 | `ESC` | cancela calibração/validação em andamento; fora delas, sai |
@@ -144,19 +154,23 @@ valores iniciais de cada visualização ficam em `DisplayConfig`
 ## Como funciona (resumo)
 
 ```
-webcam -> FaceLandmarker (478 landmarks + matriz de pose)
-       -> rotação da cabeça R e posição 3D do rosto E (cm)
-       -> íris (u, v) e pálpebras (altura da pálpebra superior lid_up,
-          abertura) no referencial da cabeça
-       -> calibração: ponto para onde a face aponta (E + E_z·tan(cabeça))
-                      + medidas do olho escaladas pela distância
-                      -> regressão ridge livre ou modelo físico (px/cm
-                         compartilhado), escolhidos por validação cruzada
-                         em alvos e em direções da cabeça -> (x, y) em pixels
+webcam -> 1. FaceLandmarker (478 landmarks + matriz de pose)
+              -> rotação da cabeça R e posição 3D do rosto (cm)
+       -> 2. por olho: âncora (meio dos cantos) e pupila (centro da íris) em cm;
+              centro do globo = âncora + R·(c_x, c_y, s)
+       -> 3. feixe centro do globo -> pupila de cada olho;
+              intersecção dos dois feixes; vetor do olhar até ela
+       -> 4. projeção do vetor no monitor virtual (plano da tela) -> pixel virtual
+       -> 5. correção monitor virtual -> real (calibração) -> pixel real
        -> aviso de postura fora da calibração (R recentraliza)
        -> estabilizador de fixação (cursor parado na fixação, salta na sacada)
        -> mouse + dwell-click
 ```
+
+A calibração ajusta, por pessoa e por olho, a posição de repouso da pupila e
+o raio efetivo do globo em cada eixo (o MediaPipe encolhe o movimento da
+íris, mais na vertical), e depois a correção virtual -> real (nenhuma,
+deslocamento, afim ou quadrática, escolhida por validação cruzada).
 
 A explicação completa, com as equações e as decisões de projeto, está em
 [`docs/metodologia.md`](docs/metodologia.md).
@@ -170,25 +184,28 @@ eyegaze/
   landmarks.py             # índices dos landmarks usados
   face_tracker.py          # MediaPipe FaceLandmarker (modo VIDEO) + download do modelo
   head_pose.py             # rotação da cabeça (matriz do modelo, com reserva por landmarks)
-  gaze.py                  # modelo do globo ocular, posição 3D do rosto, piscadas
+  gaze.py                  # etapas 1-2: âncora e pupila de cada olho em cm, piscadas
+  eyeball.py               # etapas 2-3: centro do globo, feixes, intersecção, ajuste do globo
+  geometry.py              # câmera pinhole, intersecção de retas, monitor virtual (etapa 4)
   filters.py               # One-Euro Filter e estabilizador de fixação com trava
-  calibration.py           # regressão: geometria da cabeça + medidas do olho/pálpebras -> pixel
+  calibration.py           # etapa 5: ajuste do globo + correção monitor virtual -> real
   procedures.py            # calibração (com etapa da cabeça), validação e recentralização
   visualization.py         # landmarks, olhar, pose, minimapa, HUD, ajuda
-  scene3d.py               # vista 3D: rosto, globos oculares, raios do olhar, tela
+  scene3d.py               # vista 3D: globos, feixes, intersecção, monitor virtual, cursor
   io_devices.py            # câmera/vídeo, gravação/reprodução de sessões, tela, mouse, dwell-click
   app.py                   # loop principal e teclas
 tests/
   synthetic.py             # rosto 3D sintético (testes sem câmera)
-  test_pipeline.py         # geometria, pose, olhar, calibração, invariância à cabeça, tremor
+  test_pipeline.py         # geometria, pose, globo/feixes/intersecção, calibração, tremor
+  test_scene3d.py          # vista 3D
   test_app.py              # ponta a ponta com "usuário simulado"
   test_procedures.py       # protocolo de coleta, repetição de alvos, aviso de postura
   test_recording.py        # gravação e reprodução de sessões
 docs/metodologia.md        # método detalhado (base para o texto do TCC)
 models/                    # face_landmarker.task e calibration.json (gerados)
 results/                   # validações (CSV/JSON), medidas brutas (.npz) e sessões gravadas
-tools/benchmark.py         # compara variantes do modelo em TODAS as sessões gravadas
-tools/reavaliar.py         # detalha uma sessão (sinal de cada medida, erro por alvo)
+tools/benchmark.py         # compara variantes do pipeline em TODAS as sessões gravadas
+tools/reavaliar.py         # detalha uma sessão (globo ajustado, feixes, erro por alvo)
 ```
 
 ## Testes
@@ -202,11 +219,12 @@ Os testes não usam câmera nem o modelo. Eles geram rostos 3D sintéticos com
 pose e olhar conhecidos e conferem:
 
 - que os índices de cada olho pertencem ao mesmo olho;
-- que, com a etapa da cabeça, o cursor continua no lugar certo com a cabeça
-  girada (±15° horizontal, ±10° vertical, roll) ou deslocada. O "usuário"
-  sintético tem os erros típicos de webcam: ganho do olho diferente do
-  assumido, movimento vertical da íris achatado e acoplamento com a
-  inclinação da cabeça;
+- a geometria: intersecção de retas, monitor virtual, medidas do olho em cm;
+- que o ajuste do globo recupera o raio real de um olho sintético, que o
+  feixe passa pela pupila e que os dois feixes se cruzam no alvo;
+- que o cursor continua perto do lugar certo com a cabeça girada ou
+  deslocada. O "usuário" sintético tem o erro típico do MediaPipe:
+  movimento da íris encolhido, mais na vertical;
 - que o estabilizador elimina o tremor na fixação sem atrasar as sacadas, e
   mantém o cursor parado quando a estimativa passeia devagar (ruído
   correlacionado, como nos dados reais);
@@ -226,7 +244,7 @@ pose e olhar conhecidos e conferem:
 | Cursor não acompanha pequenos deslocamentos do olhar | diminuir `StabilizerConfig.lock_ratio` (ex.: 0.025) ou `shift_frames` (ex.: 5) |
 | Cursor salta sozinho | aumentar `StabilizerConfig.saccade_ratio` (ex.: 0.10) ou `confirm_frames` (ex.: 4) |
 | Cursor demora a chegar após olhar para outro lugar | diminuir `confirm_frames` (mín. 2) ou aumentar `follow` |
-| Cursor não desce o suficiente ao inclinar a cabeça | confira se a largura da tela foi detectada (linha `[Tela]` no terminal); se não, informe `--screen-width-cm` |
+| Cursor desloca ao inclinar a cabeça / desvio vertical constante | recentralize (R); confira se a largura da tela foi detectada (linha `[Tela]` no terminal); se não, informe `--screen-width-cm` |
 | Cursor desloca quando gira a cabeça | refazer a calibração caprichando na etapa da cabeça (ver o erro com a cabeça em movimento na tela de resultado) |
 | Cliques acidentais | aumentar `DwellClickConfig.dwell_time_s` ou diminuir `tolerance_px` |
 | Piscadas não detectadas / falsas | ajustar `GazeConfig.blink_ratio` |
@@ -244,8 +262,8 @@ que está sendo removido.
 
 ## Limitações conhecidas
 
-- **Posturas extremas.** A compensação de cabeça é aprendida dentro da
-  faixa de movimento feita na etapa da cabeça (até ~15°/12°). Posturas
+- **Posturas extremas.** O globo é ajustado dentro da faixa de movimento
+  feita na etapa da cabeça (até ~15°/12°). Posturas
   muito além dela (girar a cabeça 40°, por exemplo) extrapolam o modelo, e
   nesses ângulos os landmarks do olho também deixam de ser confiáveis. O
   HUD avisa quando a postura sai da faixa calibrada; nesse caso, volte à
@@ -254,14 +272,16 @@ que está sendo removido.
   MediaPipe, que assume um campo de visão padrão para a câmera. Webcams com
   lente muito diferente geram um pequeno erro de escala. A calibração
   absorve a maior parte dele, e `R` corrige o resto.
-- **Eixo vertical.** O eixo vertical é menos preciso que o horizontal: a íris
-  se desloca menos e as pálpebras a cobrem parcialmente. Isso é comum em
-  rastreadores por webcam. O ganho da cabeça no eixo vertical é fixado pela
-  geometria quando a largura física da tela é conhecida (detectada no
-  Windows ou `--screen-width-cm`): abaixar a cabeça para olhar para baixo
-  move o cursor o quanto deve. Com a cabeça parada, as medidas do olho
-  saturam perto da borda de baixo; abaixo da última linha de alvos (92% da
-  altura) o alcance é menor.
+- **Eixo vertical.** É a principal limitação medida (ver
+  `docs/metodologia.md`, seção 5.6). A pupila do MediaPipe anda só ~15% do
+  que um olho real andaria na vertical, então o raio efetivo vertical
+  ajustado é ~0,15 cm: um deslocamento de décimos de milímetro da pupila
+  em relação aos cantos do olho (mudança de postura, abertura do olho)
+  move o cursor centenas de pixels na vertical. Além disso, com o olhar
+  fixo e a cabeça inclinando, a pupila quase não contra-rotaciona na
+  vertical, e o cursor acompanha a cabeça. Nas sessões gravadas, o erro
+  com a cabeça inclinada para cima chega a ~470 px na vertical. Use a
+  recentralização (R) quando o cursor ficar deslocado na vertical.
 - **Óculos e iluminação.** Reflexos nas lentes e contraluz pioram os
   landmarks da íris.
 - **Acurácia.** Rastreadores por webcam costumam ter erro de alguns graus de

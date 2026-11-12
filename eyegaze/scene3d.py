@@ -1,29 +1,20 @@
 """
-Vista 3D da cena (inspirada na janela "Head/Eye Debug" do Webcam3DTracker).
+Vista 3D da cena: o pipeline do olhar, etapa por etapa.
 
-Mostra, numa câmera virtual que orbita a cena: o rosto (landmarks), os
-globos oculares, o raio do olhar de cada olho, o plano da tela com o ponto
-atingido pelo olhar e a webcam. Serve para entender o que o modelo está
-vendo: se a pose da cabeça está coerente, para onde cada olho aponta e
-quanto a calibração corrige o raio puramente geométrico.
+Numa câmera virtual que orbita a cena, desenha:
 
-Dois "olhares" são desenhados até a tela:
+* o rosto (landmarks) e os eixos da cabeça (etapa 1);
+* para cada olho, o CENTRO DO GLOBO (círculo) e a PUPILA (ponto) (etapa 2);
+* o FEIXE de cada olho, do centro do globo passando pela pupila, até o
+  plano da tela (azul claro) e a INTERSECÇÃO dos dois feixes (etapa 3);
+* o VETOR DO OLHAR, do ponto entre os olhos até a intersecção, prolongado
+  até o MONITOR VIRTUAL (magenta, com o ponto atingido; etapa 4);
+* o CURSOR no monitor real, depois da correção da calibração e do
+  estabilizador (amarelo; etapa 5).
 
-* AMARELO: o cursor (saída da calibração + estabilizador), que é o que
-  move o mouse;
-* MAGENTA: o raio geométrico do modelo de globo ocular (gaze.py), sem
-  calibração, intersectado com o plano da tela. A distância entre os dois
-  mostra o quanto a calibração está corrigindo.
-
-Referencial (cm, o mesmo de ``gaze.eye_position_cm``): origem na webcam,
-x para a direita da imagem, y para baixo, z para longe da câmera. A tela é
-o plano z = 0, com a webcam centralizada logo acima da borda superior
-(notebook ou webcam presa no monitor). A largura física da tela vem de
-``--screen-width-cm``; sem ela, é suposta (``DisplayConfig``).
-
-Como a imagem da câmera NÃO é espelhada, o lado direito do usuário é -x:
-o pixel x = 0 da tela (borda esquerda, do ponto de vista do usuário) fica
-em x = +largura/2.
+Referencial (cm): o da câmera (geometry.py). A tela é o plano z = 0, com a
+webcam centralizada logo acima da borda superior. Como a imagem da câmera
+NÃO é espelhada, a borda esquerda da tela (para o usuário) fica em +x.
 
 Controles (com a janela 3D em foco): arrastar com o botão esquerdo gira,
 a roda do mouse aproxima/afasta e o botão direito volta à vista inicial.
@@ -37,22 +28,21 @@ import cv2
 import numpy as np
 
 from .face_tracker import FaceObservation
-from .calibration import SCREEN_GAP_CM, head_screen_point
-from .gaze import GazeSample, direction_to_angles, eye_position_cm
+from .gaze import RAW_FACE, GazeSample, direction_to_angles
+from .geometry import VirtualScreen, px3d_to_cm
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-ASSUMED_HFOV_DEG = 60.0   # mesmo valor de gaze.eye_position_cm
 
 C_FACE = (150, 150, 150)
 C_SCREEN = (0, 200, 255)
 C_EYE = (255, 255, 25)
-C_EYE_RAY = (255, 200, 60)
-C_GEOM = (255, 60, 255)
+C_BEAM = (255, 200, 60)
+C_VERGENCE = (255, 255, 255)
+C_VIRTUAL = (255, 60, 255)
 C_CURSOR = (0, 255, 255)
 C_RAW = (170, 170, 170)
 C_TARGET = (110, 110, 110)
 C_CAMERA = (80, 230, 80)
-C_FACE_DIR = (90, 255, 90)
 
 
 @dataclass
@@ -89,46 +79,9 @@ class OrbitView:
             self.reset()
 
 
-# ------------------------------------------------------------- geometria
-def screen_rect_cm(screen_size, screen_width_cm: float) -> tuple[float, float]:
-    sw, sh = screen_size
-    return screen_width_cm, screen_width_cm * sh / sw
-
-
-def screen_px_to_cm(p, screen_size, screen_width_cm: float) -> np.ndarray:
-    """Pixel da tela -> ponto 3D (cm) no plano z = 0."""
-    sw, sh = screen_size
-    wcm, hcm = screen_rect_cm(screen_size, screen_width_cm)
-    return np.array([(0.5 - p[0] / sw) * wcm, SCREEN_GAP_CM + p[1] / sh * hcm, 0.0])
-
-
-def landmarks_cm(obs: FaceObservation, depth_cm: float) -> tuple[np.ndarray, float]:
-    """Landmarks em cm por câmera pinhole, com o rosto na profundidade dada.
-
-    Devolve (pontos (n, 3), cm por pixel na profundidade do rosto). O z do
-    MediaPipe está na escala de x em pixels, relativo ao centro do rosto.
-    """
-    w, h = obs.image_width, obs.image_height
-    f = 0.5 * w / np.tan(np.radians(ASSUMED_HFOV_DEG / 2))
-    pts = obs.points
-    z = depth_cm + pts[:, 2] * depth_cm / f
-    out = np.column_stack([(pts[:, 0] - w / 2) * z / f, (pts[:, 1] - h / 2) * z / f, z])
-    return out, depth_cm / f
-
-
-def px3d_to_cm(p, obs: FaceObservation, depth_cm: float) -> np.ndarray:
-    w, h = obs.image_width, obs.image_height
-    f = 0.5 * w / np.tan(np.radians(ASSUMED_HFOV_DEG / 2))
-    z = depth_cm + p[2] * depth_cm / f
-    return np.array([(p[0] - w / 2) * z / f, (p[1] - h / 2) * z / f, z])
-
-
-def hit_screen(origin: np.ndarray, direction: np.ndarray) -> np.ndarray | None:
-    """Interseção do raio com o plano da tela (z = 0), ou None."""
-    if direction[2] >= -1e-6:
-        return None   # apontando para longe da tela
-    t = -origin[2] / direction[2]
-    return origin + t * direction if t > 0 else None
+def landmarks_cm(obs: FaceObservation, depth_cm: float) -> np.ndarray:
+    """Landmarks (n, 3) em cm pela câmera pinhole, com o rosto na profundidade dada."""
+    return px3d_to_cm(obs.points, (obs.image_width, obs.image_height), depth_cm)
 
 
 # ------------------------------------------------------------ projeção
@@ -152,7 +105,10 @@ class _Projector:
         self.f = 0.5 * self.w / np.tan(np.radians(view.fov_deg / 2))
 
     def __call__(self, P) -> tuple[int, int] | None:
-        pc = self.V @ (np.asarray(P, dtype=np.float64) - self.cam)
+        P = np.asarray(P, dtype=np.float64)
+        if not np.all(np.isfinite(P)):
+            return None
+        pc = self.V @ (P - self.cam)
         if pc[2] <= 1.0:
             return None
         x = self.w / 2 + self.f * pc[0] / pc[2]
@@ -183,6 +139,11 @@ class _Projector:
         r = max(1, int(round(self.f * radius_cm / max(self.depth(center), 1e-3))))
         cv2.circle(img, c, r, color, thick, cv2.LINE_AA)
 
+    def marker(self, img, P, color, kind=cv2.MARKER_TILTED_CROSS, size=14):
+        p = self(P)
+        if p is not None:
+            cv2.drawMarker(img, p, color, kind, size, 2, cv2.LINE_AA)
+
 
 def _label(img, s, org, color=(230, 230, 230), scale=0.45):
     cv2.putText(img, s, org, FONT, scale, (15, 15, 15), 3, cv2.LINE_AA)
@@ -190,33 +151,28 @@ def _label(img, s, org, color=(230, 230, 230), scale=0.45):
 
 
 # -------------------------------------------------------------- desenho
-def render_scene(view: OrbitView, screen_size: tuple[int, int], screen_width_cm: float,
-                 sample: GazeSample | None, obs: FaceObservation | None,
-                 cursor=None, raw_point=None, trail=(), targets=(),
-                 assumed_width: bool = True, size: tuple[int, int] = (760, 560),
-                 head_ref=None, face_bias=None, calibrated_gaze=None) -> np.ndarray:
-    """head_ref: pose da cabeça na calibração (yaw, pitch); com ela, o
-    texto mostra a cabeça em relação à calibração. face_bias: viés da
-    direção da face (calibration.face_bias); com ele, desenha em verde o
-    raio do rosto até a tela já corrigido. calibrated_gaze: (direção (3,),
-    ponto atingido na tela em cm (3,)) do olhar geométrico CALIBRADO
-    (o raio dos olhos até o ponto estimado pelo modelo do cursor, antes do
-    estabilizador); com ele, o raio magenta é o calibrado."""
-    """Imagem da cena 3D vista pela câmera virtual ``view``."""
+def render_scene(view: OrbitView, screen: VirtualScreen, sample: GazeSample | None,
+                 obs: FaceObservation | None, virtual_point=None, cursor=None,
+                 raw_point=None, trail=(), targets=(), assumed_width: bool = True,
+                 size: tuple[int, int] = (760, 560), head_ref=None,
+                 calibrated: bool = False) -> np.ndarray:
+    """Imagem da cena 3D vista pela câmera virtual ``view``.
+
+    virtual_point: pixel do MONITOR VIRTUAL atingido pelo vetor do olhar
+    (etapa 4); cursor / raw_point: pixel do monitor real depois da correção,
+    com e sem o estabilizador (etapa 5); head_ref: pose da cabeça na
+    calibração (yaw, pitch), para o texto."""
     W, H = size
     img = np.full((H, W, 3), (28, 24, 22), np.uint8)
-    to_cm = lambda p: screen_px_to_cm(p, screen_size, screen_width_cm)  # noqa: E731
-    sw, sh = screen_size
+    to_cm = lambda p: screen.px_to_cm(p)[0]  # noqa: E731
+    sw, sh = screen.size_px
     corners = [to_cm(p) for p in ((0, 0), (sw, 0), (sw, sh), (0, sh))]
     screen_center = to_cm((sw / 2, sh / 2))
 
-    E = None
-    if sample is not None and obs is not None:
-        E = (sample.raw[9:12] if sample.raw is not None
-             else eye_position_cm(obs, sample.head))
+    gaze = sample.gaze if sample is not None else None
+    E = sample.raw[RAW_FACE] if sample is not None else None
     head_c = E if E is not None else np.array([0.0, 8.0, 60.0])
-    pivot = 0.5 * (head_c + screen_center)
-    pj = _Projector(view, pivot, size)
+    pj = _Projector(view, 0.5 * (head_c + screen_center), size)
 
     # --- chão de referência (grade no plano y da base da tela) ----------
     floor_y = corners[2][1] + 4.0
@@ -225,7 +181,7 @@ def render_scene(view: OrbitView, screen_size: tuple[int, int], screen_width_cm:
     for k in np.linspace(-5, 90, 8):
         pj.line(img, (-40, floor_y, k), (40, floor_y, k), (50, 46, 44))
 
-    # --- tela ---------------------------------------------------------
+    # --- monitor (virtual = real na geometria suposta) ------------------
     pj.poly(img, corners, C_SCREEN, 2)
     pj.line(img, corners[0], corners[2], (0, 110, 150))
     pj.line(img, corners[1], corners[3], (0, 110, 150))
@@ -235,18 +191,17 @@ def render_scene(view: OrbitView, screen_size: tuple[int, int], screen_width_cm:
             cv2.circle(img, p, 2, C_TARGET, -1, cv2.LINE_AA)
     tl = pj(corners[0])
     if tl is not None:
-        txt = f"tela {screen_width_cm:.0f} cm" + (" (suposta)" if assumed_width else "")
+        txt = f"monitor {screen.width_cm:.1f} cm" + (" (largura suposta)" if assumed_width else "")
         _label(img, txt, (tl[0] + 4, tl[1] - 6), C_SCREEN)
 
     # --- webcam -------------------------------------------------------
-    s = 1.2
-    cam_pts = [np.array(v) * s for v in ((-1, -0.7, 1.6), (1, -0.7, 1.6), (1, 0.7, 1.6),
-                                         (-1, 0.7, 1.6))]
+    cam_pts = [1.2 * np.array(v) for v in ((-1, -0.7, 1.6), (1, -0.7, 1.6), (1, 0.7, 1.6),
+                                           (-1, 0.7, 1.6))]
     pj.poly(img, cam_pts, C_CAMERA, 1)
     for v in cam_pts:
         pj.line(img, (0, 0, 0), v, C_CAMERA)
 
-    # --- trilha e cursor na tela --------------------------------------
+    # --- trilha e cursor no monitor real --------------------------------
     tr = [pj(to_cm(p)) for p in trail]
     for a, b in zip(tr, tr[1:]):
         if a is not None and b is not None:
@@ -260,78 +215,68 @@ def render_scene(view: OrbitView, screen_size: tuple[int, int], screen_width_cm:
     if sample is None or obs is None:
         _label(img, "Rosto nao detectado", (12, 24), (80, 80, 255), 0.6)
     else:
-        pts_cm, cm_per_px = landmarks_cm(obs, E[2])
-        for P in pts_cm[:468:2]:
+        for P in landmarks_cm(obs, float(E[2]))[:468:2]:
             p = pj(P)
             if p is not None:
                 cv2.circle(img, p, 1, C_FACE, -1)
-
         # Eixos da cabeça a partir do ponto entre os olhos.
-        o = px3d_to_cm(sample.head.origin, obs, E[2])
-        for vec, color in ((sample.head.R[:, 0], (0, 0, 255)), (sample.head.R[:, 1], (0, 200, 0)),
-                           (-sample.head.R[:, 2], (255, 80, 0))):
-            pj.line(img, o, o + 5.0 * vec, color, 2)
+        anchors = np.array([e.anchor_cm for e in sample.eyes])
+        o = anchors.mean(axis=0)
+        R = sample.head.R
+        for vec, color in ((R[:, 0], (0, 0, 255)), (R[:, 1], (0, 200, 0)),
+                           (-R[:, 2], (255, 80, 0))):
+            pj.line(img, o, o + 4.0 * vec, color, 2)
 
-        # Globos oculares e raio de cada olho.
-        centers = []
-        for eye in sample.eyes:
-            c = px3d_to_cm(eye.eyeball_center_px, obs, E[2])
-            centers.append(c)
-            pj.circle_3d(img, c, eye.eyeball_radius_px * cm_per_px, C_EYE if eye.open else C_RAW)
-            if eye.open and calibrated_gaze is None:   # raios crus só antes de calibrar
-                pj.line(img, c, c + 12.0 * eye.direction_cam, C_EYE_RAY)
-        mid = np.mean(centers, axis=0)
-
-        # Raio geométrico até a tela: calibrado, se houver calibração; senão
-        # o do modelo do globo ocular puro (~40° para cima do olhar real).
-        if calibrated_gaze is not None:
-            gdir, ghit = calibrated_gaze
-            pj.line(img, mid, ghit, C_GEOM, 1)
-            p = pj(ghit)
-            if p is not None:
-                cv2.drawMarker(img, p, C_GEOM, cv2.MARKER_TILTED_CROSS, 14, 2, cv2.LINE_AA)
-            yaw, pitch = direction_to_angles(gdir)
-            lines.append((f"olhar calibrado: yaw {yaw:+.1f}  pitch {pitch:+.1f} graus",
-                          C_GEOM))
-        elif sample.direction_cam is not None:
-            hit = hit_screen(mid, sample.direction_cam)
-            if hit is not None:
-                pj.line(img, mid, hit, C_GEOM, 1)
-                p = pj(hit)
-                if p is not None:
-                    cv2.drawMarker(img, p, C_GEOM, cv2.MARKER_TILTED_CROSS, 14, 2, cv2.LINE_AA)
+        if gaze is not None:
+            # Etapas 2-3: globo, pupila e feixe de cada olho.
+            for k in range(2):
+                c, p, d = gaze.centers[k], gaze.pupils[k], gaze.directions[k]
+                color = C_EYE if gaze.open[k] else C_RAW
+                pj.circle_3d(img, c, float(np.linalg.norm(p - c)), color)
+                q = pj(p)
+                if q is not None:
+                    cv2.circle(img, q, 2, C_BEAM, -1, cv2.LINE_AA)
+                if gaze.open[k]:
+                    hit = screen.hit(c, d)[0]
+                    end = hit if np.all(np.isfinite(hit)) else c + 80.0 * d
+                    pj.line(img, c, end, C_BEAM, 1)
+            if gaze.vergence is not None:
+                pj.line(img, gaze.origin, gaze.vergence, C_VERGENCE, 1)
+                pj.marker(img, gaze.vergence, C_VERGENCE, cv2.MARKER_DIAMOND, 10)
+                lines.append((f"interseccao dos feixes: z = {gaze.vergence[2]:+.1f} cm "
+                              f"(distancia entre feixes {gaze.vergence_gap_cm:.2f} cm)",
+                              C_VERGENCE))
             else:
-                pj.line(img, mid, mid + 80.0 * sample.direction_cam, C_GEOM, 1)
-            yaw, pitch = sample.yaw_deg, sample.pitch_deg
-            lines.append((f"olhar geometrico (sem calibracao): yaw {yaw:+.1f}  pitch {pitch:+.1f}",
-                          C_GEOM))
-        # Olhar calibrado: do meio dos olhos até o cursor.
-        if cursor is not None:
+                lines.append(("feixes nao convergem a frente: bissetriz", C_VERGENCE))
+            # Etapa 4: vetor do olhar até o monitor virtual.
+            hit = screen.hit(gaze.origin, gaze.direction)[0]
+            if np.all(np.isfinite(hit)):
+                pj.line(img, gaze.origin, hit, C_VIRTUAL, 2)
+                pj.marker(img, hit, C_VIRTUAL)
+            else:
+                pj.line(img, gaze.origin, gaze.origin + 80.0 * gaze.direction, C_VIRTUAL, 2)
+            yaw, pitch = direction_to_angles(gaze.direction)
+            lines.append((f"vetor do olhar: yaw {yaw:+.1f}  pitch {pitch:+.1f} graus", C_VIRTUAL))
+        if virtual_point is not None and np.all(np.isfinite(virtual_point)):
+            pj.circle_3d(img, to_cm(virtual_point), 0.8, C_VIRTUAL, 1)
+        # Etapa 5: cursor no monitor real (correção + estabilizador).
+        if cursor is not None and gaze is not None:
             c = to_cm(cursor)
-            pj.line(img, mid, c, C_CURSOR, 2)
+            pj.line(img, gaze.origin, c, C_CURSOR, 1)
             pj.circle_3d(img, c, 1.2, C_CURSOR, 2)
-        # Direção do rosto corrigida pelo viés da calibração.
-        if face_bias is not None and sample.raw is not None:
-            P, _ = head_screen_point(sample.raw, np.asarray(face_bias))
-            hit = np.array([P[0, 0], P[0, 1], 0.0])
-            pj.line(img, E, hit, C_FACE_DIR, 1)
-            pf = pj(hit)
-            if pf is not None:
-                cv2.drawMarker(img, pf, C_FACE_DIR, cv2.MARKER_DIAMOND, 12, 2, cv2.LINE_AA)
         hy, hp, _ = sample.head.euler_deg
         if head_ref is not None:
-            lines.append((f"cabeca (rel. calibracao): yaw {hy - head_ref[0]:+.1f}  "
-                          f"pitch {hp - head_ref[1]:+.1f} graus   distancia {E[2]:.0f} cm",
-                          (220, 220, 220)))
-        else:
-            lines.append((f"cabeca: yaw {hy:+.1f}  pitch {hp:+.1f} graus   distancia {E[2]:.0f} cm",
-                          (220, 220, 220)))
+            hy, hp = hy - head_ref[0], hp - head_ref[1]
+        lines.append((f"cabeca{' (rel. calibracao)' if head_ref is not None else ''}: "
+                      f"yaw {hy:+.1f}  pitch {hp:+.1f} graus   distancia {E[2]:.0f} cm",
+                      (220, 220, 220)))
 
-    legend = [("amarelo: cursor (calibrado)", C_CURSOR),
-              ("verde: direcao do rosto (corrigida na calibracao)", C_FACE_DIR),
-              ("magenta: olhar" + (" calibrado (mesmo modelo do cursor)" if calibrated_gaze is not None
-                                              else " (sem calibracao)"), C_GEOM),
-              ] + ([] if calibrated_gaze is not None else [("azul claro: raio de cada olho", C_EYE_RAY)])
+    legend = [("circulo/ponto: centro do globo / pupila", C_EYE),
+              ("azul claro: feixe centro -> pupila de cada olho", C_BEAM),
+              ("branco: interseccao dos feixes", C_VERGENCE),
+              ("magenta: vetor do olhar -> monitor virtual", C_VIRTUAL),
+              ("amarelo: cursor no monitor real" + ("" if calibrated else " (sem calibracao)"),
+               C_CURSOR)]
     for i, (s, color) in enumerate(lines + legend):
         _label(img, s, (12, 22 + 20 * i), color)
     _label(img, "arrastar: girar | roda: zoom | botao direito: vista inicial",

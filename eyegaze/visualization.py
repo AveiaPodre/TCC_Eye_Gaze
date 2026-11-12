@@ -13,6 +13,7 @@ import numpy as np
 
 from .face_tracker import FaceObservation
 from .gaze import GazeSample
+from .geometry import cm_to_px
 from .landmarks import LEFT_EYE, RIGHT_EYE
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -53,19 +54,29 @@ def draw_landmarks(img, obs: FaceObservation):
 
 
 def draw_gaze(img, sample: GazeSample):
-    ray_len = 2.5 * sample.head.scale_px
-    for eye in sample.eyes:
-        color = (255, 255, 0) if eye.open else (120, 120, 120)
-        cv2.circle(img, _p(eye.eyeball_center_px), max(2, int(eye.eyeball_radius_px)),
-                   color, 1, cv2.LINE_AA)
-        cv2.circle(img, _p(eye.iris_px), 3, color, -1, cv2.LINE_AA)
-        if eye.open:
-            end = eye.iris_px + eye.direction_cam * ray_len
-            cv2.line(img, _p(eye.iris_px), _p(end), (0, 255, 120), 1, cv2.LINE_AA)
-    if sample.direction_cam is not None:
-        origin = np.mean([e.iris_px for e in sample.eyes], axis=0)
-        end = origin + sample.direction_cam * ray_len * 1.4
-        cv2.arrowedLine(img, _p(origin), _p(end), (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.15)
+    """Etapas 2-3 sobre a imagem: centro do globo (círculo com o raio até a
+    pupila), pupila e feixe de cada olho (do centro, passando pela pupila),
+    e o vetor do olhar a partir do ponto entre os olhos (seta amarela)."""
+    gaze = sample.gaze
+    if gaze is None:
+        for eye in sample.eyes:
+            cv2.circle(img, _p(eye.iris_px), 3, (120, 120, 120), -1, cv2.LINE_AA)
+        return
+    size = (img.shape[1], img.shape[0])
+    for k in range(2):
+        c_px = cm_to_px(gaze.centers[k], size)
+        p_px = cm_to_px(gaze.pupils[k], size)
+        color = (255, 255, 0) if gaze.open[k] else (120, 120, 120)
+        r = max(2, int(round(np.linalg.norm(p_px - c_px))))
+        cv2.circle(img, _p(c_px), r, color, 1, cv2.LINE_AA)
+        cv2.circle(img, _p(c_px), 2, color, -1, cv2.LINE_AA)
+        cv2.circle(img, _p(sample.eyes[k].iris_px), 3, (0, 255, 120), -1, cv2.LINE_AA)
+        if gaze.open[k]:
+            far = cm_to_px(gaze.centers[k] + 6.0 * gaze.directions[k], size)
+            cv2.line(img, _p(c_px), _p(far), (0, 255, 120), 1, cv2.LINE_AA)
+    o_px = cm_to_px(gaze.origin, size)
+    end = cm_to_px(gaze.origin + 9.0 * gaze.direction, size)
+    cv2.arrowedLine(img, _p(o_px), _p(end), (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.15)
 
 
 def draw_head_pose(img, sample: GazeSample):

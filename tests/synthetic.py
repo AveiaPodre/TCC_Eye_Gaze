@@ -51,7 +51,8 @@ def make_points(gaze_yaw=0.0, gaze_pitch=0.0, head=(0.0, 0.0, 0.0),
                 noise_px=0.0, rng: np.random.Generator | None = None,
                 gaze_vec=None, rho_true: float = RHO, v_scale: float = 1.0,
                 pitch_coupling: float = 0.0, lid_follow: float = 0.0,
-                mouth_open: float = 0.0, mouth_coupling: float = 0.0) -> np.ndarray:
+                mouth_open: float = 0.0, mouth_coupling: float = 0.0,
+                perspective_cm=None) -> np.ndarray:
     """Landmarks sintéticos.
 
     gaze_vec: direção do olhar na câmera (substitui gaze_yaw/gaze_pitch).
@@ -69,6 +70,10 @@ def make_points(gaze_yaw=0.0, gaze_pitch=0.0, head=(0.0, 0.0, 0.0),
         boca aberta, a íris e as pálpebras "descem" (mouth_coupling x
         abertura x largura do olho), e o olhar estimado desce sem o olho
         se mover.
+    perspective_cm: posição da cabeça (cm, referencial da câmera). Com ela,
+        x e y são a projeção em PERSPECTIVA de cada ponto (como os landmarks
+        reais do MediaPipe) e z é a profundidade relativa ao rosto na escala
+        de x; sem ela, perspectiva fraca (escala única ``scale``).
     """
     rng = rng or np.random.default_rng(0)
     R = rot(*head)
@@ -115,7 +120,14 @@ def make_points(gaze_yaw=0.0, gaze_pitch=0.0, head=(0.0, 0.0, 0.0),
     pts = rng.uniform([-6, -6, -1], [6, 7, 3], size=(478, 3))
     for k, v in local.items():
         pts[k] = v
-    out = scale * (pts @ R.T) + np.asarray(center)
+    if perspective_cm is not None:
+        P = np.asarray(perspective_cm, dtype=float) + pts @ R.T
+        z0 = float(perspective_cm[2])
+        out = np.column_stack([IMG_W / 2 + FOCAL * P[:, 0] / P[:, 2],
+                               IMG_H / 2 + FOCAL * P[:, 1] / P[:, 2],
+                               (P[:, 2] - z0) * FOCAL / z0])
+    else:
+        out = scale * (pts @ R.T) + np.asarray(center)
     if noise_px:
         out += rng.normal(0, noise_px, out.shape)
     return out
@@ -137,9 +149,12 @@ def make_transform(head=(0.0, 0.0, 0.0), head_pos_cm=(0.0, 0.0, 50.0)) -> np.nda
 def make_observation(*args, timestamp_ms=0, with_transform=False, head_pos_cm=None,
                      **kwargs) -> FaceObservation:
     """Observação sintética. Com head_pos_cm (x, y, z em cm, eixos da imagem),
-    a posição e a escala do rosto na imagem seguem uma câmera pinhole."""
+    cada landmark é projetado por uma câmera pinhole (perspectiva verdadeira),
+    a menos que ``center``/``scale`` sejam dados."""
     if head_pos_cm is not None:
         x, y, z = head_pos_cm
+        if "center" not in kwargs and "scale" not in kwargs:
+            kwargs["perspective_cm"] = tuple(head_pos_cm)
         kwargs.setdefault("center", (IMG_W / 2 + FOCAL * x / z, IMG_H / 2 + FOCAL * y / z, 0.0))
         kwargs.setdefault("scale", FOCAL / z)
     pts = make_points(*args, **kwargs)

@@ -14,9 +14,10 @@ Para cada alvo:
     2. "collect" - amostras válidas (rosto visível, sem piscada) são guardadas.
        Se o rosto sumir, o alvo espera até juntar o mínimo de amostras.
 
-Cada amostra guarda duas coisas: os ângulos (yaw, pitch), usados para
-rejeitar outliers, detectar a fixação e no CSV, e o vetor bruto ``raw``,
-entrada do modelo de calibração (ver calibration.py).
+Cada amostra guarda duas coisas: os ângulos (yaw, pitch) do vetor do olhar,
+usados para rejeitar outliers, detectar a fixação e no CSV, e o vetor bruto
+``raw`` (âncoras e pupilas em cm, pose da cabeça), entrada da calibração
+(ver gaze.py e calibration.py).
 
 A calibração percorre os alvos em ordem aleatória e tem uma etapa extra no
 fim: o alvo fica no centro e uma seta pede que a pessoa gire a cabeça
@@ -37,10 +38,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .calibration import (MOUTH_COL, CalibrationData, CalibrationModel, PointResult, build_grid,
+from .calibration import (CalibrationData, CalibrationModel, PointResult, build_grid,
                           fit_from_samples, head_angles, outlier_mask)
 from .config import CalibrationConfig, ValidationConfig
-from .gaze import GazeSample
+from .gaze import MOUTH_COL, RAW_FACE, GazeSample
 
 BG = (40, 40, 40)
 WHITE = (240, 240, 240)
@@ -73,7 +74,7 @@ class TargetProcedure:
         self.fixation_max_deg = fixation_max_deg
         self.collect_s = collect_s
         self.min_samples = min_samples
-        # Por alvo: lista de (features (2,), raw (20,)).
+        # Por alvo: lista de (features (2,), raw (RAW_SIZE,)).
         self.samples: list[list[tuple[np.ndarray, np.ndarray]]] = [[] for _ in self.targets]
         # Landmarks de cada amostra (para recalcular o olhar offline).
         self.observations: list[list] = [[] for _ in self.targets]
@@ -237,7 +238,7 @@ class TargetProcedure:
         return True
 
     def arrays(self, i: int) -> tuple[np.ndarray, np.ndarray]:
-        """(features (n,2), raw (n,20)) do alvo i."""
+        """(features (n, 2), raw (n, RAW_SIZE)) do alvo i."""
         feats = np.array([f for f, _ in self.samples[i]]).reshape(-1, 2)
         raws = np.array([r for _, r in self.samples[i]])
         return feats, raws
@@ -445,7 +446,7 @@ class CalibrationProcedure(TargetProcedure):
             grid = [np.atleast_2d(r) for i in range(len(self.targets))
                     for r in [self.arrays(i)[1]] if len(r)]
             self._mouth_base = (float(np.median(np.vstack(grid)[:, MOUTH_COL]))
-                                if grid and np.vstack(grid).shape[1] > MOUTH_COL else 0.0)
+                                if grid else 0.0)
         else:
             super().targets_done(now)
 
@@ -463,7 +464,7 @@ class CalibrationProcedure(TargetProcedure):
         valid = sample is not None and sample.valid
         if valid:
             self._last_valid = now
-            self.mouth_now = float(sample.raw[MOUTH_COL]) if len(sample.raw) > MOUTH_COL else 0.0
+            self.mouth_now = float(sample.raw[MOUTH_COL])
         if el < self.cfg.head_motion_settle_s:
             return
         if valid:
@@ -634,13 +635,12 @@ class CalibrationProcedure(TargetProcedure):
 
     def _fit(self, data: CalibrationData):
         return fit_from_samples(
-            data, (self.screen_w, self.screen_h),
-            self.cfg.polynomial_degree, self.cfg.ridge_alpha,
+            data, (self.screen_w, self.screen_h), self.cfg.screen_width_cm,
             self.cfg.outlier_mad_threshold,
             head_weight_points=self.cfg.head_motion_weight,
             head_max_deg=self.cfg.head_max_deg,
-            head_px_per_cm=(self.screen_w / self.cfg.screen_width_cm
-                            if self.cfg.screen_width_cm else None),
+            max_degree=self.cfg.polynomial_degree,
+            assumed_width_cm=self.cfg.assumed_screen_width_cm,
         )
 
     def bad_targets(self, stats: dict) -> list[int]:
@@ -695,8 +695,12 @@ class CalibrationProcedure(TargetProcedure):
             label, advice = quality_label(st["erro_loo_medio_px"], self.screen_w)
             self.message_lines.append(
                 f"Erro estimado em pontos novos: {st['erro_loo_medio_px']:.0f} px"
-                f"  (modelo {st.get('modelo', 'livre')}, iris {st.get('fonte_iris', 'mediapipe')},"
-                f" grau {st.get('grau', '?')})")
+                f"  (pupila {st.get('fonte_pupila', 'mediapipe')},"
+                f" correcao virtual->real: {st.get('correcao', '?')})")
+            if "erro_loo_monitor_virtual_px" in st:
+                self.message_lines.append(
+                    "So o monitor virtual (sem correcao): "
+                    f"{st['erro_loo_monitor_virtual_px']:.0f} px")
             if "erro_cv_cabeca_px" in st:
                 self.message_lines.append(
                     f"Erro estimado com a cabeca em poses novas: {st['erro_cv_cabeca_px']:.0f} px")
@@ -716,7 +720,7 @@ class CalibrationProcedure(TargetProcedure):
         self.message_lines.append("Branco = alvo, ponto colorido = estimativa. Use T para validar.")
         print(f"[Calibração] Concluída. Erro médio de ajuste {errs.mean():.1f} px, "
               f"máx {errs.max():.1f} px. Estatísticas: "
-              f"{ {k: v for k, v in st.items() if k != 'candidatos'} }")
+              f"{ {k: v for k, v in st.items() if k not in ('candidatos', 'erro_loo_por_alvo_px', 'erro_loo_alvos')} }")
         if self.raw_path is not None:
             print(f"[Calibração] Dados brutos em {self.raw_path}")
 
@@ -755,7 +759,7 @@ class ValidationProcedure(TargetProcedure):
 
     def on_complete(self):
         rows = []
-        accuracies, precisions = [], []
+        accuracies, precisions = [], []   # NaN: olhar fora do plano da tela
         raw_data = CalibrationData()
         for i, target in enumerate(self.targets):
             feats, raws = self.arrays(i)
@@ -764,6 +768,10 @@ class ValidationProcedure(TargetProcedure):
             keep = outlier_mask(feats, self.mad)
             s, raws = feats[keep], raws[keep]
             preds = self.model.predict(raws)
+            fin = np.all(np.isfinite(preds), axis=1)
+            preds, s = preds[fin], s[fin]
+            if not len(preds):
+                preds = np.full((1, 2), np.nan)
             med = np.median(preds, axis=0)
             pr = PointResult(target, (float(med[0]), float(med[1])), len(s))
             self.results.append(pr)
@@ -774,17 +782,17 @@ class ValidationProcedure(TargetProcedure):
                 rows.append([i, target[0], target[1], p[0], p[1], f[0], f[1],
                              float(np.hypot(p[0] - target[0], p[1] - target[1]))])
 
-        acc = float(np.mean(accuracies))
-        prec = float(np.mean(precisions))
+        acc = float(np.nanmean(accuracies))
+        prec = float(np.nanmean(precisions))
         errs = np.array([r.prediction for r in self.results]) - np.array(self.targets)
-        offset = errs.mean(axis=0)
-        acc_recentered = float(np.mean(np.hypot(*(errs - offset).T)))
+        offset = np.nanmean(errs, axis=0)
+        acc_recentered = float(np.nanmean(np.hypot(*(errs - offset).T)))
         self.summary = {
             "data": time.strftime("%Y-%m-%d %H:%M:%S"),
             "tela_px": [self.screen_w, self.screen_h],
             "n_alvos": len(self.targets),
             "acuracia_media_px": acc,
-            "acuracia_mediana_px": float(np.median(accuracies)),
+            "acuracia_mediana_px": float(np.nanmedian(accuracies)),
             "precisao_rms_media_px": prec,
             "acuracia_media_graus": self._px_to_deg(acc),
             "precisao_rms_media_graus": self._px_to_deg(prec),
@@ -836,10 +844,10 @@ class ValidationProcedure(TargetProcedure):
 class RecenterProcedure(TargetProcedure):
     """Correção rápida de deslocamento (1 ponto) sem refazer a calibração.
 
-    O modelo já compensa rotação e translação da cabeça, mas aproximações
-    (posição 3D do rosto estimada pelo MediaPipe, cansaço, óculos que
-    escorregam) deixam um deslocamento residual, que é corrigido somando
-    um offset à saída do modelo. Nos dados reais, esse desvio constante era
+    O pipeline geométrico já compensa rotação e translação da cabeça, mas
+    aproximações (posição 3D do rosto estimada pelo MediaPipe, cansaço,
+    óculos que escorregam) deixam um deslocamento residual, que é corrigido
+    somando um offset ao pixel do monitor real. Nos dados reais, esse desvio constante era
     a maior parte do erro depois de uma mudança de postura.
     """
 
@@ -857,9 +865,9 @@ class RecenterProcedure(TargetProcedure):
     def on_complete(self):
         feats, raws = self.arrays(0)
         raws = raws[outlier_mask(feats, self.mad)]
-        pred = np.median(self.model.predict(raws), axis=0)
+        pred = np.nanmedian(self.model.predict(raws), axis=0)
         delta = np.array(self.targets[0]) - pred
-        if (abs(delta[0]) > self.max_frac * self.screen_w
+        if (not np.all(np.isfinite(delta)) or abs(delta[0]) > self.max_frac * self.screen_w
                 or abs(delta[1]) > self.max_frac * self.screen_h):
             # Desvio grande demais para ser corrigido por um deslocamento:
             # a postura mudou muito ou o rosto foi mal detectado. Aplicar
@@ -879,7 +887,7 @@ class RecenterProcedure(TargetProcedure):
         # O offset agora vale para a postura atual: ela vira a referência do
         # aviso de postura (calibration.CalibrationModel.posture_deviation).
         self.model.head_ref = np.median(head_angles(raws), axis=0)
-        self.model.pos_ref = np.median(raws[:, 9:12], axis=0)
+        self.model.pos_ref = np.median(raws[:, RAW_FACE], axis=0)
         self.succeeded = True
         self.message_lines = [f"Recentralizado: deslocamento ({delta[0]:+.0f}, {delta[1]:+.0f}) px"]
         print(f"[Recentralizar] Offset ajustado em ({delta[0]:+.1f}, {delta[1]:+.1f}) px.")

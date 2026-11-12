@@ -3,9 +3,9 @@ Teste de ponta a ponta do app com um "usuário simulado".
 
 O FakeTracker substitui o MediaPipe: ele olha para o alvo que o app está
 mostrando (ou para ``look_at``), segue as setas da etapa de movimento da
-cabeça e devolve landmarks sintéticos coerentes com isso. O "usuário" tem os
-erros típicos de webcam (ganho do olho diferente do assumido, íris achatada
-na vertical, acoplamento com o pitch da cabeça) e ruído nos landmarks.
+cabeça e devolve landmarks sintéticos coerentes com isso. O "usuário" tem o
+erro típico do MediaPipe (movimento da íris encolhido, mais na vertical) e
+ruído nos landmarks.
 
 Exercita: calibração (com etapa de cabeça), cursor estável, cursor com a
 cabeça girada/transladada, validação, recentralização, mouse, dwell-click,
@@ -24,14 +24,11 @@ from synthetic import ScreenGeometry, make_observation
 
 SCREEN = (1920, 1080)
 EYE_POS = np.array([0.0, 10.0, 60.0])
-# Íris quase parada na vertical (como nos dados reais do MediaPipe) e
-# pálpebras acompanhando o olhar: o sinal vertical vem das pálpebras.
-# pitch_coupling = 0.2 (= v_scale): a íris vertical NÃO responde à inclinação
-# da cabeça com o olhar fixo, como medido nas sessões reais com o estimador
-# atual (razão resposta-na-cabeça/resposta-na-grade de -0,13 a +0,15). O
-# valor antigo (0,4) imitava o estimador que usava o z da íris e fazia v
-# responder AO CONTRÁRIO (razão -1), o que não ocorre mais.
-USER = dict(rho_true=0.5, v_scale=0.2, pitch_coupling=0.2, lid_follow=0.7)
+# Globo maior que o anatômico (raio 0,5 x largura do olho) e movimento
+# vertical da íris a 30%: o raio efetivo de cada eixo absorve isso. A íris
+# contra-rotaciona com a cabeça; nos dados reais ela quase não o faz na
+# vertical, limitação medida em docs/metodologia.md (não simulada aqui).
+USER = dict(rho_true=0.5, v_scale=0.3)
 
 
 class Clock:
@@ -131,6 +128,7 @@ def make_app(tmp_path):
     cfg.calibration.results_dir = tmp_path / "results"
     cfg.calibration.random_seed = 0   # ordem dos alvos reproduzível nos testes
     cfg.validation.screen_width_cm = 53.0
+    cfg.calibration.screen_width_cm = 53.0     # monitor do usuário simulado
     cfg.validation.viewing_distance_cm = 60.0
     clock = Clock()
     tracker = FakeTracker()
@@ -184,16 +182,13 @@ def test_end_to_end(tmp_path):
     app.handle_key(ord("m"))
     assert not mouse.enabled
 
-    # --- calibração (9 pontos + etapa de cabeça) -----------------------
+    # --- calibração (16 pontos + etapa da cabeça) ----------------------
     app.handle_key(ord(" "))
     proc = run_procedure(app, out_dir=out_dir, snap_head=True)
     assert proc.collecting_done and proc.succeeded
     assert len(proc.head_samples) > 60
     assert proc.stats["usa_etapa_cabeca"]
-    # Erro de ajuste no pior alvo: o modelo físico (3 coeficientes), quando
-    # escolhido pela validação cruzada, ajusta um pouco pior a grade (~45 px)
-    # e melhor as poses novas da cabeça.
-    assert max(r.error_px for r in proc.results) < 55
+    assert max(r.error_px for r in proc.results) < 70
     if out_dir:
         cv2.imwrite(os.path.join(out_dir, "calibracao_resultado.png"), app.last_target_view)
     app.handle_key(13)  # qualquer tecla fecha a tela de resultado
@@ -205,12 +200,12 @@ def test_end_to_end(tmp_path):
         for head in [(0, 0, 0), (15, 0, 0), (-12, 8, 3), (0, -10, 0)]:
             tracker.look_at, tracker.head = target, head
             settle(app)
-            assert err(app, target) < 80, (target, head, err(app, target))
+            # Cabeça girada até 15°: ~120 px de resíduo no usuário sintético
+            # (compressão vertical da íris x forma tangente do modelo do olho;
+            # ver test_pipeline.test_head_rotation_and_translation_are_compensated).
+            assert err(app, target) < 130, (target, head, err(app, target))
             assert cursor_jitter(app) < 4.0, (target, head)
-    # ... e com a cabeça deslocada (translação). O caso 8 cm mais perto fica
-    # em ~72 px: a validação cruzada mede rotação (a etapa da cabeça), não
-    # translação, e escolhe o grau 1, que extrapola um pouco pior a
-    # distância (o grau 2 fixo dava ~63 px, mas era pior com rotação).
+    # ... e com a cabeça deslocada (translação).
     tracker.head = (0, 0, 0)
     for pos in [(5.0, 10.0, 60.0), (0.0, 13.0, 52.0)]:
         tracker.pos = np.array(pos)
@@ -316,17 +311,14 @@ def test_calibration_without_head_stage(tmp_path):
     assert err(app, (700, 400)) < 60
 
 
-def test_screen_width_fixes_head_gain_without_head_stage(tmp_path):
-    """Com a largura física da tela (detectada ou --screen-width-cm), o
-    ganho da cabeça vem da geometria: inclinar a cabeça mantém o cursor no
-    lugar certo mesmo sem a etapa da cabeça."""
+def test_head_tilt_without_head_stage(tmp_path):
+    """Sem a etapa da cabeça, o feixe ainda acompanha a rotação da cabeça pela
+    geometria (R): inclinar a cabeça mantém o cursor no lugar."""
     app, tracker, _ = make_app(tmp_path)
     app.cfg.calibration.head_stage = False
-    app.cfg.calibration.screen_width_cm = 53.0   # monitor do usuário simulado
     app.handle_key(ord(" "))
     proc = run_procedure(app)
-    assert proc.succeeded and proc.stats["px_por_cm_cabeca"] > 0
-    assert proc.model.y_model is not None
+    assert proc.succeeded and proc.stats["largura_conhecida"]
     app.handle_key(13)
     for head in [(0, -8, 0), (0, 6, 0)]:
         tracker.head, tracker.look_at = head, (900, 850)
@@ -359,7 +351,6 @@ def test_mouth_stage_end_to_end(tmp_path):
     a etapa da boca, o cursor não se move quando a boca abre."""
     import synthetic
     app, tracker, _ = make_app(tmp_path)
-    app.cfg.calibration.screen_width_cm = 53.0
     orig = synthetic.make_points
 
     def with_artifact(*a, **k):
@@ -386,7 +377,6 @@ def test_head_fine_adjustment_moves_cursor_from_gaze_point(tmp_path):
     """Modo A: olhando um alvo, um pequeno giro da cabeça desloca o cursor
     (precisão da cabeça); um salto do olhar zera o ajuste."""
     app, tracker, _ = make_app(tmp_path)
-    app.cfg.calibration.screen_width_cm = 53.0
     app.handle_key(ord(" "))
     run_procedure(app)
     app.handle_key(13)

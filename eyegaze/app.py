@@ -1,10 +1,16 @@
 """
 Loop principal da aplicação.
 
-    câmera -> FaceTracker (landmarks + pose)
-           -> GazeEstimator (rotação da cabeça, posição 3D do rosto, íris)
-           -> CalibrationModel (raio do olhar -> plano da tela -> pixel)
+    câmera -> FaceTracker                  1. landmarks
+           -> GazeEstimator                2. âncora + pupila de cada olho (cm)
+              + EyeballModel               2-3. centro do globo, feixes, intersecção
+           -> VirtualScreen                4. vetor do olhar -> monitor virtual
+           -> CalibrationModel             5. correção monitor virtual -> real
            -> FixationStabilizer -> mouse / dwell
+
+Antes de calibrar, o mesmo pipeline roda com o globo anatômico típico e sem
+correção (o ponto do monitor virtual é o cursor); a calibração troca os dois
+pelos ajustados.
 
 Os procedimentos de calibração, validação e recentralização rodam DENTRO
 deste mesmo loop (procedures.py), então o rastreamento nunca para.
@@ -21,10 +27,11 @@ import numpy as np
 
 from . import scene3d
 from . import visualization as vis
-from .calibration import CalibrationModel, build_grid, uncalibrated_mapping
+from .calibration import CalibrationModel, build_grid
 from .config import AppConfig
 from .filters import FixationStabilizer, HeadFineTuner, OneEuroFilter
 from .gaze import GazeEstimator, GazeSample, direction_to_angles
+from .geometry import VirtualScreen
 from .io_devices import DwellClick, MouseController
 from .procedures import (CalibrationProcedure, RecenterProcedure, TargetProcedure,
                          ValidationProcedure)
@@ -53,17 +60,16 @@ class EyeGazeApp:
         self.mouse = mouse if mouse is not None else MouseController(screen_size)
 
         self.estimator = GazeEstimator(cfg.gaze)
-        self.filter = OneEuroFilter(cfg.filter.min_cutoff, cfg.filter.beta, cfg.filter.d_cutoff)
         st = cfg.stabilizer
         self.stabilizer = FixationStabilizer(
             saccade_px=st.saccade_ratio * screen_size[0], confirm_frames=st.confirm_frames,
             window=st.window_frames, follow=st.follow, lock_px=st.lock_ratio * screen_size[0],
             lock_k=st.lock_k, shift_frames=st.shift_frames, settle_frames=st.settle_frames,
             noise_k=st.noise_k, lock_cap=st.lock_cap)
-        # Suavização SÓ da exibição do olhar bruto (raio magenta da vista 3D):
-        # a estimativa bruta treme ~18 px por quadro; o cursor não usa isto.
+        # Suavização SÓ da exibição do ponto no monitor virtual (vista 3D):
+        # a estimativa bruta treme de quadro a quadro; o cursor não usa isto.
         self._display_filter = OneEuroFilter(1.5, 0.01, 1.0)
-        self.screen_point_display: np.ndarray | None = None
+        self.virtual_point_display: np.ndarray | None = None
         fc = cfg.fine
         self.fine_enabled = fc.enabled
         self.fine = HeadFineTuner(fc.gain_px_per_deg, fc.deadzone_deg, fc.max_px, fc.reset_deg)
@@ -83,9 +89,14 @@ class EyeGazeApp:
         self._scene_window_open = False
         self.mirror = cfg.camera.mirror_display
 
-        self.model: CalibrationModel | None = CalibrationModel.load(
-            cfg.calibration.save_path, screen_size)
+        # Monitor virtual (etapa 4) e o pipeline SEM calibração: globo
+        # anatômico típico e nenhuma correção virtual -> real.
+        cc = cfg.calibration
+        self.screen_width_cm = cc.screen_width_cm or cc.assumed_screen_width_cm
+        self.base_model = CalibrationModel(VirtualScreen(screen_size, self.screen_width_cm))
+        self.model: CalibrationModel | None = CalibrationModel.load(cc.save_path, screen_size)
         if self.model is not None:
+            self.estimator.eyeball = self.model.eyeball
             print(f"[Calibração] Carregada ({self.model.created_at}). "
                   "Pressione ESPAÇO para refazer.")
         self.calib_targets = build_grid(*screen_size, cfg.calibration.grid_cols,
@@ -94,7 +105,6 @@ class EyeGazeApp:
         self.procedure: TargetProcedure | None = None
         self.sample: GazeSample | None = None
         self.obs = None
-        self.features_filtered: np.ndarray | None = None
         self.screen_point: np.ndarray | None = None
         self.screen_point_raw: np.ndarray | None = None
         self.trail: deque = deque(maxlen=25)
@@ -121,14 +131,16 @@ class EyeGazeApp:
     def calibrated(self) -> bool:
         return self.model is not None and self.model.is_fitted
 
-    def _map_to_screen(self, sample: GazeSample, feats_filtered: np.ndarray) -> np.ndarray:
-        if self.calibrated:
-            p = self.model.predict(sample.raw)
-        else:
-            c = self.cfg.calibration
-            p = uncalibrated_mapping(feats_filtered, self.screen_size,
-                                     c.uncalibrated_half_range_yaw_deg,
-                                     c.uncalibrated_half_range_pitch_deg)
+    @property
+    def active_model(self) -> CalibrationModel:
+        """Pipeline em uso: o calibrado, ou o anatômico sem correção."""
+        return self.model if self.calibrated else self.base_model
+
+    def _map_to_screen(self, sample: GazeSample) -> np.ndarray | None:
+        """Etapas 4-5: pixel do monitor real (None se o olhar não atinge a tela)."""
+        p = self.active_model.predict(sample.raw)
+        if not np.all(np.isfinite(p)):
+            return None
         w, h = self.screen_size
         # Permite sair um pouco da tela antes de estabilizar (não "gruda" na borda).
         return np.array([np.clip(p[0], -0.1 * w, 1.1 * w), np.clip(p[1], -0.1 * h, 1.1 * h)])
@@ -175,12 +187,15 @@ class EyeGazeApp:
             self.last_face_time = now
         face_recent = now - self.last_face_time <= self.cfg.mouse.face_lost_timeout_s
 
-        if self.sample is not None and self.sample.valid:
+        point = (self._map_to_screen(self.sample)
+                 if self.sample is not None and self.sample.valid else None)
+        if point is not None:
             self.recent_raw.append(self.sample.raw)
             self._update_posture(self.sample, now)
-            self.features_filtered = self.filter(self.sample.features(), now)
-            self.screen_point_raw = self._map_to_screen(self.sample, self.features_filtered)
-            self.screen_point_display = self._display_filter(self.screen_point_raw, now)
+            self.screen_point_raw = point
+            v = self.active_model.virtual_px(self.sample.raw)[0]
+            if np.all(np.isfinite(v)):
+                self.virtual_point_display = self._display_filter(v, now)
             w, h = self.screen_size
             stab = self.stabilizer(self.screen_point_raw)
             if self.fine_enabled and self.calibrated:
@@ -191,16 +206,14 @@ class EyeGazeApp:
             self.trail.append(self.screen_point.copy())
         elif not face_recent:
             # Rosto perdido: zera os filtros para não "puxar" a posição antiga.
-            self.filter.reset()
             self.stabilizer.reset()
             self.fine.reset()
             self.recent_raw.clear()
-            self.features_filtered = None
             self.screen_point_raw = None
-            self.screen_point_display = None
+            self.virtual_point_display = None
             self._display_filter.reset()
             self.screen_point = None
-        # Durante uma piscada, mantém a última posição.
+        # Durante uma piscada (ou olhar fora da tela), mantém a última posição.
 
         if self.procedure is not None:
             self.procedure.update(self.sample, now)
@@ -257,6 +270,8 @@ class EyeGazeApp:
         self._close_target_window()
         if isinstance(proc, CalibrationProcedure) and proc.succeeded:
             self.model = proc.model
+            # Feixes e vetor do olhar de cada quadro passam a usar o globo ajustado.
+            self.estimator.eyeball = self.model.eyeball
             self.stabilizer.reset()
             self.model.save(self.cfg.calibration.save_path)
             self.toast("Calibracao salva")
@@ -383,15 +398,16 @@ class EyeGazeApp:
             lines.append(("Ajuste fino pela cabeca: OFF (A)", GRAY))
         if self.posture_off:
             lines.append(("Postura fora da calibracao: R para recentralizar", YELLOW))
-        cal_gaze = self._calibrated_gaze() if self.show_gaze else None
-        if cal_gaze is not None:
-            yaw, pitch = direction_to_angles(cal_gaze[0])
-            lines.append((f"Olhar (calibrado) yaw {yaw:+5.1f}  pitch {pitch:+5.1f} graus", YELLOW))
-        elif self.show_gaze and self.features_filtered is not None and not self.calibrated:
-            # Ângulos do modelo geométrico, SEM calibração: têm o viés do
-            # MediaPipe (~25-30° para cima), então só aparecem antes de calibrar.
-            yaw, pitch = self.features_filtered
-            lines.append((f"Olhar (sem calibracao) yaw {yaw:+5.1f}  pitch {pitch:+5.1f}", YELLOW))
+        gaze = self.sample.gaze if self.sample is not None else None
+        if self.show_gaze and gaze is not None:
+            yaw, pitch = direction_to_angles(gaze.direction)
+            tag = "globo calibrado" if self.calibrated else "globo anatomico, sem calibracao"
+            lines.append((f"Olhar yaw {yaw:+5.1f}  pitch {pitch:+5.1f} graus ({tag})", YELLOW))
+            if gaze.vergence is not None:
+                lines.append((f"Interseccao dos feixes a {gaze.vergence[2]:+.0f} cm do plano "
+                              "da tela", GRAY))
+            else:
+                lines.append(("Feixes nao convergem: usando a bissetriz", GRAY))
         if self.sample is not None and (self.show_head_pose or self.calibrated):
             hy, hp, hr = self.sample.head.euler_deg
             if self.calibrated:
@@ -441,41 +457,14 @@ class EyeGazeApp:
         self.last_target_view = None
 
     def render_scene_view(self) -> np.ndarray:
-        width_cm = self.cfg.validation.screen_width_cm
-        assumed = width_cm is None
-        if assumed:
-            width_cm = self.cfg.display.assumed_screen_width_cm
         return scene3d.render_scene(
-            self.view3d, self.screen_size, width_cm, self.sample, self.obs,
-            cursor=self.screen_point if self.calibrated else None,
-            raw_point=self.screen_point_raw if self.calibrated else None,
-            trail=list(self.trail) if self.calibrated else (),
-            targets=self.calib_targets, assumed_width=assumed,
+            self.view3d, self.active_model.screen, self.sample, self.obs,
+            virtual_point=self.virtual_point_display, cursor=self.screen_point,
+            raw_point=self.screen_point_raw, trail=list(self.trail),
+            targets=self.calib_targets,
+            assumed_width=self.cfg.calibration.screen_width_cm is None,
             head_ref=self.model.head_ref if self.calibrated else None,
-            face_bias=self._face_bias(), calibrated_gaze=self._calibrated_gaze())
-
-    def _calibrated_gaze(self):
-        """(direção, ponto na tela em cm) do olhar CALIBRADO: o raio dos olhos
-        até o ponto estimado pelo modelo do cursor (antes do estabilizador).
-
-        Antes, o raio exibido vinha de um modelo geométrico separado e não
-        coincidia com o cursor. Agora os dois são o mesmo estimador: o raio
-        mostra para onde o modelo acha que você olha, e o cursor é esse mesmo
-        ponto estabilizado."""
-        if (not self.calibrated or self.sample is None or self.sample.raw is None
-                or self.screen_point_display is None):
-            return None
-        width_cm = self.cfg.validation.screen_width_cm or self.cfg.display.assumed_screen_width_cm
-        hit = scene3d.screen_px_to_cm(self.screen_point_display, self.screen_size, width_cm)
-        d = hit - self.sample.raw[9:12]
-        return d / np.linalg.norm(d), hit
-
-    def _face_bias(self):
-        """Viés da direção da face da calibração atual (None se não houver)."""
-        if not self.calibrated:
-            return None
-        m = self.model.y_model if self.model.y_model is not None else self.model
-        return m.face_bias
+            calibrated=self.calibrated)
 
     def _open_scene_window(self):
         if self.headless or self._scene_window_open:
