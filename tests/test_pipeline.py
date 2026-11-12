@@ -576,3 +576,26 @@ def test_stabilizer_holds_still_when_estimate_wanders():
         step = np.linalg.norm(np.diff(out[15:], axis=0), axis=1)
         moving.append(np.mean(step > 0.5))
     assert np.mean(moving) < 0.05   # cursor parado em >95% dos quadros da fixação
+
+
+def test_head_fine_tuner_directions_deadzone_and_resets():
+    from eyegaze.filters import HeadFineTuner
+    ft = HeadFineTuner(gain_px_per_deg=25, deadzone_deg=0.3, max_px=100, reset_deg=6, smooth_hz=1000)
+    c = np.array([900.0, 500.0])
+    t = 0.0
+    assert np.allclose(ft(c, 1, (0.0, 0.0), t), c)           # nova fixação: referência
+    t += 0.03
+    assert np.allclose(ft(c, 1, (0.2, -0.2), t), c)          # dentro da zona morta
+    t += 0.03
+    out = ft(c, 1, (2.3, 0.0), t)                             # cabeça 2,3° para a direita
+    assert out[0] == pytest.approx(900 + 25 * 2.0, abs=1)     # (2,3 - 0,3) x 25
+    t += 0.03
+    out = ft(c, 1, (0.0, 1.3), t)                             # cabeça 1,3° para cima
+    assert out[1] == pytest.approx(500 - 25 * 1.0, abs=1)     # cursor sobe
+    t += 0.03
+    out = ft(c, 1, (5.5, 5.5), t)
+    assert np.linalg.norm(out - c) == pytest.approx(100, abs=1)   # limite (~184 px sem ele)
+    t += 0.03
+    assert np.allclose(ft(c, 1, (8.0, 0.0), t), c)            # giro grande: mudança de postura
+    t += 0.03
+    assert np.allclose(ft(c, 2, (9.0, 0.0), t), c)            # nova fixação zera

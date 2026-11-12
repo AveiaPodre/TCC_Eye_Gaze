@@ -237,6 +237,18 @@ class AdaptConfig:
 
 
 @dataclass
+class FineConfig:
+    # Ajuste fino pela cabeça (tecla A; filters.HeadFineTuner): durante uma
+    # fixação, pequenos giros da cabeça deslocam o cursor a partir do ponto
+    # do olhar. A cabeça é medida com ~10x mais precisão que o olhar.
+    enabled: bool = False
+    gain_px_per_deg: float = 25.0   # o "físico" seria ~38 px/grau; menor = mais preciso
+    deadzone_deg: float = 0.3       # balanço natural da cabeça não move o cursor
+    max_px: float = 250.0           # ajuste máximo a partir do ponto do olhar
+    reset_deg: float = 6.0          # giro maior que isto = mudança de postura (zera)
+
+
+@dataclass
 class DwellClickConfig:
     enabled_at_start: bool = False
     dwell_time_s: float = 1.0
@@ -274,4 +286,5 @@ class AppConfig:
     posture: PostureConfig = field(default_factory=PostureConfig)
     adapt: AdaptConfig = field(default_factory=AdaptConfig)
     dwell: DwellClickConfig = field(default_factory=DwellClickConfig)
+    fine: FineConfig = field(default_factory=FineConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)

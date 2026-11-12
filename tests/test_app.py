@@ -380,3 +380,41 @@ def test_mouth_stage_end_to_end(tmp_path):
         assert np.linalg.norm(app.screen_point - closed) < 60, (closed, app.screen_point)
     finally:
         synthetic.make_points = orig
+
+
+def test_head_fine_adjustment_moves_cursor_from_gaze_point(tmp_path):
+    """Modo A: olhando um alvo, um pequeno giro da cabeça desloca o cursor
+    (precisão da cabeça); um salto do olhar zera o ajuste."""
+    app, tracker, _ = make_app(tmp_path)
+    app.cfg.calibration.screen_width_cm = 53.0
+    app.handle_key(ord(" "))
+    run_procedure(app)
+    app.handle_key(13)
+    tracker.look_at, tracker.head = (900, 500), (0, 0, 0)
+    settle(app, 60)
+    base = app.screen_point.copy()
+    # Sem o modo: girar a cabeça olhando o mesmo alvo não move o cursor.
+    tracker.head = (2.0, 0, 0)
+    settle(app, 30)
+    assert np.linalg.norm(app.screen_point - base) < 30
+    tracker.head = (0, 0, 0)
+    settle(app, 60)
+    app.handle_key(ord("a"))
+    assert app.fine_enabled
+    settle(app, 30)
+    base = app.screen_point.copy()
+    tracker.head = (2.0, 0, 0)          # cabeça 2° para a direita
+    settle(app, 30)
+    dx = app.screen_point[0] - base[0]
+    assert 20 < dx < 80, dx             # ~ (2 - 0,3) x 25 = 42 px
+    tracker.head = (0, 1.5, 0)          # cabeça para cima
+    settle(app, 30)
+    assert app.screen_point[1] < base[1] - 10
+    # Salto do olhar: o cursor vai ao novo ponto e o ajuste zera.
+    tracker.head = (0, 0, 0)
+    tracker.look_at = (300, 900)
+    settle(app, 45)
+    assert err(app, (300, 900)) < 80
+    assert np.linalg.norm(app.fine.offset) < 1
+    app.handle_key(ord("a"))
+    assert not app.fine_enabled

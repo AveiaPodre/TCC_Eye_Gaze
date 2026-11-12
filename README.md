@@ -118,6 +118,7 @@ automaticamente. Ela é descartada se a resolução da tela mudar.
 | `R` | recentralizar (corrige deslocamento com 1 ponto) |
 | `M` | liga/desliga o controle do mouse (exige calibração) |
 | `D` | liga/desliga o dwell-click |
+| `A` | liga/desliga o **ajuste fino pela cabeça**: o olhar leva o cursor à região e, enquanto você continua olhando, pequenos giros da cabeça (direita/esquerda/cima/baixo) movem o cursor a partir dali com precisão de poucos pixels. Um novo salto do olhar zera o ajuste. Parâmetros em `FineConfig` |
 | `L` | liga/desliga a visualização dos **landmarks** (malha, contorno dos olhos, íris, cantos) |
 | `G` | liga/desliga a visualização do **olhar** (globos oculares, raio de cada olho, raio combinado, ângulos) |
 | `P` | liga/desliga os **eixos da cabeça** e os ângulos de pose |

@@ -284,6 +284,32 @@ cursor. Com um passeio de ~50 px, eles não se distinguem do ruído em tempo
 útil. Na vista 3D, o raio passou a ser desenhado com uma suavização leve
 (One-Euro, só na exibição), sem efeito no cursor.
 
+### 4.3 Ajuste fino pela cabeça (modo híbrido, tecla A)
+
+Com o olhar parado num alvo, a estimativa do olhar varia ~41 px (desvio,
+272 alvos das calibrações gravadas), mas a pose da cabeça varia só 0,10°,
+o que com o ganho de 25 px/grau dá ~2-4 px. A ponta do nariz varia 0,34 px na
+imagem. A cabeça é medida com precisão ~10x maior que o olhar.
+
+O modo híbrido (`filters.HeadFineTuner`, desligado por padrão) usa as duas:
+
+1. o olhar leva o cursor à região, e o estabilizador o trava na fixação;
+2. durante a acomodação da fixação (primeiros 8 quadros), a pose da cabeça
+   vira a referência;
+3. depois, cursor = ponto da fixação + 25 px/grau × (pose − referência),
+   com zona morta de 0,3° (o balanço natural da cabeça não move o cursor),
+   limite de 250 px, girar para a direita move para a direita e inclinar para
+   cima move para cima;
+4. uma nova fixação (sacada ou deslocamento do olhar) zera o ajuste, e um
+   giro maior que 6° também (mudança de postura).
+
+Enquanto a pessoa ajusta pela cabeça e continua olhando o alvo, o olho
+gira ao contrário da cabeça. Com a compensação da cabeça do modelo, a
+estimativa do olhar fica no lugar, dentro do raio de trava, e o ponto da
+fixação não muda. O ganho (25 px/grau) é menor que o físico (~38) para
+favorecer a precisão. Serve só para quem tem algum controle da cabeça; o
+modo só com o olhar continua sendo o padrão.
+
 ## 5. Calibração (`calibration.py`, `procedures.py`)
 
 ### 5.1 Por que o modelo mudou (versão 3)

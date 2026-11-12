@@ -127,6 +127,7 @@ HELP_LINES = [
     "R  recentralizar (1 ponto)",
     "M  liga/desliga mouse",
     "D  liga/desliga dwell-click",
+    "A  ajuste fino pela cabeca",
     "L  landmarks   G  olhar",
     "P  pose cabeca V  minimapa",
     "3  vista 3D    F  espelhar",

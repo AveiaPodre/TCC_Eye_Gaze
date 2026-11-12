@@ -23,7 +23,7 @@ from . import scene3d
 from . import visualization as vis
 from .calibration import CalibrationModel, build_grid, uncalibrated_mapping
 from .config import AppConfig
-from .filters import FixationStabilizer, OneEuroFilter
+from .filters import FixationStabilizer, HeadFineTuner, OneEuroFilter
 from .gaze import GazeEstimator, GazeSample, direction_to_angles
 from .io_devices import DwellClick, MouseController
 from .procedures import (CalibrationProcedure, RecenterProcedure, TargetProcedure,
@@ -64,6 +64,9 @@ class EyeGazeApp:
         # a estimativa bruta treme ~18 px por quadro; o cursor não usa isto.
         self._display_filter = OneEuroFilter(1.5, 0.01, 1.0)
         self.screen_point_display: np.ndarray | None = None
+        fc = cfg.fine
+        self.fine_enabled = fc.enabled
+        self.fine = HeadFineTuner(fc.gain_px_per_deg, fc.deadzone_deg, fc.max_px, fc.reset_deg)
         self.dwell = DwellClick(cfg.dwell.dwell_time_s, cfg.dwell.tolerance_px,
                                 cfg.dwell.cooldown_s)
         self.dwell_enabled = cfg.dwell.enabled_at_start
@@ -180,12 +183,17 @@ class EyeGazeApp:
             self.screen_point_display = self._display_filter(self.screen_point_raw, now)
             w, h = self.screen_size
             stab = self.stabilizer(self.screen_point_raw)
+            if self.fine_enabled and self.calibrated:
+                hy, hp, _ = self.sample.head.euler_deg
+                stab = self.fine(stab, self.stabilizer.fixation_id, (hy, hp), now,
+                                 settling=self.stabilizer.settling)
             self.screen_point = np.array([np.clip(stab[0], 0, w - 1), np.clip(stab[1], 0, h - 1)])
             self.trail.append(self.screen_point.copy())
         elif not face_recent:
             # Rosto perdido: zera os filtros para não "puxar" a posição antiga.
             self.filter.reset()
             self.stabilizer.reset()
+            self.fine.reset()
             self.recent_raw.clear()
             self.features_filtered = None
             self.screen_point_raw = None
@@ -329,6 +337,10 @@ class EyeGazeApp:
             self.toast(f"Vista 3D: {'ON' if self.show_scene3d else 'OFF'}")
         elif ch == "h":
             self.show_help = not self.show_help
+        elif ch == "a":
+            self.fine_enabled = not self.fine_enabled
+            self.fine.reset()
+            self.toast(f"Ajuste fino pela cabeca: {'ON' if self.fine_enabled else 'OFF'}")
         elif ch == "f":
             self.mirror = not self.mirror
             self.toast(f"Espelhar imagem: {'ON' if self.mirror else 'OFF'}")
@@ -364,6 +376,11 @@ class EyeGazeApp:
             lines.append(("Mouse: OFF (M)", GRAY))
         lines.append((f"Dwell-click: {'ON' if self.dwell_enabled else 'OFF'} (D)",
                       GREEN if self.dwell_enabled else GRAY))
+        if self.fine_enabled:
+            ox, oy = self.fine.offset
+            lines.append((f"Ajuste fino pela cabeca: ON (A)  desvio ({ox:+.0f}, {oy:+.0f}) px", GREEN))
+        else:
+            lines.append(("Ajuste fino pela cabeca: OFF (A)", GRAY))
         if self.posture_off:
             lines.append(("Postura fora da calibracao: R para recentralizar", YELLOW))
         cal_gaze = self._calibrated_gaze() if self.show_gaze else None

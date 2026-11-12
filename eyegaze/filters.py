@@ -120,10 +120,16 @@ class FixationStabilizer:
         self.threshold = self.saccade_px
         self.noise_px = 0.0     # dispersão da fixação atual (HUD)
         self.wander_px = 0.0    # passeio típico (média das fixações anteriores)
+        self.fixation_id = 0    # incrementa a cada nova fixação (sacada ou deslocamento)
 
     @property
     def lock_radius(self) -> float:
         return min(max(self.lock_px, self.lock_k * self.wander_px), self.lock_cap * self.threshold)
+
+    @property
+    def settling(self) -> bool:
+        """True nos primeiros ``settle_frames`` quadros de uma fixação."""
+        return self.goal is not None and self._age <= self.settle_frames
 
     @property
     def locked(self) -> bool:
@@ -139,6 +145,7 @@ class FixationStabilizer:
         self._buf = [np.asarray(q, dtype=np.float64) for q in pts]
         self._age = len(self._buf)
         self.goal = np.mean(self._buf, axis=0)
+        self.fixation_id += 1
 
     def __call__(self, point) -> np.ndarray:
         p = np.asarray(point, dtype=np.float64)
@@ -199,3 +206,66 @@ class FixationStabilizer:
         else:
             self.cursor = self.cursor + self.follow * d
         return self.cursor.copy()
+
+
+class HeadFineTuner:
+    """Ajuste fino do cursor pela cabeça (modo híbrido olhar + cabeça).
+
+    O olhar leva o cursor à região (sacada) e o estabilizador o trava na
+    fixação. Durante a fixação, pequenos movimentos da cabeça deslocam o
+    cursor a partir dali:
+
+        cursor = ponto da fixação + ganho x (pose da cabeça - pose no início
+                 da fixação), descontada uma zona morta.
+
+    Por quê: com o olhar parado, a estimativa do olhar treme ~40 px (limite
+    das medidas do olho do MediaPipe), mas a pose da cabeça varia só ~0,1°
+    (~2-4 px no cursor com o ganho padrão). A cabeça dá precisão de poucos
+    pixels para acertar alvos pequenos.
+
+    Uma nova fixação (sacada ou deslocamento do olhar) zera o ajuste, e o
+    olhar volta a mandar; um giro grande da cabeça (``reset_deg``) também,
+    porque aí a pessoa está mudando de postura, não ajustando o cursor.
+    """
+
+    def __init__(self, gain_px_per_deg: float = 25.0, deadzone_deg: float = 0.3,
+                 max_px: float = 250.0, reset_deg: float = 6.0, smooth_hz: float = 2.0):
+        self.gain = gain_px_per_deg
+        self.deadzone = deadzone_deg
+        self.max_px = max_px
+        self.reset_deg = reset_deg
+        self._filter = OneEuroFilter(smooth_hz, 0.0, 1.0)
+        self.reset()
+
+    def reset(self):
+        self._fix_id: int | None = None
+        self._ref: np.ndarray | None = None
+        self.offset = np.zeros(2)
+        self._filter.reset()
+
+    def __call__(self, cursor: np.ndarray, fixation_id: int, head_yaw_pitch, t: float,
+                 settling: bool = False) -> np.ndarray:
+        """Cursor ajustado. head_yaw_pitch: (yaw, pitch) em graus (yaw > 0 =
+        direita do usuário, pitch > 0 = para cima). settling: a fixação ainda
+        está se acomodando; a referência da cabeça acompanha (a pessoa pode
+        estar terminando de mover a cabeça junto com o olhar)."""
+        head = self._filter(np.asarray(head_yaw_pitch, dtype=np.float64), t)
+        if fixation_id != self._fix_id or self._ref is None or settling:
+            self._fix_id = fixation_id
+            self._ref = head.copy()
+            self.offset = np.zeros(2)
+            return np.asarray(cursor, dtype=np.float64).copy()
+        delta = head - self._ref
+        if np.max(np.abs(delta)) > self.reset_deg:
+            # Mudança de postura: nova referência, o olhar volta a mandar.
+            self._ref = head.copy()
+            self.offset = np.zeros(2)
+            return np.asarray(cursor, dtype=np.float64).copy()
+        mag = np.abs(delta)
+        eff = np.sign(delta) * np.maximum(mag - self.deadzone, 0.0)
+        off = self.gain * np.array([eff[0], -eff[1]])   # cima na cabeça = cima na tela (-y)
+        n = float(np.linalg.norm(off))
+        if n > self.max_px:
+            off *= self.max_px / n
+        self.offset = off
+        return np.asarray(cursor, dtype=np.float64) + off
