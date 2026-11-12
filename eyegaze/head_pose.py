@@ -109,6 +109,23 @@ def rotations_agree(R_a: np.ndarray, R_b: np.ndarray, max_deg: float = 35.0) -> 
             np.dot(R_a[:, 2], R_b[:, 2]) > np.cos(np.radians(max_deg + 15)))
 
 
+MOUTH_OPEN_RATIO = 0.05   # abertura dos lábios / largura entre os olhos
+
+
+def mouth_ratio(points: np.ndarray) -> float:
+    """Abertura da boca (lábios internos 13-14) / distância entre os cantos externos.
+
+    O MediaPipe estima a malha inteira de uma vez, e abrir a boca contamina a
+    pose da cabeça e os pontos do olho: com o olhar fixo num alvo, o ponto
+    estimado descia ~50 px (sessão de 12/11 09:47). Até os pontos "rígidos"
+    (cantos dos olhos, ponte do nariz, testa) se moviam, então uma pose só
+    com eles não resolvia. A abertura da boca entra como medida e a
+    calibração aprende a descontá-la (etapa da boca em procedures.py).
+    """
+    w = max(float(np.linalg.norm(points[263, :2] - points[33, :2])), 1e-6)
+    return float(np.linalg.norm(points[13, :2] - points[14, :2]) / w)
+
+
 def estimate_head_pose(points: np.ndarray, transform: np.ndarray | None = None,
                        source: str = "matrix") -> tuple[HeadPose, str]:
     """Devolve (pose, fonte_usada). Usa a matriz do modelo se disponível e

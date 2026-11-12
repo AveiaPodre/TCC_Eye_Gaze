@@ -123,7 +123,12 @@ def test_eye_indices_are_from_same_eye():
 # vertical da íris achatado pelas pálpebras e acoplamento com o pitch da cabeça.
 # Íris quase parada na vertical (como nos dados reais do MediaPipe) e
 # pálpebras acompanhando o olhar: o sinal vertical vem das pálpebras.
-USER = dict(rho_true=0.5, v_scale=0.2, pitch_coupling=0.4, lid_follow=0.7)
+# pitch_coupling = 0.2 (= v_scale): a íris vertical NÃO responde à inclinação
+# da cabeça com o olhar fixo, como medido nas sessões reais com o estimador
+# atual (razão resposta-na-cabeça/resposta-na-grade de -0,13 a +0,15). O
+# valor antigo (0,4) imitava o estimador que usava o z da íris e fazia v
+# responder AO CONTRÁRIO (razão -1), o que não ocorre mais.
+USER = dict(rho_true=0.5, v_scale=0.2, pitch_coupling=0.2, lid_follow=0.7)
 EYE_POS = (0.0, 10.0, 60.0)
 
 
@@ -135,17 +140,18 @@ class SimUser:
         self.noise = noise_px
         self.user = user or USER
 
-    def sample(self, tx, ty, head=(0, 0, 0), pos=EYE_POS):
+    def sample(self, tx, ty, head=(0, 0, 0), pos=EYE_POS, mouth=0.0):
         g = self.geom.gaze_vector(tx, ty, pos)
         obs = make_observation(head=head, head_pos_cm=pos, with_transform=True, gaze_vec=g,
-                               noise_px=self.noise, rng=self.rng, **self.user)
+                               noise_px=self.noise, rng=self.rng, mouth_open=mouth, **self.user)
         s = self.est.estimate(obs)
         return s.features(), s.raw
 
-    def calibration_data(self, head_stage=True, grid=(3, 3), n=25):
+    def calibration_data(self, head_stage=True, grid=(3, 3), n=25, grid_head_sd=1.5,
+                         mouth_stage=False):
         data = CalibrationData()
         for t in build_grid(1920, 1080, *grid, 0.08):
-            F, Rw = zip(*[self.sample(*t, head=tuple(self.rng.normal(0, 1.5, 3)))
+            F, Rw = zip(*[self.sample(*t, head=tuple(self.rng.normal(0, grid_head_sd, 3)))
                           for _ in range(n)])
             data.grid.append((t, np.array(F), np.array(Rw)))
         if head_stage:
@@ -158,13 +164,18 @@ class SimUser:
             F, Rw = zip(*hs)
             data.head_target = (960, 540)
             data.head_features, data.head_raw = np.array(F), np.array(Rw)
+        if mouth_stage:
+            ms = [self.sample(960, 540, mouth=0.15 * abs(np.sin(k / 8.0))) for k in range(90)]
+            F, Rw = zip(*ms)
+            data.mouth_target = (960, 540)
+            data.mouth_features, data.mouth_raw = np.array(F), np.array(Rw)
         return data
 
-    def mean_error(self, model, head=(0, 0, 0), pos=EYE_POS):
+    def mean_error(self, model, head=(0, 0, 0), pos=EYE_POS, mouth=0.0):
         errs = []
         for tx, ty in [(480, 270), (1440, 270), (960, 540), (480, 810), (1440, 810),
                        (300, 540), (1600, 600)]:
-            _, r = self.sample(tx, ty, head, pos)
+            _, r = self.sample(tx, ty, head, pos, mouth)
             errs.append(math.hypot(*(model.predict(r) - [tx, ty])))
         return float(np.mean(errs))
 
@@ -177,9 +188,10 @@ def test_calibration_generalizes_to_unseen_points():
     user = SimUser(1)
     model, results, _ = _fit(user.calibration_data())
     # O critério de escolha também pesa o erro com a cabeça em poses novas,
-    # então aceita um ajuste um pouco pior nos próprios alvos (~31 px) em
-    # troca de ~16% menos erro com a cabeça girada.
-    assert max(r.error_px for r in results) < 35
+    # então aceita um ajuste um pouco pior nos próprios alvos em troca de
+    # menos erro com a cabeça girada (o modelo físico, com 3 coeficientes,
+    # chega a ~37 px no pior alvo).
+    assert max(r.error_px for r in results) < 40
     assert user.mean_error(model) < 25
 
 
@@ -295,6 +307,160 @@ def test_iris_depth_noise_does_not_leak_into_eye_measures():
         assert np.allclose(base.raw[12:], noisy.raw[12:], atol=1e-9), head
 
 
+def test_upper_lid_measure_follows_eye_in_head_not_head():
+    """lid_up responde à rotação do olho DENTRO da cabeça: com o olho fixo
+    na cabeça, inclinar a cabeça não muda a medida; olhar para baixo muda.
+
+    Nos dados reais, as medidas verticais anteriores mudavam com o olhar na
+    grade, mas não quando a cabeça inclinava com o olhar fixo."""
+    est = GazeEstimator(GazeConfig())
+    d_head = np.array([0.05, 0.15, -1.0])          # olho fixo na cabeça, um pouco para baixo
+    d_head /= np.linalg.norm(d_head)
+    vals = []
+    for head in [(0, 0, 0), (0, 10, 0), (0, -10, 0), (12, 0, 0), (8, -6, 3)]:
+        obs = make_observation(head=head, gaze_vec=rot(*head) @ d_head, with_transform=True,
+                               lid_follow=0.7)
+        vals.append(est.estimate(obs).raw[14])
+    assert np.ptp(vals) < 0.01, vals
+    down = est.estimate(make_observation(0, -20, with_transform=True, lid_follow=0.7)).raw[14]
+    up = est.estimate(make_observation(0, 10, with_transform=True, lid_follow=0.7)).raw[14]
+    assert down > up + 0.05   # y para baixo: olhar para baixo desce a pálpebra
+
+
+def test_physical_model_is_candidate_and_roundtrips(tmp_path):
+    """Modelo físico (px/cm compartilhado): entra na escolha quando há etapa
+    da cabeça, compensa a cabeça e sobrevive a salvar/carregar."""
+    user = SimUser(11)
+    data = user.calibration_data()
+    _, _, stats = _fit(data)
+    assert any(c["modelo"] == "fisico" for c in stats["candidatos"])
+    raw = np.vstack([r for _, _, r in data.grid] + [data.head_raw])
+    Y = np.vstack([np.tile(t, (len(r), 1)) for t, _, r in data.grid]
+                  + [np.tile(data.head_target, (len(data.head_raw), 1))])
+    m = CalibrationModel(kind="fisico")
+    m.fit(raw, Y, None, (1920, 1080))
+    assert m.degree == 1
+    for head in [(0, 0, 0), (12, 0, 0), (0, -8, 0)]:
+        assert user.mean_error(m, head) < 120, head
+    m.save(tmp_path / "f.json")
+    loaded = CalibrationModel.load(tmp_path / "f.json", (1920, 1080))
+    assert loaded.kind == "fisico"
+    _, r = user.sample(700, 400, head=(5, -3, 0))
+    assert np.allclose(loaded.predict(r), m.predict(r))
+
+
+def test_geometric_head_gain_follows_head_tilt():
+    """Problema relatado: o cursor não descia o suficiente, como se a pessoa
+    estivesse sempre de frente para a câmera. Inclinar a cabeça para olhar
+    para baixo tem de mover o cursor pela geometria (px/cm da tela), e não
+    por um ganho aprendido (e encolhido) numa etapa da cabeça curta.
+
+    Com a largura da tela conhecida, a compensação da cabeça vale mesmo sem
+    a etapa da cabeça. Sem ela e sem a largura, o modelo não tem de onde
+    aprender a cabeça: nos dados reais a cabeça fica parada na grade
+    (variação de ~0,1°), como aqui."""
+    user = SimUser(13)
+    data = user.calibration_data(head_stage=False, grid_head_sd=0.0)
+    px_cm = 1920 / user.geom.w_cm
+    geo, _, stats = _fit(data, head_px_per_cm=px_cm)
+    learned, _, _ = _fit(data)
+    assert stats["px_por_cm_cabeca"] == pytest.approx(px_cm)
+    assert geo.y_model is not None and geo.y_model.head_px_per_cm == pytest.approx(px_cm)
+    for head in [(0, -10, 0), (0, 8, 0)]:
+        e_geo = user.mean_error(geo, head)
+        assert e_geo < 70, (head, e_geo)
+        assert e_geo < 0.5 * user.mean_error(learned, head), head
+
+
+def test_composed_y_model_roundtrip(tmp_path):
+    user = SimUser(14)
+    model, _, stats = _fit(user.calibration_data(), head_px_per_cm=1920 / user.geom.w_cm)
+    assert "modelo_y" in stats and model.y_model is not None
+    model.offset = np.array([4.0, -6.0])
+    model.save(tmp_path / "c.json")
+    loaded = CalibrationModel.load(tmp_path / "c.json", (1920, 1080))
+    assert loaded.y_model is not None
+    _, r = user.sample(600, 900, head=(3, -6, 0))
+    assert np.allclose(loaded.predict(r), model.predict(r))
+
+
+def test_face_bias_makes_calibration_posture_face_the_screen():
+    """O MediaPipe vê o rosto ~30° mais para cima do que a direção real para
+    a tela. Com o viés da calibração, a face na postura da grade aponta para
+    o centro da tela, e uma inclinação de cabeça é medida a partir dali."""
+    from eyegaze.calibration import face_bias, head_screen_point
+    E = np.array([0.0, -3.0, 36.0])
+    center = np.array([0.0, 11.0, 0.0])
+    raws = []
+    for pitch in (12.0, 13.0, 14.0):     # "cabeça para cima" segundo o MediaPipe
+        r = np.zeros(20)
+        r[:9] = rot(0.0, pitch, 0.0).reshape(-1)
+        r[9:12] = E
+        raws.append(r)
+    raws = np.array(raws)
+    bias = face_bias(raws, center)
+    assert np.degrees(bias[1]) < -25          # viés de ~-34° no espaço de atan(tans)
+    P, _ = head_screen_point(raws[1], bias)
+    assert np.allclose(P[0], center[:2], atol=0.05)
+    # Abaixar a cabeça 5° a partir da postura da calibração desce o ponto.
+    r = raws[1].copy()
+    r[:9] = rot(0.0, 8.0, 0.0).reshape(-1)
+    P2, _ = head_screen_point(r, bias)
+    assert P2[0, 1] > P[0, 1] + 2.5           # ~36 cm x 5° x sec² ≈ 3,6 cm
+
+
+def test_calibrated_geometric_gaze_points_at_target():
+    """O olhar geométrico cru (globo ocular + cabeça) aponta longe do olhar
+    real (nos dados reais, ~40° para cima, com 1/4 da variação vertical).
+    Calibrado, ele aponta para o alvo. É o modelo do eixo y quando não há
+    etapa da cabeça (só medidas coerentes com a cabeça)."""
+    from eyegaze.gaze import direction_to_angles
+    user = SimUser(15)
+    model, _, _ = _fit(user.calibration_data(grid=(4, 4), head_stage=False),
+                       head_px_per_cm=1920 / user.geom.w_cm)
+    assert model.geo is not None and model.geo.kind == "geometrico"
+    for tx, ty, head in [(480, 270, (0, 0, 0)), (1500, 900, (0, 0, 0)), (900, 800, (0, -8, 0))]:
+        g = user.geom.gaze_vector(tx, ty)
+        obs = make_observation(head=head, head_pos_cm=EYE_POS, with_transform=True, gaze_vec=g,
+                               **USER)
+        s = user.est.estimate(obs)
+        true = np.array(direction_to_angles(g))
+        cal = np.array(direction_to_angles(model.geo.gaze_direction(s.raw)[0]))
+        assert np.abs(cal - true).max() < 3.0, (tx, ty, cal, true)
+
+
+def test_mouth_stage_cancels_mouth_artifact():
+    """Problema relatado: abrir a boca fazia o olhar descer. O MediaPipe
+    deforma a malha inteira (nos dados reais, ~50 px para baixo com o olhar
+    fixo). A etapa da boca (olhar fixo, boca abrindo e fechando) ensina à
+    calibração quanto descontar."""
+    user = SimUser(16, **dict(USER, mouth_coupling=0.6))
+    px_cm = 1920 / user.geom.w_cm
+    with_m, _, stats = _fit(user.calibration_data(mouth_stage=True), head_px_per_cm=px_cm)
+    without, _, _ = _fit(user.calibration_data(), head_px_per_cm=px_cm)
+    assert "boca_px_por_unidade" in stats
+    e_without = user.mean_error(without, mouth=0.12)
+    e_with = user.mean_error(with_m, mouth=0.12)
+    assert e_without > 80                      # o artefato desloca o cursor
+    assert e_with < 0.5 * e_without, (e_with, e_without)
+    # Boca fechada: a correção não muda nada.
+    assert abs(user.mean_error(with_m) - user.mean_error(without)) < 15
+
+
+def test_mouth_correction_needs_mouth_variation():
+    user = SimUser(17)
+    data = user.calibration_data()
+    data.mouth_target, data.mouth_raw = (960, 540), np.array([user.sample(960, 540)[1] for _ in range(30)])
+    data.mouth_features = np.zeros((30, 2))
+    model, _, stats = _fit(data)
+    assert not np.any(model.mouth_coef)      # boca não abriu: sem correção
+
+
+def test_without_head_stage_has_no_physical_candidate():
+    _, _, stats = _fit(SimUser(12).calibration_data(head_stage=False))
+    assert all(c["modelo"] == "livre" for c in stats["candidatos"])
+
+
 def test_calibration_falls_back_to_affine_with_few_points():
     user = SimUser(6)
     model, _, _ = _fit(user.calibration_data(head_stage=False, grid=(2, 2)))
@@ -361,7 +527,13 @@ def test_stabilizer_follows_saccades_quickly():
     st = FixationStabilizer()
     out = np.array([st(p) for p in raw])
     arrived = np.argmax(np.linalg.norm(out[60:] - truth[60:], axis=1) < 60)
-    assert arrived <= 5   # <= ~170 ms a 30 fps
+    # <= 200 ms a 30 fps. Com este ruído BRANCO de 45 px por eixo, uma amostra
+    # isolada erra ~64 px e é preciso 1 quadro a mais de média. O cursor salta
+    # para a amostra mais recente (não para a média das pendentes): nas
+    # sessões reais, em que o ruído é correlacionado e o ponto bruto leva
+    # alguns quadros para atravessar a tela, isso reduziu o atraso do cursor
+    # de 92 para 42 ms (mediana) e de 292 para 110 ms (p90).
+    assert arrived <= 6
 
 
 def test_stabilizer_ignores_isolated_spikes():
@@ -376,6 +548,31 @@ def test_stabilizer_ignores_isolated_spikes():
 def test_stabilizer_follows_slow_drift():
     st = FixationStabilizer()
     xs = np.linspace(500, 700, 120)   # 200 px em 4 s (perseguição lenta)
-    for x in xs:
-        out = st(np.array([x, 500.0]))
-    assert abs(out[0] - 700) < 40
+    outs = [st(np.array([x, 500.0]))[0] for x in xs]
+    # Segue em degraus: fica no máximo ~1 raio de trava atrás, e não trava de vez.
+    assert abs(outs[-1] - 700) < st.lock_radius + 20
+    assert outs[-1] > 600
+
+
+def _wander(n, sigma, rho, rng):
+    """Ruído AR(1): passeia devagar, como a estimativa real (autocorrelação ~0,97)."""
+    e = np.zeros((n, 2))
+    for i in range(1, n):
+        e[i] = rho * e[i - 1] + rng.normal(0, sigma * np.sqrt(1 - rho ** 2), 2)
+    return e
+
+
+def test_stabilizer_holds_still_when_estimate_wanders():
+    """Problema relatado: com a vista parada o cursor se movia um pouco.
+
+    A estimativa real não treme de quadro a quadro, ela passeia (ruído
+    correlacionado). A média deslizante acompanhava esse passeio."""
+    rng = np.random.default_rng(3)
+    moving = []
+    for _ in range(20):
+        st = FixationStabilizer(saccade_px=134, lock_px=67)
+        raw = np.array([900.0, 500.0]) + _wander(60, 20.0, 0.97, rng)
+        out = np.array([st(p) for p in raw])
+        step = np.linalg.norm(np.diff(out[15:], axis=0), axis=1)
+        moving.append(np.mean(step > 0.5))
+    assert np.mean(moving) < 0.05   # cursor parado em >95% dos quadros da fixação

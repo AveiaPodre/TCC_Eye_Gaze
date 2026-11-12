@@ -37,7 +37,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .calibration import (CalibrationData, CalibrationModel, PointResult, build_grid,
+from .calibration import (MOUTH_COL, CalibrationData, CalibrationModel, PointResult, build_grid,
                           fit_from_samples, head_angles, outlier_mask)
 from .config import CalibrationConfig, ValidationConfig
 from .gaze import GazeSample
@@ -94,6 +94,23 @@ class TargetProcedure:
         self.computing = False
         # on_complete pode pedir para voltar a coletar (repetição de alvos).
         self.restart_collection = False
+        # Modo manual: o alvo só avança quando o usuário confirma (tecla) que
+        # está olhando para ele; as amostras são as de antes da confirmação.
+        self.manual = False
+        self.manual_window_s = 1.0      # amostras usadas: esta janela antes da tecla...
+        self.manual_reaction_s = 0.15   # ...descontado o tempo de reação (mão/tecla)
+        self.manual_min_s = 0.5         # confirmações antes disto são ignoradas
+        self._manual_buf: list = []     # (t, features, raw, obs) do alvo atual
+        self._manual_msg: tuple[str, float] | None = None
+
+    def _blank(self) -> np.ndarray:
+        """Fundo da tela de alvos. Copiar um fundo pronto custa bem menos que
+        criar a imagem 1920x1080 a cada quadro (~10 ms), tempo que atrasava a
+        leitura da câmera durante os procedimentos."""
+        bg = getattr(self, "_bg", None)
+        if bg is None or bg.shape[:2] != (self.screen_h, self.screen_w):
+            bg = self._bg = np.full((self.screen_h, self.screen_w, 3), BG, dtype=np.uint8)
+        return bg.copy()
 
     @property
     def index(self) -> int:
@@ -118,6 +135,7 @@ class TargetProcedure:
         self._phase_start = now
         self._collect_start = None
         self._recent = []
+        self._manual_buf = []
 
     def _is_fixating(self) -> bool:
         n = self.fixation_window
@@ -150,6 +168,14 @@ class TargetProcedure:
         if valid:
             self._last_valid = now
 
+        if self.manual:
+            if valid:
+                self._manual_buf.append((now, sample.features(), sample.raw, sample.obs))
+                horizon = now - 3.0 * self.manual_window_s
+                while self._manual_buf and self._manual_buf[0][0] < horizon:
+                    self._manual_buf.pop(0)
+            return
+
         if self._collect_start is None:
             if valid:
                 self._recent.append(sample.features())
@@ -171,6 +197,44 @@ class TargetProcedure:
     def targets_done(self, now: float):
         """Todos os alvos coletados (subclasses podem acrescentar etapas)."""
         self.computing = True
+
+    @property
+    def awaiting_confirmation(self) -> bool:
+        """Modo manual, num alvo da grade, esperando a tecla de confirmação."""
+        return (self.manual and not self.collecting_done and not self.computing
+                and self.pos < len(self.order))
+
+    def confirm(self, now: float) -> bool:
+        """Modo manual: o usuário confirma que está olhando para o alvo.
+
+        Usa as amostras da janela ``manual_window_s`` ANTES da tecla (sem os
+        últimos ``manual_reaction_s``): ao apertar a tecla a pessoa costuma
+        piscar ou olhar para o teclado, então as amostras de depois não
+        servem. Recusa (e avisa) se o olhar não estava parado nessa janela.
+        """
+        if not self.awaiting_confirmation or self._phase_start is None:
+            return False
+        if now - self._phase_start < self.manual_min_s:
+            return False
+        t1 = now - self.manual_reaction_s
+        win = [b for b in self._manual_buf if t1 - self.manual_window_s <= b[0] <= t1]
+        if len(win) < self.min_samples:
+            self._manual_msg = ("Rosto/olhos nao detectados: olhe para o ponto e tente de novo", now)
+            return False
+        feats = np.array([b[1] for b in win])
+        med = np.median(feats, axis=0)
+        if float(np.percentile(np.hypot(*(feats - med).T), 80)) > 2.0 * self.fixation_max_deg:
+            self._manual_msg = ("Olhar ainda se movendo: fixe o ponto e aperte de novo", now)
+            return False
+        for _, f, r, o in win:
+            self.samples[self.index].append((f, r))
+            self.observations[self.index].append(o)
+        self._manual_msg = None
+        self.pos += 1
+        self._start_phase(now)
+        if self.pos >= len(self.order):
+            self.targets_done(now)
+        return True
 
     def arrays(self, i: int) -> tuple[np.ndarray, np.ndarray]:
         """(features (n,2), raw (n,20)) do alvo i."""
@@ -195,7 +259,7 @@ class TargetProcedure:
                 "  -  ESC cancela")
 
     def render(self, now: float) -> np.ndarray:
-        canvas = np.full((self.screen_h, self.screen_w, 3), BG, dtype=np.uint8)
+        canvas = self._blank()
         if self.computing:
             self._centered(canvas, f"{self.title}: calculando...", self.screen_h // 2)
             return canvas
@@ -208,7 +272,10 @@ class TargetProcedure:
         tx, ty = (int(round(v)) for v in self.current_target())
         elapsed = 0.0 if self._phase_start is None else now - self._phase_start
 
-        if self._collect_start is None:
+        if self.manual:
+            cv2.circle(canvas, (tx, ty), 16, TARGET, 3, cv2.LINE_AA)
+            cv2.circle(canvas, (tx, ty), 4, WHITE, -1, cv2.LINE_AA)
+        elif self._collect_start is None:
             # Alvo encolhendo enquanto o olho chega; depois, um anel pequeno
             # até o olhar estabilizar.
             k = min(1.0, elapsed / max(self.settle_s, 1e-6))
@@ -227,6 +294,12 @@ class TargetProcedure:
         top = ty >= self.screen_h / 2
         y0 = 45 if top else self.screen_h - 75
         self._centered(canvas, self.status_line(), y0)
+        if self.manual:
+            msg = self._manual_msg
+            if msg is not None and now - msg[1] < 2.5:
+                self._centered(canvas, msg[0], y0 + 40, WARN)
+            else:
+                self._centered(canvas, "Olhe para o ponto e aperte ESPACO (ou ENTER)", y0 + 40)
         if now - self._last_valid > 1.0:
             self._centered(canvas, "Rosto/olhos nao detectados - posicione-se em frente a camera",
                            y0 + 40, WARN)
@@ -316,6 +389,7 @@ class CalibrationProcedure(TargetProcedure):
                          fixation_window=cfg.fixation_window,
                          fixation_max_deg=cfg.fixation_max_deg, order=order)
         self.cfg = cfg
+        self.manual = bool(getattr(cfg, "manual", False))
         self.model: CalibrationModel | None = None
         self.raw_path: Path | None = None
         self.results: list[PointResult] = []
@@ -330,6 +404,14 @@ class CalibrationProcedure(TargetProcedure):
         self.head_delta: np.ndarray | None = None     # desvio atual em relação a ela
         self.head_samples: list[tuple[np.ndarray, np.ndarray]] = []
         self.head_observations: list = []
+        # Etapa da boca (olhar fixo no centro, boca abrindo e fechando).
+        self.mouth_start: float | None = None
+        self._mouth_done = False
+        self.mouth_samples: list[tuple[np.ndarray, np.ndarray]] = []
+        self.mouth_observations: list = []
+        self.mouth_now = 0.0     # abertura atual (para a barra na tela)
+        self.mouth_max = 0.0
+        self._mouth_base: float | None = None
         # Repetição de alvos ruins.
         self.retried_targets: list[int] = []
         self._now = 0.0
@@ -358,8 +440,41 @@ class CalibrationProcedure(TargetProcedure):
                     for r in [self.arrays(i)[1]] if len(r)]
             self.head_base = (np.median(head_angles(np.vstack(grid)), axis=0)
                               if grid else np.zeros(2))
+        elif getattr(self.cfg, "mouth_stage", False) and self.mouth_start is None:
+            self.mouth_start = now
+            grid = [np.atleast_2d(r) for i in range(len(self.targets))
+                    for r in [self.arrays(i)[1]] if len(r)]
+            self._mouth_base = (float(np.median(np.vstack(grid)[:, MOUTH_COL]))
+                                if grid and np.vstack(grid).shape[1] > MOUTH_COL else 0.0)
         else:
             super().targets_done(now)
+
+    # ------------------------------------------------- etapa da boca
+    @property
+    def in_mouth_stage(self) -> bool:
+        return (self.mouth_start is not None and not self._mouth_done
+                and not self.collecting_done and not self.computing)
+
+    def _update_mouth(self, sample, now: float):
+        """Olhar fixo no centro enquanto a boca abre e fecha: ensina à
+        calibração quanto a abertura da boca desloca a estimativa (artefato
+        do MediaPipe; ver calibration.fit_mouth_correction)."""
+        el = now - self.mouth_start
+        valid = sample is not None and sample.valid
+        if valid:
+            self._last_valid = now
+            self.mouth_now = float(sample.raw[MOUTH_COL]) if len(sample.raw) > MOUTH_COL else 0.0
+        if el < self.cfg.head_motion_settle_s:
+            return
+        if valid:
+            self.mouth_samples.append((sample.features(), sample.raw))
+            self.mouth_observations.append(sample.obs)
+            self.mouth_max = max(self.mouth_max, self.mouth_now - (self._mouth_base or 0.0))
+        opened = self.mouth_max >= self.cfg.mouth_min_open
+        if ((el >= self.cfg.mouth_stage_s and opened) or el >= self.cfg.mouth_timeout_s) \
+                and len(self.mouth_samples) >= self.min_samples:
+            self._mouth_done = True
+            self.targets_done(now)
 
     def _update_head(self, sample, now: float):
         el = now - self.head_start
@@ -381,7 +496,7 @@ class CalibrationProcedure(TargetProcedure):
             # Etapa final: cabeça de volta ao centro.
             if step_el >= self.cfg.head_center_s and len(self.head_samples) >= self.min_samples:
                 self._head_done = True
-                super().targets_done(now)
+                self.targets_done(now)   # etapa da boca, se houver
             return
         reached = (self.head_delta is not None and
                    head_progress(self.head_delta, direction, self.cfg.head_target_deg)
@@ -400,6 +515,8 @@ class CalibrationProcedure(TargetProcedure):
             return
         if self.in_head_stage:
             self._update_head(sample, now)
+        elif self.in_mouth_stage:
+            self._update_mouth(sample, now)
         else:
             super().update(sample, now)
 
@@ -408,7 +525,8 @@ class CalibrationProcedure(TargetProcedure):
         return (self.screen_w / 2, self.screen_h / 2)
 
     def current_target(self) -> tuple[float, float]:
-        return self.head_target if self.in_head_stage else super().current_target()
+        return (self.head_target if self.in_head_stage or self.in_mouth_stage
+                else super().current_target())
 
     def status_line(self) -> str:
         if self.retrying:
@@ -418,9 +536,11 @@ class CalibrationProcedure(TargetProcedure):
 
     def render(self, now: float) -> np.ndarray:
         self._now = now
+        if not self.computing and self.in_mouth_stage:
+            return self._render_mouth(now)
         if self.computing or not self.in_head_stage:
             return super().render(now)
-        canvas = np.full((self.screen_h, self.screen_w, 3), BG, dtype=np.uint8)
+        canvas = self._blank()
         cx, cy = (int(v) for v in self.head_target)
         cv2.circle(canvas, (cx, cy), 12, COLLECT, -1, cv2.LINE_AA)
         cv2.circle(canvas, (cx, cy), 3, (0, 0, 0), -1, cv2.LINE_AA)
@@ -437,6 +557,34 @@ class CalibrationProcedure(TargetProcedure):
             else:
                 self._centered(canvas, "Volte a cabeca ao CENTRO", 90)
         self._centered(canvas, "Se nao puder mover a cabeca, apenas continue olhando o ponto",
+                       self.screen_h - 75)
+        if now - self._last_valid > 1.0:
+            self._centered(canvas, "Rosto/olhos nao detectados - posicione-se em frente a camera",
+                           135, WARN)
+        return canvas
+
+    def _render_mouth(self, now: float) -> np.ndarray:
+        canvas = self._blank()
+        cx, cy = (int(v) for v in self.head_target)
+        cv2.circle(canvas, (cx, cy), 12, COLLECT, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (cx, cy), 3, (0, 0, 0), -1, cv2.LINE_AA)
+        self._centered(canvas, "Mantenha o OLHAR no ponto verde", 45)
+        if now - self.mouth_start < self.cfg.head_motion_settle_s:
+            self._centered(canvas, "Prepare-se...", 90)
+        else:
+            self._centered(canvas, "ABRA e FECHE a boca devagar, algumas vezes", 90)
+        # Barra com a abertura atual da boca; a marca é o mínimo pedido.
+        bw, bh = 300, 18
+        x0, y0 = cx - bw // 2, cy + 80
+        cv2.rectangle(canvas, (x0, y0), (x0 + bw, y0 + bh), GRAY, 1)
+        full = 2.0 * self.cfg.mouth_min_open
+        k = float(np.clip((self.mouth_now - (self._mouth_base or 0.0)) / full, 0, 1))
+        color = COLLECT if self.mouth_max >= self.cfg.mouth_min_open else TARGET
+        if k > 0:
+            cv2.rectangle(canvas, (x0, y0), (x0 + int(bw * k), y0 + bh), color, -1)
+        xm = x0 + bw // 2
+        cv2.line(canvas, (xm, y0 - 4), (xm, y0 + bh + 4), WHITE, 2)
+        self._centered(canvas, "Se nao puder abrir a boca, apenas continue olhando o ponto",
                        self.screen_h - 75)
         if now - self._last_valid > 1.0:
             self._centered(canvas, "Rosto/olhos nao detectados - posicione-se em frente a camera",
@@ -473,6 +621,11 @@ class CalibrationProcedure(TargetProcedure):
             data.grid.append((t, feats, raws))
             data.grid_obs.append(self.observations[i])
         data.head_obs = self.head_observations
+        if self.mouth_samples:
+            data.mouth_target = self.head_target
+            data.mouth_features = np.array([f for f, _ in self.mouth_samples])
+            data.mouth_raw = np.array([r for _, r in self.mouth_samples])
+            data.mouth_obs = self.mouth_observations
         if self.head_samples:
             data.head_target = self.head_target
             data.head_features = np.array([f for f, _ in self.head_samples])
@@ -486,6 +639,8 @@ class CalibrationProcedure(TargetProcedure):
             self.cfg.outlier_mad_threshold,
             head_weight_points=self.cfg.head_motion_weight,
             head_max_deg=self.cfg.head_max_deg,
+            head_px_per_cm=(self.screen_w / self.cfg.screen_width_cm
+                            if self.cfg.screen_width_cm else None),
         )
 
     def bad_targets(self, stats: dict) -> list[int]:
@@ -540,7 +695,8 @@ class CalibrationProcedure(TargetProcedure):
             label, advice = quality_label(st["erro_loo_medio_px"], self.screen_w)
             self.message_lines.append(
                 f"Erro estimado em pontos novos: {st['erro_loo_medio_px']:.0f} px"
-                f"  (iris: {st.get('fonte_iris', 'mediapipe')}, grau {st.get('grau', '?')})")
+                f"  (modelo {st.get('modelo', 'livre')}, iris {st.get('fonte_iris', 'mediapipe')},"
+                f" grau {st.get('grau', '?')})")
             if "erro_cv_cabeca_px" in st:
                 self.message_lines.append(
                     f"Erro estimado com a cabeca em poses novas: {st['erro_cv_cabeca_px']:.0f} px")
@@ -549,6 +705,12 @@ class CalibrationProcedure(TargetProcedure):
             self.message_lines.append(
                 f"Etapa da cabeca: {st['n_cabeca_usadas']} de {st['n_cabeca_total']} amostras "
                 "dentro da faixa util")
+        if "boca_px_por_unidade" in st:
+            shift = 0.1 * float(np.hypot(*st["boca_px_por_unidade"]))
+            self.message_lines.append(
+                f"Etapa da boca: abrir a boca deslocava ~{shift:.0f} px; agora e descontado")
+        elif self.mouth_samples:
+            self.message_lines.append("Etapa da boca: a boca nao abriu o suficiente; sem correcao")
         if self.retried_targets:
             self.message_lines.append(f"{len(self.retried_targets)} alvo(s) repetido(s)")
         self.message_lines.append("Branco = alvo, ponto colorido = estimativa. Use T para validar.")
@@ -690,12 +852,29 @@ class RecenterProcedure(TargetProcedure):
                          cfg.min_samples_per_point, **_gating(cfg))
         self.model = model
         self.mad = cfg.outlier_mad_threshold
+        self.max_frac = cfg.recenter_max_frac
 
     def on_complete(self):
         feats, raws = self.arrays(0)
         raws = raws[outlier_mask(feats, self.mad)]
         pred = np.median(self.model.predict(raws), axis=0)
         delta = np.array(self.targets[0]) - pred
+        if (abs(delta[0]) > self.max_frac * self.screen_w
+                or abs(delta[1]) > self.max_frac * self.screen_h):
+            # Desvio grande demais para ser corrigido por um deslocamento:
+            # a postura mudou muito ou o rosto foi mal detectado. Aplicar
+            # mesmo assim deslocava o cursor inteiro (caso real: -964 px no
+            # eixo y, 23 s depois de calibrar) e deixava parte da tela
+            # inalcançável quando a pessoa voltava à postura normal.
+            self.succeeded = False
+            self.result_timeout_s = 6.0   # tempo para ler o aviso
+            self.message_lines = [
+                f"Desvio muito grande ({delta[0]:+.0f}, {delta[1]:+.0f}) px: NAO aplicado",
+                "A postura mudou demais ou o rosto nao foi bem detectado.",
+                "Volte a postura da calibracao ou recalibre (ESPACO)."]
+            print(f"[Recentralizar] Desvio de ({delta[0]:+.1f}, {delta[1]:+.1f}) px rejeitado "
+                  f"(limite {self.max_frac:.0%} da tela).")
+            return
         self.model.offset = self.model.offset + delta
         # O offset agora vale para a postura atual: ela vira a referência do
         # aviso de postura (calibration.CalibrationModel.posture_deviation).

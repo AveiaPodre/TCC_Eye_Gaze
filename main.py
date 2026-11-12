@@ -21,7 +21,7 @@ from eyegaze.app import EyeGazeApp
 from eyegaze.config import AppConfig
 from eyegaze.face_tracker import FaceTracker
 from eyegaze.io_devices import (FrameSource, NullMouse, ReplaySource, SessionRecorder,
-                                detect_screen_size)
+                                detect_screen_size, detect_screen_width_cm)
 
 
 def parse_args(argv=None):
@@ -36,7 +36,8 @@ def parse_args(argv=None):
     p.add_argument("--reset-calibration", action="store_true",
                    help="ignora a calibração salva")
     p.add_argument("--screen-width-cm", type=float, default=None,
-                   help="largura física da tela (para erro em graus na validação)")
+                   help="largura física da tela em cm (padrão: detecta no Windows). Fixa o "
+                        "ganho da cabeça na calibração e dá o erro em graus na validação")
     p.add_argument("--distance-cm", type=float, default=None,
                    help="distância olho-tela (para erro em graus na validação)")
     p.add_argument("--gravar", action="store_true",
@@ -47,6 +48,13 @@ def parse_args(argv=None):
     p.add_argument("--sem-janela", action="store_true",
                    help="com --reproduzir: roda sem abrir janelas (mais rápido)")
     return p.parse_args(argv)
+
+
+def _set_screen_width(cfg: AppConfig, width_cm: float | None):
+    """A largura física serve à calibração (ganho da cabeça), à validação
+    (erro em graus) e à vista 3D."""
+    cfg.calibration.screen_width_cm = width_cm
+    cfg.validation.screen_width_cm = width_cm
 
 
 def _replay(args, cfg: AppConfig) -> int:
@@ -60,6 +68,7 @@ def _replay(args, cfg: AppConfig) -> int:
     if cfg.calibration.save_path.exists():
         cfg.calibration.save_path.unlink()
     cfg.calibration.random_seed = source.seed
+    _set_screen_width(cfg, args.screen_width_cm or source.screen_width_cm)
     print(f"[Reprodução] {name}: tela {source.screen_size}, resultados em {out}")
     tracker = FaceTracker(cfg.tracker)
     app = EyeGazeApp(cfg, tracker, source, source.screen_size, mouse=NullMouse(),
@@ -76,7 +85,6 @@ def main(argv=None) -> int:
     cfg.camera.height = args.height
     if args.no_mirror:
         cfg.camera.mirror_display = False
-    cfg.validation.screen_width_cm = args.screen_width_cm
     cfg.validation.viewing_distance_cm = args.distance_cm
 
     if args.reproduzir:
@@ -90,7 +98,15 @@ def main(argv=None) -> int:
         if screen_size is None:
             print("Não foi possível detectar a resolução da tela; use --screen LARGURAxALTURA.")
             return 1
-    print(f"[Tela] {screen_size[0]}x{screen_size[1]}")
+    width_cm = args.screen_width_cm or detect_screen_width_cm(screen_size)
+    _set_screen_width(cfg, width_cm)
+    if width_cm:
+        origem = "informada" if args.screen_width_cm else "detectada"
+        print(f"[Tela] {screen_size[0]}x{screen_size[1]}, {width_cm:.1f} cm de largura ({origem})")
+    else:
+        print(f"[Tela] {screen_size[0]}x{screen_size[1]}. Largura física desconhecida: o ganho "
+              "da cabeça será aprendido na calibração. Para fixá-lo pela geometria, use "
+              "--screen-width-cm.")
 
     if args.reset_calibration and cfg.calibration.save_path.exists():
         cfg.calibration.save_path.unlink()
@@ -106,7 +122,8 @@ def main(argv=None) -> int:
         cfg.calibration.random_seed = seed
         stamp = time.strftime("%Y%m%d_%H%M%S")
         recorder = SessionRecorder(cfg.calibration.results_dir / f"sessao_{stamp}",
-                                   cfg.camera.fps, source.resolution, screen_size, seed)
+                                   cfg.camera.fps, source.resolution, screen_size, seed,
+                                   screen_width_cm=width_cm)
         print(f"[Gravação] Gravando em {recorder.video_path}")
 
     tracker = FaceTracker(cfg.tracker)

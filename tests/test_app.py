@@ -26,7 +26,12 @@ SCREEN = (1920, 1080)
 EYE_POS = np.array([0.0, 10.0, 60.0])
 # Íris quase parada na vertical (como nos dados reais do MediaPipe) e
 # pálpebras acompanhando o olhar: o sinal vertical vem das pálpebras.
-USER = dict(rho_true=0.5, v_scale=0.2, pitch_coupling=0.4, lid_follow=0.7)
+# pitch_coupling = 0.2 (= v_scale): a íris vertical NÃO responde à inclinação
+# da cabeça com o olhar fixo, como medido nas sessões reais com o estimador
+# atual (razão resposta-na-cabeça/resposta-na-grade de -0,13 a +0,15). O
+# valor antigo (0,4) imitava o estimador que usava o z da íris e fazia v
+# responder AO CONTRÁRIO (razão -1), o que não ocorre mais.
+USER = dict(rho_true=0.5, v_scale=0.2, pitch_coupling=0.2, lid_follow=0.7)
 
 
 class Clock:
@@ -63,6 +68,8 @@ class FakeTracker:
         self.rng = np.random.default_rng(0)
         self.noise_px = 0.25
         self._head_amount = 0.0
+        self.mouth = 0.0
+        self._mouth_t = 0
 
     def _head_for_prompt(self, proc):
         """Simula a pessoa girando a cabeça devagar na direção pedida."""
@@ -88,10 +95,15 @@ class FakeTracker:
             pos = getattr(self, "proc_pos", EYE_POS)
         else:
             target = self.look_at
+        # Boca: abre e fecha na etapa da boca; fora dela, ``self.mouth``.
+        mouth = self.mouth
+        if proc is not None and getattr(proc, "in_mouth_stage", False):
+            self._mouth_t += 1
+            mouth = 0.15 * abs(np.sin(self._mouth_t / 8.0))
         g = self.geom.gaze_vector(*target, pos)
         return make_observation(head=head, head_pos_cm=tuple(pos), with_transform=True,
                                 gaze_vec=g, noise_px=self.noise_px, rng=self.rng,
-                                timestamp_ms=ts, **USER)
+                                timestamp_ms=ts, mouth_open=mouth, **USER)
 
     def close(self):
         pass
@@ -178,7 +190,10 @@ def test_end_to_end(tmp_path):
     assert proc.collecting_done and proc.succeeded
     assert len(proc.head_samples) > 60
     assert proc.stats["usa_etapa_cabeca"]
-    assert max(r.error_px for r in proc.results) < 45
+    # Erro de ajuste no pior alvo: o modelo físico (3 coeficientes), quando
+    # escolhido pela validação cruzada, ajusta um pouco pior a grade (~45 px)
+    # e melhor as poses novas da cabeça.
+    assert max(r.error_px for r in proc.results) < 55
     if out_dir:
         cv2.imwrite(os.path.join(out_dir, "calibracao_resultado.png"), app.last_target_view)
     app.handle_key(13)  # qualquer tecla fecha a tela de resultado
@@ -258,7 +273,7 @@ def test_end_to_end(tmp_path):
 
     # --- teclas de visualização ---------------------------------------
     flags = {"l": "show_landmarks", "g": "show_gaze", "p": "show_head_pose",
-             "v": "show_minimap", "h": "show_help", "f": "mirror"}
+             "v": "show_minimap", "h": "show_help", "f": "mirror", "3": "show_scene3d"}
     for key, attr in flags.items():
         before_flag = getattr(app, attr)
         app.handle_key(ord(key))
@@ -269,8 +284,10 @@ def test_end_to_end(tmp_path):
     for attr in flags.values():
         setattr(app, attr, True)
     app.step()
+    assert app.last_scene_view is not None and app.last_scene_view.ndim == 3
     if out_dir:
         cv2.imwrite(os.path.join(out_dir, "camera_tudo_ligado.png"), app.last_camera_view)
+        cv2.imwrite(os.path.join(out_dir, "vista_3d.png"), app.last_scene_view)
     for attr in flags.values():
         setattr(app, attr, False)
     app.step()
@@ -297,3 +314,69 @@ def test_calibration_without_head_stage(tmp_path):
     tracker.look_at = (700, 400)
     settle(app)
     assert err(app, (700, 400)) < 60
+
+
+def test_screen_width_fixes_head_gain_without_head_stage(tmp_path):
+    """Com a largura física da tela (detectada ou --screen-width-cm), o
+    ganho da cabeça vem da geometria: inclinar a cabeça mantém o cursor no
+    lugar certo mesmo sem a etapa da cabeça."""
+    app, tracker, _ = make_app(tmp_path)
+    app.cfg.calibration.head_stage = False
+    app.cfg.calibration.screen_width_cm = 53.0   # monitor do usuário simulado
+    app.handle_key(ord(" "))
+    proc = run_procedure(app)
+    assert proc.succeeded and proc.stats["px_por_cm_cabeca"] > 0
+    assert proc.model.y_model is not None
+    app.handle_key(13)
+    for head in [(0, -8, 0), (0, 6, 0)]:
+        tracker.head, tracker.look_at = head, (900, 850)
+        settle(app)
+        assert err(app, (900, 850)) < 90, (head, err(app, (900, 850)))
+
+
+def test_recenter_rejects_huge_offset(tmp_path):
+    """Caso real: R logo depois de calibrar, com a postura muito diferente,
+    aplicou -964 px no eixo y e o cursor não alcançava mais a parte de baixo
+    da tela. Desvios acima de 25% da tela não são aplicados."""
+    app, tracker, _ = make_app(tmp_path)
+    app.cfg.calibration.head_stage = False
+    app.handle_key(ord(" "))
+    run_procedure(app)
+    app.handle_key(13)
+    app.model.offset = app.model.offset + np.array([0.0, 600.0])   # desvio enorme
+    before = app.model.offset.copy()
+    tracker.look_at = (960, 540)
+    app.handle_key(ord("r"))
+    proc = run_procedure(app)
+    assert not proc.succeeded
+    settle(app, 200)   # a tela de aviso fecha sozinha
+    assert app.procedure is None
+    assert np.allclose(app.model.offset, before)
+
+
+def test_mouth_stage_end_to_end(tmp_path):
+    """Usuário em que abrir a boca "desce" a íris (artefato do MediaPipe): com
+    a etapa da boca, o cursor não se move quando a boca abre."""
+    import synthetic
+    app, tracker, _ = make_app(tmp_path)
+    app.cfg.calibration.screen_width_cm = 53.0
+    orig = synthetic.make_points
+
+    def with_artifact(*a, **k):
+        k.setdefault("mouth_coupling", 0.6)
+        return orig(*a, **k)
+
+    synthetic.make_points = with_artifact
+    try:
+        app.handle_key(ord(" "))
+        proc = run_procedure(app)
+        assert proc.succeeded and "boca_px_por_unidade" in proc.stats
+        app.handle_key(13)
+        tracker.look_at = (900, 600)
+        settle(app)
+        closed = app.screen_point.copy()
+        tracker.mouth = 0.12
+        settle(app)
+        assert np.linalg.norm(app.screen_point - closed) < 60, (closed, app.screen_point)
+    finally:
+        synthetic.make_points = orig

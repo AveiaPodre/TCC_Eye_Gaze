@@ -76,11 +76,22 @@ class StabilizerConfig:
     # Estabilizador de fixação aplicado ao ponto na tela (cursor e dwell).
     # Ver filters.FixationStabilizer.
     saccade_ratio: float = 0.07   # salto mínimo (fração da largura da tela) p/ sacada
-    confirm_frames: int = 3       # amostras seguidas fora da fixação p/ confirmar salto
-    window_frames: int = 20       # janela da média durante a fixação (~0,7 s a 30 fps)
-    follow: float = 0.3           # fração do caminho até a média percorrida por frame
-    deadzone_px: float = 6.0      # movimentos menores que isto são ignorados
-    noise_k: float = 3.0          # limiar adaptativo = max(base, k * ruído medido)
+    confirm_frames: int = 2       # amostras seguidas fora da fixação p/ confirmar salto
+    window_frames: int = 30       # amostras guardadas da fixação atual (~1 s a 30 fps)
+    follow: float = 0.6           # fração do caminho até o destino percorrida por frame
+    # Trava da fixação: depois de ``settle_frames`` quadros o cursor para e
+    # só volta a andar se ``shift_frames`` amostras seguidas ficarem fora do
+    # raio de trava = max(lock_ratio * largura, lock_k * passeio medido).
+    lock_ratio: float = 0.035     # ~67 px numa tela de 1920 px
+    # Passeio da estimativa com o olho parado: ~50 px de desvio (medido nos
+    # vídeos gravados). Com lock_k 2,5 e teto de 0,6 x limiar de sacada, o
+    # cursor "destravava" ~18 vezes por minuto seguindo esse passeio; com
+    # 3,5 e teto 0,9, ~6,5 vezes, sem mudar o atraso após sacadas.
+    lock_k: float = 3.5
+    lock_cap: float = 0.9         # raio de trava <= lock_cap x limiar de sacada
+    shift_frames: int = 8         # ~0,27 s
+    settle_frames: int = 8
+    noise_k: float = 3.0          # limiar de sacada = max(base, k * ruído medido)
 
 
 @dataclass
@@ -89,7 +100,10 @@ class CalibrationConfig:
     # de alvos do que o 3x3 oferecia (~35 s no total).
     grid_cols: int = 4
     grid_rows: int = 4
-    margin_ratio: float = 0.08     # distância dos alvos à borda (fração da tela)
+    # Distância dos alvos à borda (fração da tela). Era 0,08: a última linha
+    # ficava a 92% da altura, e abaixo dela (barra de tarefas) o modelo
+    # extrapolava medidas que saturam ao olhar para baixo.
+    margin_ratio: float = 0.05
     # Ordem aleatória dos alvos. Na ordem linha a linha, o tempo (cansaço,
     # olho ressecando, postura escorregando) andava junto com a posição
     # vertical: nos dados reais a abertura do olho caiu de 0,27 para 0,16 ao
@@ -143,6 +157,29 @@ class CalibrationConfig:
     # Faixa aproveitada no ajuste (amostras além dela são descartadas).
     head_max_deg: tuple = (15.0, 12.0)
     head_motion_weight: float = 1.0   # peso da etapa, em "número de alvos"
+
+    # Etapa da boca (depois da etapa da cabeça): olhar fixo no centro e a boca
+    # abrindo e fechando. Ensina quanto a abertura da boca desloca a
+    # estimativa (o MediaPipe deforma a malha inteira) para descontá-la.
+    mouth_stage: bool = True
+    mouth_stage_s: float = 4.0       # duração mínima
+    mouth_timeout_s: float = 7.0     # segue mesmo se a boca não abrir
+    mouth_min_open: float = 0.08     # abertura pedida (lábios / largura entre olhos)
+
+    # Calibração manual (tecla C): cada alvo só avança quando o usuário,
+    # olhando para ele, aperta ESPAÇO/ENTER. As etapas da cabeça e da boca
+    # continuam automáticas.
+    manual: bool = False
+
+    # Recentralização (R): desvios maiores que esta fração da tela (em cada
+    # eixo) não são aplicados; a mensagem pede para recalibrar.
+    recenter_max_frac: float = 0.25
+
+    # Largura física da tela (cm). Com ela, o ganho da cabeça é fixado pela
+    # geometria (px/cm da tela) em vez de aprendido (calibration.py, versão
+    # 6). Preenchida por --screen-width-cm ou detectada no Windows; None =
+    # ganho da cabeça aprendido na etapa da cabeça.
+    screen_width_cm: float | None = None
 
     # Mapeamento usado ANTES de calibrar (só para visualização): ângulo de
     # olhar que corresponderia à borda da tela.
@@ -214,8 +251,14 @@ class DisplayConfig:
     show_head_pose: bool = False
     show_minimap: bool = True
     show_help: bool = True
+    # Vista 3D (scene3d.py): rosto, globos oculares, raios do olhar e tela.
+    show_scene3d: bool = False
+    # Largura física suposta da tela na vista 3D quando --screen-width-cm
+    # não é informado (34,5 cm = notebook de 15,6" 16:9).
+    assumed_screen_width_cm: float = 34.5
     window_name: str = "Eye Gaze - camera"
     target_window_name: str = "Eye Gaze - alvos"
+    scene3d_window_name: str = "Eye Gaze - 3D"
 
 
 @dataclass

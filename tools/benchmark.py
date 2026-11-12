@@ -49,12 +49,14 @@ PAIR_WINDOW_S = 30 * 60         # validação até 30 min depois da calibração
 
 # (nome, argumentos de fit_from_samples). A primeira é a configuração padrão.
 VARIANTS: list[tuple[str, dict]] = [
-    ("padrão (faixa 15/12)", dict()),
+    ("padrão", dict()),
+    ("ganho da cabeça aprendido", dict(_learn_head=True)),
     ("faixa 10/8", dict(head_max_deg=(10.0, 8.0))),
-    ("sem filtro de faixa", dict(head_max_deg=None)),
     ("etapa da cabeça peso 3", dict(head_weight_points=3.0)),
     ("sem etapa da cabeça", dict(_no_head=True)),
 ]
+# px/cm da tela (ganho da cabeça fixado pela geometria); definido em main().
+HEAD_PX_PER_CM: float | None = None
 
 
 @dataclass
@@ -97,6 +99,8 @@ def load_sessions(results: Path, recalc: bool) -> list[Session]:
 
 def _fit(data: CalibrationData, screen, kw: dict):
     kw = dict(kw)
+    if not kw.pop("_learn_head", False):
+        kw.setdefault("head_px_per_cm", HEAD_PX_PER_CM)
     if kw.pop("_no_head", False):
         data = CalibrationData(grid=data.grid)
     model, _, stats = fit_from_samples(data, screen, 2, None, 3.5, **kw)
@@ -151,10 +155,20 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--results", type=Path, default=ROOT / "results")
     p.add_argument("--screen", type=str, default="1920x1080")
+    p.add_argument("--screen-width-cm", type=float, default=None,
+                   help="largura física da tela (padrão: detecta no Windows); fixa o ganho "
+                        "da cabeça. Sem ela, o ganho é aprendido em todas as variantes")
     p.add_argument("--sem-recalcular", action="store_true",
                    help="não recalcula as medidas a partir dos landmarks gravados")
     args = p.parse_args(argv)
     screen = tuple(int(v) for v in args.screen.lower().split("x"))
+    global HEAD_PX_PER_CM
+    from eyegaze.io_devices import detect_screen_width_cm
+    width_cm = args.screen_width_cm or detect_screen_width_cm(screen)
+    HEAD_PX_PER_CM = screen[0] / width_cm if width_cm else None
+    print(f"Tela: {screen[0]}x{screen[1]}, "
+          + (f"{width_cm:.1f} cm ({HEAD_PX_PER_CM:.1f} px/cm)" if width_cm
+             else "largura física desconhecida (ganho da cabeça aprendido)"))
 
     sessions = load_sessions(args.results, recalc=not args.sem_recalcular)
     if not sessions:

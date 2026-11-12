@@ -32,14 +32,28 @@ Esses dois ângulos servem para o HUD e para rejeitar outliers. A
 calibração usa as medidas brutas (``GazeSample.raw``), incluindo as
 medidas verticais pelas PÁLPEBRAS:
 
-    lid_v   = (íris_y - linha média das pálpebras) / largura do olho
+    lid_up   = altura da pálpebra superior em relação aos cantos, no
+               referencial da cabeça, com o z do PRÓPRIO MediaPipe
+               (y > 0 = para baixo) / largura do olho
     abertura = (pálpebra inferior - superior) / largura do olho
 
 Nos dados reais, o centro da íris do MediaPipe quase não se move na
-vertical em relação aos cantos do olho (cerca de 3 graus de variação para a
-tela inteira, contra os ~15-18 esperados). Já as pálpebras acompanham o
-olhar vertical (a superior desce quando se olha para baixo), então essas
-duas medidas trazem a maior parte do sinal vertical.
+vertical em relação aos cantos do olho. A pálpebra superior acompanha o
+olhar vertical (desce quando se olha para baixo) e é a melhor medida
+vertical disponível.
+
+Por que ``lid_up`` usa o z do MediaPipe e não a superfície da esfera: uma
+medida do olho só serve para compensar a cabeça se responder à rotação do
+olho DENTRO da cabeça do mesmo jeito quando quem se move é o olho (grade
+de alvos, cabeça parada) e quando quem se move é a cabeça (olhar fixo,
+cabeça inclinando). Nas sessões gravadas, a razão entre essas duas
+respostas foi 1,03 e 1,11 para ``lid_up`` (ideal: 1), contra ~0 para a
+versão com profundidade na esfera, para a íris vertical e para a
+abertura: elas mudavam com o olhar na grade, mas não quando a cabeça
+inclinava, e a calibração aprendia relações contraditórias no eixo
+vertical. A pálpebra não está exatamente na superfície do globo, então
+trocar o z dela pelo da esfera distorcia a medida conforme a inclinação.
+A pálpebra inferior não serve: responde ao contrário (razão ~ -4,5).
 """
 
 from __future__ import annotations
@@ -50,7 +64,7 @@ import numpy as np
 
 from .config import GazeConfig
 from .face_tracker import FaceObservation
-from .head_pose import HeadPose, estimate_head_pose
+from .head_pose import HeadPose, estimate_head_pose, mouth_ratio
 from .landmarks import LEFT_EYE, RIGHT_EYE, EyeIndices
 
 
@@ -71,11 +85,11 @@ class EyeGaze:
     offset_u: float = 0.0
     offset_v: float = 0.0
     # Medidas verticais pelas pálpebras (ver docstring do módulo).
-    lid_v: float = 0.0
+    lid_up: float = 0.0
     aperture: float = 0.0
-    # (u, v, lid_v) com o centro da íris refinado na imagem (iris_refine.py);
+    # (u, v) com o centro da íris refinado na imagem (iris_refine.py);
     # igual ao do MediaPipe quando o refinamento não está disponível.
-    refined: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    refined: tuple[float, float] = (0.0, 0.0)
     refined_ok: bool = False
 
 
@@ -90,8 +104,8 @@ class GazeSample:
     blink: bool                       # ambos os olhos fechados
     extras: dict = field(default_factory=dict)
     # Vetor bruto usado pela calibração (ver calibration.RAW_LAYOUT):
-    # [R (9, linha a linha), posição do olho em cm (3), u, v, lid_v, abertura
-    #  (íris do MediaPipe), u, v, lid_v, abertura (íris refinada)]
+    # [R (9, linha a linha), posição do olho em cm (3), u, v, lid_up, abertura
+    #  (íris do MediaPipe), u, v, lid_up, abertura (íris refinada), boca]
     raw: np.ndarray | None = None
     # Observacao de origem (landmarks), gravada para reanalise offline.
     obs: FaceObservation | None = None
@@ -203,23 +217,24 @@ class GazeEstimator:
         dir_head = angles_to_head_direction(yaw, pitch)
         dir_cam = head.R @ dir_head
 
-        # Pálpebras (média de vários pontos): também apoiadas no globo, com a
-        # mesma correção de profundidade.
+        # Pálpebras (média de vários pontos).
         up = pts[list(idx.upper_lid_ring or (idx.upper_lid,))].mean(axis=0)
         lo = pts[list(idx.lower_lid_ring or (idx.lower_lid,))].mean(axis=0)
-        up_l = to_eye(up)
-        lo_l = to_eye(lo)
-        lid_mid = (up_l[1] + lo_l[1]) / 2
-        lid_v = float(local[1] - lid_mid)
-        aperture = float(lo_l[1] - up_l[1])
+        # Altura da pálpebra superior com o z do MediaPipe (SEM a correção
+        # da esfera): é a versão coerente com a rotação da cabeça (ver
+        # docstring do módulo).
+        lid_up = float((head.R.T @ (up - mid))[1] / width)
+        # Abertura com a correção da esfera (versão anterior; a calibração
+        # decide se ela ajuda).
+        aperture = float(to_eye(lo)[1] - to_eye(up)[1])
 
         refined_ok = refined_xy is not None and bool(np.all(np.isfinite(refined_xy)))
         if refined_ok:
             # z provisório: on_eyeball recalcula a profundidade.
             loc_r = to_eye(np.array([refined_xy[0], refined_xy[1], mid[2]]))
-            refined = (float(loc_r[0]), float(loc_r[1]), float(loc_r[1] - lid_mid))
+            refined = (float(loc_r[0]), float(loc_r[1]))
         else:
-            refined = (float(local[0]), float(local[1]), lid_v)
+            refined = (float(local[0]), float(local[1]))
 
         # EAR: abertura vertical / largura.
         ear = float(np.linalg.norm(pts[idx.upper_lid] - pts[idx.lower_lid]) / width)
@@ -244,7 +259,7 @@ class GazeEstimator:
             open=bool(is_open),
             offset_u=float(local[0]),
             offset_v=float(local[1]),
-            lid_v=lid_v,
+            lid_up=lid_up,
             aperture=aperture,
             refined=refined,
             refined_ok=refined_ok,
@@ -253,7 +268,9 @@ class GazeEstimator:
     def estimate(self, obs: FaceObservation) -> GazeSample:
         pts = obs.points
         head, pose_source = estimate_head_pose(pts, obs.transform, self.cfg.head_pose_source)
-        extras = {"pose_source": pose_source}
+        mouth = mouth_ratio(pts)
+        extras = {"pose_source": pose_source, "boca": mouth}
+        eye_pos = eye_position_cm(obs, head)
         ref = obs.iris_refined
         eyes = [self._eye(pts, head, RIGHT_EYE, None if ref is None else ref[0]),
                 self._eye(pts, head, LEFT_EYE, None if ref is None else ref[1])]
@@ -269,11 +286,11 @@ class GazeEstimator:
 
         u = float(np.mean([e.offset_u for e in open_eyes]))
         v = float(np.mean([e.offset_v for e in open_eyes]))
-        lv = float(np.mean([e.lid_v for e in open_eyes]))
+        lu = float(np.mean([e.lid_up for e in open_eyes]))
         ap = float(np.mean([e.aperture for e in open_eyes]))
-        ur, vr, lvr = np.mean([e.refined for e in open_eyes], axis=0)
+        ur, vr = np.mean([e.refined for e in open_eyes], axis=0)
         extras["iris_refinada"] = all(e.refined_ok for e in open_eyes)
-        raw = np.concatenate([head.R.reshape(-1), eye_position_cm(obs, head),
-                              [u, v, lv, ap, ur, vr, lvr, ap]])
+        raw = np.concatenate([head.R.reshape(-1), eye_pos,
+                              [u, v, lu, ap, ur, vr, lu, ap, mouth]])
         return GazeSample(obs.timestamp_ms, head, eyes, combined, yaw, pitch, blink=False,
                           extras=extras, raw=raw, obs=obs)

@@ -41,7 +41,7 @@ python main.py                      # webcam 0
 python main.py --camera 1           # outra webcam
 python main.py --video sessao.mp4   # roda sobre um vídeo gravado
 python main.py --screen 1920x1080   # se a resolução não for detectada
-python main.py --screen-width-cm 53 --distance-cm 60   # erro em graus na validação
+python main.py --screen-width-cm 53 --distance-cm 60   # largura física da tela (fora do Windows) e erro em graus
 python main.py --gravar             # grava vídeo + teclas (results/sessao_*.avi/.json)
 python main.py --reproduzir results/sessao_X.json --sem-janela   # refaz a sessão offline
 python main.py --help
@@ -54,7 +54,11 @@ Fluxo recomendado:
 2. Pressione **ESPAÇO** e olhe para cada um dos 16 alvos, que aparecem em
    ordem aleatória. O círculo laranja encolhe enquanto o olho chega ao alvo.
    A coleta (ponto verde com anel de progresso) só começa quando o olhar
-   estabiliza no alvo.
+   estabiliza no alvo. Na **calibração manual** (tecla **C**), cada alvo só
+   avança quando você, olhando para ele, aperta **ESPAÇO** (ou ENTER). São
+   usadas as amostras do segundo **antes** da tecla, porque ao apertar é
+   comum piscar ou olhar para o teclado. Se o olhar ainda estava se movendo,
+   a tela pede para tentar de novo.
 3. **Etapa da cabeça (~10 s):** um ponto verde fica no centro. Sem tirar os
    olhos dele, gire a cabeça na direção da seta (direita, esquerda, cima,
    baixo) até a seta ficar **verde** (~10° para os lados, ~8° para cima e
@@ -63,18 +67,24 @@ Fluxo recomendado:
    modelo quanto do movimento vem dos olhos e quanto vem da cabeça. Quem não
    consegue mover a cabeça pode só continuar olhando o ponto (cada direção
    avança sozinha em 4 s).
-4. Alvos com erro muito alto (piscada longa, distração) são repetidos
+4. **Etapa da boca (~4 s):** continue olhando o ponto central e abra e feche
+   a boca devagar algumas vezes (a barra mostra a abertura). O MediaPipe
+   deforma a malha inteira do rosto quando a boca abre, e sem esta etapa o
+   cursor descia com a boca aberta. A etapa ensina ao modelo quanto
+   descontar. Quem não puder abrir a boca pode só continuar olhando (segue
+   sozinha em 7 s).
+5. Alvos com erro muito alto (piscada longa, distração) são repetidos
    automaticamente, uma vez.
-5. A tela de resultado mostra o erro em cada alvo, o erro estimado em pontos
+6. A tela de resultado mostra o erro em cada alvo, o erro estimado em pontos
    novos e em poses novas da cabeça (validação cruzada) e uma classificação
    da qualidade (boa / razoável / ruim).
-6. Pressione **T** para validar: 9 alvos novos, que não entram na
+7. Pressione **T** para validar: 9 alvos novos, que não entram na
    calibração, medem a acurácia e a precisão. O resultado vai para
    `results/` e mostra também quanto do erro é um desvio constante, que o
    **R** corrige.
-7. Pressione **M** para ligar o mouse e **D** para ligar o clique por
+8. Pressione **M** para ligar o mouse e **D** para ligar o clique por
    permanência (*dwell-click*).
-8. Se o HUD mostrar **"Postura fora da calibração"** (você se mexeu ou
+9. Se o HUD mostrar **"Postura fora da calibração"** (você se mexeu ou
    girou a cabeça além do que foi calibrado) ou o cursor ficar
    sistematicamente deslocado, pressione **R** e olhe para o centro
    (recentralização de 1 ponto).
@@ -102,7 +112,8 @@ automaticamente. Ela é descartada se a resolução da tela mudar.
 
 | Tecla | Ação |
 |---|---|
-| `ESPAÇO` ou `C` | calibrar (16 pontos + etapa da cabeça) |
+| `ESPAÇO` | calibrar, automática (16 pontos + etapas da cabeça e da boca) |
+| `C` | calibrar, manual: cada alvo avança com ESPAÇO/ENTER enquanto você olha para ele |
 | `T` | validar (mede o erro em alvos novos e salva CSV/JSON em `results/`) |
 | `R` | recentralizar (corrige deslocamento com 1 ponto) |
 | `M` | liga/desliga o controle do mouse (exige calibração) |
@@ -111,6 +122,7 @@ automaticamente. Ela é descartada se a resolução da tela mudar.
 | `G` | liga/desliga a visualização do **olhar** (globos oculares, raio de cada olho, raio combinado, ângulos) |
 | `P` | liga/desliga os **eixos da cabeça** e os ângulos de pose |
 | `V` | liga/desliga o **minimapa** da tela com o ponto estimado em tempo real |
+| `3` | liga/desliga a **vista 3D** (janela própria): rosto, globos oculares, raio de cada olho, plano da tela com o cursor (amarelo), o raio geométrico (magenta; calibrado depois da calibração, cru antes) e a direção do rosto corrigida (verde). Arraste para girar, use a roda para zoom e o botão direito para voltar à vista inicial. Informe `--screen-width-cm` para a tela ficar em escala |
 | `F` | espelha ou não a imagem exibida (o processamento não muda) |
 | `H` | mostra/oculta a ajuda |
 | `ESC` | cancela calibração/validação em andamento; fora delas, sai |
@@ -133,11 +145,13 @@ valores iniciais de cada visualização ficam em `DisplayConfig`
 ```
 webcam -> FaceLandmarker (478 landmarks + matriz de pose)
        -> rotação da cabeça R e posição 3D do rosto E (cm)
-       -> íris (u, v) e pálpebras (lid_v, abertura) no referencial da cabeça
+       -> íris (u, v) e pálpebras (altura da pálpebra superior lid_up,
+          abertura) no referencial da cabeça
        -> calibração: ponto para onde a face aponta (E + E_z·tan(cabeça))
                       + medidas do olho escaladas pela distância
-                      -> regressão ridge (validação cruzada em alvos e em
-                         direções da cabeça) -> (x, y) em pixels
+                      -> regressão ridge livre ou modelo físico (px/cm
+                         compartilhado), escolhidos por validação cruzada
+                         em alvos e em direções da cabeça -> (x, y) em pixels
        -> aviso de postura fora da calibração (R recentraliza)
        -> estabilizador de fixação (cursor parado na fixação, salta na sacada)
        -> mouse + dwell-click
@@ -156,10 +170,11 @@ eyegaze/
   face_tracker.py          # MediaPipe FaceLandmarker (modo VIDEO) + download do modelo
   head_pose.py             # rotação da cabeça (matriz do modelo, com reserva por landmarks)
   gaze.py                  # modelo do globo ocular, posição 3D do rosto, piscadas
-  filters.py               # One-Euro Filter e estabilizador de fixação (anti-tremor)
+  filters.py               # One-Euro Filter e estabilizador de fixação com trava
   calibration.py           # regressão: geometria da cabeça + medidas do olho/pálpebras -> pixel
   procedures.py            # calibração (com etapa da cabeça), validação e recentralização
   visualization.py         # landmarks, olhar, pose, minimapa, HUD, ajuda
+  scene3d.py               # vista 3D: rosto, globos oculares, raios do olhar, tela
   io_devices.py            # câmera/vídeo, gravação/reprodução de sessões, tela, mouse, dwell-click
   app.py                   # loop principal e teclas
 tests/
@@ -191,7 +206,9 @@ pose e olhar conhecidos e conferem:
   sintético tem os erros típicos de webcam: ganho do olho diferente do
   assumido, movimento vertical da íris achatado e acoplamento com a
   inclinação da cabeça;
-- que o estabilizador elimina o tremor na fixação sem atrasar as sacadas;
+- que o estabilizador elimina o tremor na fixação sem atrasar as sacadas, e
+  mantém o cursor parado quando a estimativa passeia devagar (ruído
+  correlacionado, como nos dados reais);
 - que a calibração generaliza para pontos fora da grade;
 - o fluxo completo do app: calibrar, validar, recentralizar, mouse,
   dwell-click, perda de rosto e todas as teclas de visualização;
@@ -204,9 +221,11 @@ pose e olhar conhecidos e conferem:
 
 | Sintoma | Ajuste |
 |---|---|
-| Cursor ainda tremendo | aumentar `StabilizerConfig.window_frames` (ex.: 30) ou `deadzone_px` (ex.: 10) |
+| Cursor anda sozinho com o olhar parado | aumentar `StabilizerConfig.lock_ratio` (ex.: 0.05) ou `shift_frames` (ex.: 12) |
+| Cursor não acompanha pequenos deslocamentos do olhar | diminuir `StabilizerConfig.lock_ratio` (ex.: 0.025) ou `shift_frames` (ex.: 5) |
 | Cursor salta sozinho | aumentar `StabilizerConfig.saccade_ratio` (ex.: 0.10) ou `confirm_frames` (ex.: 4) |
 | Cursor demora a chegar após olhar para outro lugar | diminuir `confirm_frames` (mín. 2) ou aumentar `follow` |
+| Cursor não desce o suficiente ao inclinar a cabeça | confira se a largura da tela foi detectada (linha `[Tela]` no terminal); se não, informe `--screen-width-cm` |
 | Cursor desloca quando gira a cabeça | refazer a calibração caprichando na etapa da cabeça (ver o erro com a cabeça em movimento na tela de resultado) |
 | Cliques acidentais | aumentar `DwellClickConfig.dwell_time_s` ou diminuir `tolerance_px` |
 | Piscadas não detectadas / falsas | ajustar `GazeConfig.blink_ratio` |
@@ -236,7 +255,12 @@ que está sendo removido.
   absorve a maior parte dele, e `R` corrige o resto.
 - **Eixo vertical.** O eixo vertical é menos preciso que o horizontal: a íris
   se desloca menos e as pálpebras a cobrem parcialmente. Isso é comum em
-  rastreadores por webcam.
+  rastreadores por webcam. O ganho da cabeça no eixo vertical é fixado pela
+  geometria quando a largura física da tela é conhecida (detectada no
+  Windows ou `--screen-width-cm`): abaixar a cabeça para olhar para baixo
+  move o cursor o quanto deve. Com a cabeça parada, as medidas do olho
+  saturam perto da borda de baixo; abaixo da última linha de alvos (92% da
+  altura) o alcance é menor.
 - **Óculos e iluminação.** Reflexos nas lentes e contraluz pioram os
   landmarks da íris.
 - **Acurácia.** Rastreadores por webcam costumam ter erro de alguns graus de

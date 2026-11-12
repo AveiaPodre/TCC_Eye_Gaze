@@ -325,3 +325,56 @@ def test_wrong_selection_moves_offset_only_a_little(tmp_path):
     before = app.model.offset.copy()
     app.confirm_target((1700.0, 1000.0))  # "tecla" longe de onde a pessoa olhava
     assert np.linalg.norm(app.model.offset - before) <= app.cfg.adapt.max_step_px + 1e-6
+
+
+# ------------------------------------------------------- calibração manual
+def test_manual_mode_advances_only_on_confirmation():
+    """Modo manual: o alvo só avança com a tecla, e as amostras são as de
+    ANTES da tecla (descontado o tempo de reação), não as de depois."""
+    proc = TargetProcedure([(100, 100), (900, 500)], (1920, 1080), settle_s=0.5, collect_s=0.5,
+                           min_samples=5, fixation_max_deg=0.8)
+    proc.manual = True
+    t = 0.0
+    while t < 3.0:                                  # olhando o alvo 0, sem apertar
+        proc.update(StubSample(5.0, 2.0), t)
+        t += 1 / 30
+    assert proc.pos == 0 and proc.awaiting_confirmation
+    # Logo depois da tecla a pessoa desvia o olhar (para o teclado): essas
+    # amostras não podem entrar.
+    assert proc.confirm(t)
+    proc.update(StubSample(40.0, -30.0), t)
+    feats, _ = proc.arrays(0)
+    assert len(feats) >= 5 and np.allclose(feats, [5.0, 2.0])
+    assert proc.pos == 1
+
+
+def test_manual_mode_refuses_when_gaze_is_moving():
+    proc = TargetProcedure([(100, 100)], (1920, 1080), settle_s=0.5, collect_s=0.5,
+                           min_samples=5, fixation_max_deg=0.8)
+    proc.manual = True
+    rng = np.random.default_rng(1)
+    t = 0.0
+    while t < 2.0:
+        proc.update(StubSample(*rng.normal(0, 4.0, 2)), t)   # olhar procurando
+        t += 1 / 30
+    assert not proc.confirm(t)
+    assert proc.pos == 0 and proc._manual_msg is not None
+    assert not proc.confirm(0.1)                              # cedo demais é ignorado
+
+
+def test_manual_calibration_end_to_end(tmp_path):
+    """Tecla C: calibração manual; ESPAÇO confirma cada alvo; etapas da cabeça
+    e da boca continuam automáticas."""
+    app, tracker, _ = make_app(tmp_path)
+    app.handle_key(ord("c"))
+    proc = app.procedure
+    assert proc.manual
+    for _ in range(6000):
+        app.step()
+        if proc.awaiting_confirmation and app.clock() - proc._phase_start > 1.2:
+            app.handle_key(32)
+        if proc.collecting_done:
+            break
+    assert proc.succeeded
+    assert all(len(s) >= proc.min_samples for s in proc.samples)
+    assert len(proc.mouth_samples) > 0

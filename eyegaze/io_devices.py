@@ -6,6 +6,7 @@ tamanho da tela e controle do mouse.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -32,17 +33,44 @@ class FrameSource:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             self.cap.set(cv2.CAP_PROP_FPS, fps)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # ignorado por alguns drivers
         self._t0 = time.monotonic()
+        # Webcam: uma thread lê a câmera sem parar e guarda só o quadro mais
+        # recente. Com leitura síncrona, quando o processamento de um quadro
+        # passava de ~33 ms (calibração/validação, gravação), o driver
+        # acumulava quadros e o app processava imagens cada vez mais velhas:
+        # atraso de vários quadros antes mesmo do estabilizador.
+        self._latest: tuple[np.ndarray, int] | None = None
+        self._new = threading.Event()
+        self._stop = False
+        self._failed = False
+        self._thread = None
+        if not self.is_file:
+            self._thread = threading.Thread(target=self._grab, daemon=True)
+            self._thread.start()
+
+    def _grab(self):
+        while not self._stop:
+            ok, frame = self.cap.read()
+            if not ok:
+                self._failed = True
+                self._new.set()
+                return
+            self._latest = (frame, int((time.monotonic() - self._t0) * 1000))
+            self._new.set()
 
     def read(self) -> tuple[np.ndarray | None, int]:
-        ok, frame = self.cap.read()
-        if not ok:
-            return None, 0
         if self.is_file:
-            ts = int(self.cap.get(cv2.CAP_PROP_POS_MSEC))
-        else:
-            ts = int((time.monotonic() - self._t0) * 1000)
-        return frame, ts
+            ok, frame = self.cap.read()
+            if not ok:
+                return None, 0
+            return frame, int(self.cap.get(cv2.CAP_PROP_POS_MSEC))
+        # Espera um quadro NOVO (não reprocessa o mesmo) e pega o mais recente;
+        # os intermediários são descartados.
+        if not self._new.wait(timeout=2.0) or self._failed or self._latest is None:
+            return None, 0
+        self._new.clear()
+        return self._latest
 
     @property
     def resolution(self) -> tuple[int, int]:
@@ -50,6 +78,9 @@ class FrameSource:
                 int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 
     def release(self):
+        self._stop = True
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
         self.cap.release()
 
 
@@ -62,7 +93,8 @@ class SessionRecorder:
     """
 
     def __init__(self, base_path: Path, fps: float, frame_size: tuple[int, int],
-                 screen_size: tuple[int, int], seed: int):
+                 screen_size: tuple[int, int], seed: int,
+                 screen_width_cm: float | None = None):
         self.base = Path(base_path)
         self.base.parent.mkdir(parents=True, exist_ok=True)
         self.video_path = self.base.with_suffix(".avi")
@@ -72,7 +104,8 @@ class SessionRecorder:
         if not self._writer.isOpened():
             raise RuntimeError(f"Não foi possível gravar {self.video_path}")
         self.meta = {"versao": 1, "tela": list(screen_size), "camera": list(frame_size),
-                     "fps": fps, "semente": int(seed), "timestamps_ms": [], "teclas": []}
+                     "fps": fps, "semente": int(seed), "tela_cm": screen_width_cm,
+                     "timestamps_ms": [], "teclas": []}
 
     @property
     def frame_index(self) -> int:
@@ -121,6 +154,11 @@ class ReplaySource:
     @property
     def seed(self) -> int:
         return int(self.meta["semente"])
+
+    @property
+    def screen_width_cm(self) -> float | None:
+        """Largura física da tela gravada (None em gravações antigas)."""
+        return self.meta.get("tela_cm")
 
     @property
     def resolution(self) -> tuple[int, int]:
@@ -175,6 +213,37 @@ def detect_screen_size() -> tuple[int, int] | None:
         return size
     except Exception:  # noqa: BLE001
         return None
+
+
+def detect_screen_width_cm(screen_size: tuple[int, int] | None = None) -> float | None:
+    """Largura física do monitor principal em cm, ou None se não der.
+
+    No Windows, ``GetDeviceCaps(HORZSIZE/VERTSIZE)`` devolve o tamanho
+    físico informado pelo monitor (EDID), em mm. O valor só é aceito se for
+    plausível (15-300 cm) e se a proporção bater com a da resolução (até
+    10% de diferença): projetores e alguns adaptadores informam 0 ou
+    valores genéricos. Nos outros sistemas, use --screen-width-cm.
+    """
+    import sys
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+        user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+        dc = user32.GetDC(0)
+        try:
+            w_mm, h_mm = gdi32.GetDeviceCaps(dc, 4), gdi32.GetDeviceCaps(dc, 6)
+        finally:
+            user32.ReleaseDC(0, dc)
+    except Exception:  # noqa: BLE001
+        return None
+    if not (150 <= w_mm <= 3000 and h_mm > 0):
+        return None
+    if screen_size is not None:
+        aspect_px = screen_size[0] / screen_size[1]
+        if abs((w_mm / h_mm) / aspect_px - 1.0) > 0.10:
+            return None
+    return w_mm / 10.0
 
 
 class MouseController:

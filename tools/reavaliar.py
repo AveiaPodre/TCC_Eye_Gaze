@@ -31,7 +31,7 @@ from eyegaze.calibration import (EYE_COLS, CalibrationData, fit_from_samples,  #
 from eyegaze.config import GazeConfig  # noqa: E402
 from eyegaze.gaze import GazeEstimator  # noqa: E402
 
-MEASURES = ("u (iris horiz.)", "v (iris vert.)", "lid_v (iris/palpebras)", "abertura")
+MEASURES = ("u (iris horiz.)", "v (iris vert.)", "lid_up (palpebra sup.)", "abertura")
 
 
 def latest(pattern: str) -> Path | None:
@@ -68,6 +68,9 @@ def recompute(data: CalibrationData) -> CalibrationData:
     if data.head_obs:
         out.head_target = data.head_target
         out.head_features, out.head_raw = run(data.head_obs)
+    if data.mouth_obs:
+        out.mouth_target = data.mouth_target
+        out.mouth_features, out.mouth_raw = run(data.mouth_obs)
     return out
 
 

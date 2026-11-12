@@ -162,30 +162,127 @@ A solução usa a estrutura do próprio olhar. O olho alterna entre
 rápidos). O `FixationStabilizer` foi inspirado nos detectores de fixação por
 dispersão (I-DT; Salvucci e Goldberg, 2000):
 
-1. **Durante uma fixação**, o cursor segue a média das últimas N amostras
-   (N = 20, ~0,7 s). Ruído com desvio σ vira σ/√N. Uma zona morta de 6 px
-   impede micro-movimentos, e o cursor percorre 30% do caminho até a média
-   a cada frame.
-2. **Sacada:** uma amostra a mais de L px da média da fixação é candidata.
-   O cursor só salta quando 3 amostras seguidas estão fora e são coerentes
-   entre si (dispersão < L). Picos isolados (quase-piscadas, erros de
+1. **Sacada:** uma amostra a mais de L px da média da fixação é candidata.
+   O cursor só salta quando 2 amostras seguidas estão fora e são coerentes
+   entre si (dispersão < max(L, metade do salto)), e salta para a amostra
+   mais recente (ver 4.1). Picos de um quadro (quase-piscadas, erros de
    detecção) são ignorados.
-3. **Limiar adaptativo:** L = max(7% da largura da tela, 3 × ruído medido na
+2. **Limiar adaptativo:** L = max(7% da largura da tela, 3 × ruído medido na
    fixação atual). Em condições ruins (pouca luz, rosto longe), o ruído
    aumenta e fica mais difícil confundir tremor com sacada.
+3. **Acomodação:** nos primeiros 8 quadros de uma fixação, o cursor desliza
+   (60% do caminho por quadro) até a média das amostras.
+4. **Trava:** depois disso o cursor **para**. Ele só volta a andar quando as
+   últimas 8 amostras (~0,27 s) estão **todas** a mais de r px da posição
+   travada, ou seja, um deslocamento pequeno porém sustentado. Aí começa uma
+   nova fixação no ponto médio dessas amostras. O raio é
+   r = max(3,5% da largura da tela, 3,5 × passeio típico), em que o passeio
+   típico é a dispersão das fixações anteriores (média móvel), limitado a
+   0,9 L (antes 2,5 × e 0,6 L; ver 4.2).
 
-Resultado num sinal simulado com ruído de 45 px por eixo:
+**Por que a trava (versão 2 do estabilizador).** A primeira versão seguia a
+média deslizante das últimas 20 amostras, com zona morta de 6 px. Isso
+supõe ruído branco (independente de quadro para quadro), e a média de N
+amostras reduz o desvio para σ/√N. Nas sessões gravadas, porém, o ruído da
+estimativa é fortemente **correlacionado**: a autocorrelação entre quadros
+seguidos é 0,97, e a média de 8 amostras tem praticamente o mesmo desvio
+que uma amostra isolada (13 px contra 17 px, quando o esperado com ruído
+branco seria 6 px). A estimativa não treme, ela **passeia**: em 1,2 s de
+fixação, afasta-se 50–130 px do ponto inicial em metade dos alvos (≈1–2,5°,
+bem acima do movimento fisiológico do olho na fixação). A média deslizante
+acompanhava esse passeio e o cursor "andava" com o olho parado. A trava
+troca um pouco de resolução (deslocamentos menores que r não movem o
+cursor) por um cursor parado, o que é aceitável porque a acurácia do
+sistema (~150 px) já é maior que r.
+
+Resultado nas sequências reais das duas sessões gravadas (16 alvos cada,
+reproduzidas na ordem em que foram vistos):
+
+| | quadros com o cursor em movimento na fixação | quadros até chegar após uma sacada (mediana) |
+|---|---|---|
+| média deslizante (versão 1) | 71% | 2 |
+| trava (versão 2) | ~8% (quase todos no deslizamento inicial) | 2 |
+
+E num sinal simulado com ruído branco de 45 px por eixo:
 
 | | movimento do cursor por frame durante a fixação | frames até chegar após uma sacada |
 |---|---|---|
 | sem filtro | ~82 px | 0 |
-| One-Euro (versão anterior) | ~46 px | 0 |
+| One-Euro | ~46 px | 0 |
 | estabilizador de fixação | ~2 px | 2–3 (~100 ms) |
 
 O One-Euro continua sendo usado, com parâmetros mais suaves, só nos ângulos
 mostrados no HUD e no mapeamento antes da calibração. O HUD mostra o ruído
 estimado (`ruido ~N px`). O minimapa mostra o ponto bruto (cinza) e o cursor
 estabilizado (amarelo).
+
+### 4.1 Atraso do cursor
+
+**Medição.** O MediaPipe de cada quadro das duas sessões gravadas em vídeo
+foi guardado em cache. O ponto bruto de cada quadro foi calculado com o
+modelo da calibração original da sessão, e os arquivos de calibração e
+validação dão o alvo em cada instante. Em cada troca de alvo (89 trocas
+com salto ≥ 250 px), o **atraso extra do cursor** é o tempo entre o ponto
+bruto chegar perto do novo alvo e o cursor chegar.
+
+| Estabilizador | atraso mediano | atraso p90 | quadros com o cursor em movimento na fixação | erro do cursor no alvo |
+|---|---|---|---|---|
+| anterior (confirmação em 3 quadros, desliza 35%/quadro, salta para a média das pendentes) | 92 ms | 292 ms | 23% | 148 px |
+| **atual** (2 quadros, 60%/quadro, salta para a amostra mais recente) | **42 ms** | **110 ms** | **15%** | **138 px** |
+
+O ponto bruto leva alguns quadros para atravessar a tela (o MediaPipe
+suaviza os landmarks no tempo). A média das amostras pendentes caía no meio
+dessa travessia, o cursor parava ali e ainda tinha de deslizar ou esperar
+um "deslocamento pequeno" de 8 quadros. Saltar para a amostra mais recente
+leva o cursor direto ao destino. A tolerância de coerência das pendentes
+passou a crescer com o tamanho do salto. O cursor também se move menos na
+fixação, porque termina de deslizar mais cedo, e fica mais perto do alvo
+(138 px contra 135 do ponto bruto).
+
+**Câmera.** O driver da webcam guardava 3 quadros (medido). Com leitura
+síncrona, quando um quadro levava mais que ~33 ms para ser processado
+(MediaPipe 13 ms, desenho 5–10 ms, tela de alvos 10 ms, gravação de vídeo),
+o app processava imagens com até ~100 ms de atraso. Agora uma thread lê a
+câmera sem parar e o loop pega sempre o quadro mais recente
+(`FrameSource`). Com um processamento simulado de 50 ms por quadro, o
+quadro processado tem ~7 ms de idade. O fundo da tela de alvos passou a
+ser copiado de uma imagem pronta em vez de criado a cada quadro.
+
+### 4.2 Tremor do olhar estimado
+
+O raio do olhar na vista 3D treme porque mostra a estimativa **bruta**,
+antes do estabilizador. Nas quatro sessões gravadas em vídeo, com o olho
+parado num alvo conhecido, ela anda ~18 px de um quadro para o outro e
+passeia com ~50 px de desvio. Origem desse tremor, testada nos dados:
+
+| Teste | Resultado |
+|---|---|
+| filtrar no tempo a pose da cabeça (One-Euro 0,5–1 Hz) | nada muda (18 px/quadro, 58 px de dispersão) |
+| filtrar as medidas do olho (One-Euro 1–2 Hz) | tremor rápido cai à metade, passeio quase igual (50 px), atraso p90 do cursor sobe de 149 para 248–402 ms |
+| regularização (ridge) mais forte | dispersão igual (46–50 px) até α = 0,1; com α = 1 cai, mas o erro vai a 356 px (tudo comprimido) |
+| quadros com o olho abaixo de 80% da abertura normal | 3,4% das amostras, 46% dos desvios > 150 px (piscadas parciais) |
+
+O tremor vem das medidas do olho do MediaPipe nessa câmera e é o limite de
+**precisão** do sistema (~50 px de desvio com o olho parado). Descartar
+quadros com queda brusca de abertura do olho (piscada parcial) reduziu
+pouco os movimentos do cursor (36 → 32/min) e foi deixado de fora.
+
+O que movia o cursor junto com o tremor era o **destravamento por
+deslocamento pequeno**. Classificando os eventos do estabilizador durante
+fixações conhecidas: sacadas falsas, 2,6/min; destravamentos (o passeio
+fica fora do raio de trava por 8 quadros), ~19/min, de ~119 px cada. O
+raio de trava adaptativo estava limitado a 0,6 do limiar de sacada, menos
+que o passeio real. Com o fator 3,5 (antes 2,5) e o teto de 0,9:
+
+| | destravamentos/min | atraso p90 após sacada | cursor em movimento na fixação | erro no alvo |
+|---|---|---|---|---|
+| anterior (2,5; 0,6) | 18,3 | 139 ms | 16,0% | 118 px |
+| **atual (3,5; 0,9)** | **6,5** | **139 ms** | **12,3%** | 122 px |
+
+O custo é que deslocamentos do olhar menores que ~130 px não movem mais o
+cursor. Com um passeio de ~50 px, eles não se distinguem do ruído em tempo
+útil. Na vista 3D, o raio passou a ser desenhado com uma suavização leve
+(One-Euro, só na exibição), sem efeito no cursor.
 
 ## 5. Calibração (`calibration.py`, `procedures.py`)
 
@@ -212,12 +309,47 @@ Além do deslocamento da íris em relação aos cantos (u, v), o estimador
 mede as **pálpebras** no referencial da cabeça (média de 3 pontos em cada
 pálpebra):
 
-- lid_v: posição vertical da íris em relação à linha média das pálpebras;
+- lid_up: altura da pálpebra superior em relação ao meio dos cantos, com o
+  z do próprio MediaPipe (ver 5.2.1);
 - abertura: distância entre as pálpebras.
 
 Todas são divididas pela largura do olho. A pálpebra superior acompanha o
-olhar vertical (desce quando se olha para baixo), então lid_v e a abertura
-trazem o sinal vertical que falta em v.
+olhar vertical (desce quando se olha para baixo), então lid_up e a abertura
+trazem o sinal vertical que falta em v. A versão anterior usava, no lugar
+de lid_up, lid_v (posição da íris entre as pálpebras), que nas sessões
+reais não variava com o olhar (r² = 0,00 contra a posição vertical do alvo).
+
+#### 5.2.1 Coerência com a rotação da cabeça: por que lid_up
+
+Para compensar a cabeça, uma medida do olho precisa responder à rotação do
+olho **dentro da cabeça** do mesmo jeito em duas situações: quando quem se
+move é o olho (grade de alvos, cabeça parada) e quando quem se move é a
+cabeça (etapa da cabeça: olhar fixo no centro, cabeça inclinando, olho
+girando ao contrário). Para cada medida candidata, ajustou-se a inclinação
+medida × ângulo do olho na cabeça separadamente na grade e na etapa da
+cabeça (só inclinação vertical, |yaw| < 4°). O ângulo do olho na cabeça vem
+da posição do alvo, da posição 3D do rosto e da rotação da cabeça. A razão
+entre as duas inclinações deveria ser 1:
+
+| Medida vertical | Razão (sessão 1 / sessão 2) | r² na grade | Ruído entre alvos |
+|---|---|---|---|
+| íris vertical v (profundidade pela esfera) | 0,15 / −0,04 | 0,68 / 0,80 | 5,5° / 4,0° |
+| abertura (profundidade pela esfera) | 0,07 / 0,06 | 0,89 / 0,92 | 2,8° / 2,3° |
+| pálpebra superior (profundidade pela esfera) | 0,01 / −0,07 | 0,87 / 0,92 | 3,0° / 2,4° |
+| íris refinada na imagem | 0,47 / 0,29 | 0,86 / 0,93 | 3,1° / 2,2° |
+| pálpebra inferior (z do MediaPipe) | −4,7 / −4,5 | 0,58 / 0,64 | 6,7° / 5,9° |
+| **pálpebra superior (z do MediaPipe) = lid_up** | **1,03 / 1,11** | **0,92 / 0,94** | **2,3° / 1,9°** |
+
+As medidas anteriores mudavam com o olhar na grade, mas praticamente não
+mudavam quando a cabeça inclinava com o olhar fixo. A calibração então
+aprendia relações contraditórias no eixo vertical: a etapa da cabeça piorava
+o ajuste da grade sem trazer invariância. A diferença entre a pálpebra
+superior "pela esfera" (razão ~0) e "pelo z do MediaPipe" (razão ~1) mostra
+que o problema estava na correção de profundidade: a pálpebra não fica
+exatamente sobre a superfície do globo, e trocar o z dela pelo da esfera
+distorcia a medida conforme a inclinação. Para a íris, a correção pela
+esfera continua necessária (ver abaixo): com o z do MediaPipe, a razão da
+íris vertical fica em 5–6.
 
 #### Profundidade da íris pela esfera do olho
 
@@ -227,8 +359,8 @@ MediaPipe, que é ruidoso. Com a cabeça girada, esse z "vazava" para u e
 v. Na sessão de 02/11 (13h30), u variava 4,5× mais por grau de cabeça do
 que por grau de olho, e v ~14×. Agora só x e y da imagem são usados. A
 profundidade é obtida pela interseção da linha de visada com a esfera do
-olho, ancorada nos cantos (`gaze.on_eyeball`). O mesmo vale para as
-pálpebras.
+olho, ancorada nos cantos (`gaze.on_eyeball`). Na abertura também; já
+lid_up usa o z do MediaPipe (ver 5.2.1).
 
 #### Limite de resolução e refinamento da íris na imagem
 
@@ -256,9 +388,9 @@ tela) é:
 
   P_cabeça = E_xy + E_z · tan(direção da face)   (cm)
 
-O olho entra pelas medidas brutas φ = [u, v, lid_v, abertura],
+O olho entra pelas medidas brutas φ = [u, v, lid_up, abertura],
 centralizadas na média da calibração, mais os termos quadráticos u²,
-u·lid_v, lid_v² e u·v no grau 2. Elas são multiplicadas pela distância E_z
+u·lid_up, lid_up² e u·v no grau 2. Elas são multiplicadas pela distância E_z
 (o mesmo ângulo de olho cobre mais centímetros de longe) e por
 sec²(ângulo da cabeça), a derivada de tan(cabeça + olho):
 
@@ -271,9 +403,236 @@ As colunas são padronizadas, com desvio-padrão mínimo de 1 cm nas de
 P_cabeça. Assim, se a cabeça ficou quase parada na calibração, o ruído
 dessa coluna não é amplificado.
 
+#### Modelo físico (candidato)
+
+A regressão acima ("livre") tem ~20 coeficientes, e cada eixo tem os seus
+para a cabeça. Quando há etapa da cabeça, entra na escolha (5.5) também um
+modelo com só 3 coeficientes:
+
+  x = c_x − a·P_x + b_x · E_z · sec²(yaw_cabeça) · u
+  y = c_y + a·P_y + b_y · E_z · sec²(pitch_cabeça) · lid_up
+
+O coeficiente a (px por cm na tela) é **o mesmo nos dois eixos**, porque os
+pixels são quadrados. O sinal negativo em x vem da imagem não espelhada (a
+direita do usuário é −x na câmera). Cada eixo usa só a medida do olho
+coerente com a cabeça (u no horizontal, lid_up no vertical). O giro
+horizontal da etapa da cabeça, que é o mais confiável, determina a, e esse
+valor passa a valer também na vertical. As equações dos dois eixos são
+resolvidas juntas (ridge com coeficientes compartilhados e um intercepto
+por eixo). Nas sessões reais, o a ajustado ficou em 56–65 px/cm, compatível
+com uma tela de 1920 px e ~30–34 cm de largura. Sem a etapa da cabeça, a
+fica indeterminado (a cabeça quase não se move na grade) e o modelo físico
+não é considerado. Quando a largura física da tela é conhecida, a não é
+aprendido: ver a seguir.
+
+#### Ganho da cabeça pela geometria (largura da tela conhecida)
+
+**Problema relatado.** O eixo vertical "não alcançava" a parte de baixo
+da tela, como se a câmera esperasse a cabeça sempre voltada para ela. O
+ganho do modelo à inclinação da cabeça explica isso: girando a matriz de
+rotação de uma amostra típica com as medidas do olho fixas (a cabeça
+inclina e o olho acompanha, como ao abaixar a cabeça para olhar para
+baixo), o cursor andava só 12, 27 e 23 px por grau de pitch nas três
+sessões gravadas. A geometria pede ~38 px/grau (distância × π/180 ×
+px/cm). A etapa da cabeça é curta (na sessão de 12/11, 10–19 amostras por
+direção) e várias medidas do olho não respondem à cabeça, então o
+coeficiente aprendido saía 1/3 a 2/3 do físico. Remover a penalidade do
+ridge nesse coeficiente não mudou nada: o encolhimento vinha dos dados.
+
+**Solução.** Se a cabeça gira θ com o olho parado dentro dela, o olhar
+gira θ e o cursor tem de andar a·ΔP_cabeça, com a = px/cm da tela. Com a
+largura física da tela, a é conhecido. No Windows ela é lida do monitor
+(`GetDeviceCaps(HORZSIZE)`, valor do EDID; 34,4 cm no notebook dos testes,
+aceito só se a proporção bater com a da resolução); nos outros sistemas,
+`--screen-width-cm`. A coerência da pálpebra (5.2.1), calculada supondo
+essa largura e a distância do MediaPipe, deu razão ≈ 1, o que indica que
+essa escala está certa. O termo da cabeça vira então um deslocamento
+fixo, −a·P_x e +a·P_y, e só o olho é ajustado.
+
+**Só no eixo y.** No horizontal, o ganho fixo piorava o erro em pontos
+novos (sessão de 12/11: 82 → 140 px de erro em x), porque a regressão livre
+usa mais medidas do olho, inclusive a íris refinada, que nessa sessão teve
+o dobro do sinal horizontal. O horizontal já funcionava bem no uso. Por
+isso x continua vindo do melhor modelo aprendido, e y vem de um segundo
+modelo (`y_model`) com a cabeça pela geometria. Na versão atual, esse modelo
+é o olhar geométrico calibrado (ver adiante). Na primeira versão, ele era
+escolhido pelo erro **só do eixo y** entre:
+
+- o **compacto**: y = c + a·P_y + E_z·sec²(pitch)·(b₁·lid_up + b₂·lid_up²),
+  só com a medida coerente com a cabeça (o termo quadrático cobre a
+  saturação da pálpebra ao olhar para baixo);
+- a **regressão livre** (todas as medidas do olho, grau 1 ou 2), com a
+  cabeça fixa.
+
+A validação cruzada é refeita para a combinação, e os erros da tela de
+resultado são os da combinação. Mesmo sem a etapa da cabeça, a
+compensação da cabeça continua valendo.
+
+**Escolha do modelo de y só pelos alvos da grade.** Na etapa da cabeça o
+alvo é sempre o **centro** da tela. Por isso o erro nessa etapa favorece
+modelos que encolhem a previsão para o centro: um modelo que sempre
+previsse o centro teria erro zero ali. Com o erro da cabeça pesando metade
+na escolha (da força do ridge e do tipo de modelo), o eixo y era
+comprimido. Na sessão de 12/11 09:07, a linha de baixo era prevista 185 px
+acima do alvo na própria calibração (inclinação prevista/real de 0,70). Os
+modelos de y passaram a ser escolhidos só pelo erro nos alvos da grade
+(`score_head=False`); a etapa da cabeça continua no ajuste e o erro nela
+continua sendo reportado.
+
+**Viés da direção da face (`face_bias`).** O eixo "para a frente" do
+modelo canônico do MediaPipe não coincide com a direção para onde a pessoa
+vira o rosto. Olhando para a tela (abaixo da câmera), a face aparecia
+inclinada ~13° para cima, quando a geometria pede ~20° para baixo: um viés
+de 29–35° nas cinco sessões gravadas, muito estável. Com o ganho da cabeça
+fixo, o viés distorce o termo E_z·tan(direção da face). Por exemplo, ao se
+aproximar da tela o cursor subia em vez de descer (tan(+13°) = +0,23
+contra tan(−20°) = −0,36). Supõe-se então que, na postura da grade, o rosto
+aponta em média para o centro dos alvos. O viés é a diferença entre a
+direção medida (mediana da grade) e a direção do rosto até esse ponto, e é
+subtraído (no espaço dos ângulos) antes de calcular P_cabeça. A postura da
+calibração vira a referência "de frente para a tela". O HUD e a vista 3D
+mostram a cabeça em relação a essa referência; antes mostravam o ângulo
+cru do MediaPipe (+13°), dando a impressão de que o sistema "achava" que a
+cabeça estava sempre para cima.
+
+**Trava na recentralização.** Desvios maiores que 25% da tela em qualquer
+eixo (`CalibrationConfig.recenter_max_frac`) não são aplicados, e a tela
+pede para recalibrar. Caso real: um R 23 s depois de calibrar, com o rosto
+medido 8 cm mais baixo, aplicou −964 px no eixo y, e a parte de baixo da
+tela ficou inalcançável.
+
+#### Olhar geométrico calibrado (vista 3D e HUD)
+
+O olhar geométrico de `gaze.py` (globo ocular + rotação da cabeça, sem
+calibração) foi comparado com a direção real do rosto até cada alvo da
+grade, nas nove sessões gravadas:
+
+| | Olhar real | Olhar geométrico cru |
+|---|---|---|
+| inclinação média | −15° a −21° (a tela fica abaixo da câmera) | +18° a +31° |
+| variação na tela toda | 100% | vertical: 18–29%; horizontal: 34–47% |
+
+O raio cru aponta ~40° para **cima** do real. Cerca de 30° vêm do viés da
+direção da face do MediaPipe (`face_bias`) e ~10° da íris, que em repouso
+fica acima da linha que une os cantos do olho. Além disso, o movimento do
+olho aparece comprimido em 2 a 5 vezes (íris regularizada pelo MediaPipe,
+ver 5.2).
+
+O modelo **geométrico** calibra esse raio, trabalhando com ângulos
+(φ = atan das tangentes):
+
+  φ = direção da face corrigida (face_bias) + ângulo do olho na cabeça
+  ângulo do olho: φ_olho,x = c_x + b·u;  φ_olho,y = c_y + b₁·lid_up + b₂·lid_up² + b₃·v
+  ponto na tela = E_xy + E_z · tan(φ)  (cm → px pela largura da tela)
+
+O ajuste é linear: para cada amostra, o ângulo do olho **necessário** é o
+ângulo do rosto até o alvo menos a direção corrigida da face, e as medidas
+do olho são regredidas nele (ridge, força escolhida pelo erro no eixo y nos
+alvos da grade). A cabeça e a distância entram pela geometria exata (sem o
+ganho linearizado a·P_cabeça); só o olho é ajustado, com 4 coeficientes
+por fonte da íris.
+
+Ele chegou a ser o modelo do eixo y (`y_model`). Nas nove sessões (média,
+erro só no eixo y, validação cruzada na grade), comparado com a escolha
+anterior entre o compacto e a regressão livre com a cabeça fixa:
+
+| | erro y em alvos novos (LOO) | erro y com a cabeça em poses novas |
+|---|---|---|
+| escolha entre compacto e livre | 94 px | 325 px |
+| **olhar geométrico calibrado** | **91 px** | **261 px** |
+
+Escolher por sessão entre todos os candidatos não ajudou (98 px / 332 px):
+com 16 alvos, a escolha é ruidosa.
+
+A íris vertical v não responde à inclinação da cabeça (razão ~0, ver
+5.2.1), mas traz sinal na grade: sem ela, o erro y subia para 113 px (alvos
+novos) e 289 px (cabeça). Por isso ela só entra com a etapa da cabeça,
+cujas amostras (olhar fixo, cabeça inclinando) ensinam ao ajuste quanto
+confiar nela. Sem a etapa, o modelo usaria v como na grade, e inclinar a
+cabeça deslocaria o cursor (no usuário sintético, 206 px a 10° de
+inclinação); aí entram só lid_up e lid_up². O usuário sintético dos testes
+foi ajustado para reproduzir essa razão ~0 medida (`pitch_coupling` = 0,2).
+O valor anterior, 0,4, imitava o estimador antigo, em que v respondia ao
+contrário. Na vista 3D e no HUD, o "olhar calibrado" (magenta) é hoje o raio dos olhos
+até o ponto estimado pelo **modelo do cursor** (antes do estabilizador).
+Mostrar o raio de um modelo geométrico separado fazia o raio e o cursor
+discordarem, o que confundia mais do que ajudava.
+
+#### Validação real: modelo do eixo y atual
+
+Com as sessões de 12/11 vieram três **validações** (9 alvos de outro
+momento da sessão, que não entram na calibração). Elas são o teste mais
+próximo do uso, porque a postura muda entre calibrar e usar. Erro médio e
+escala do eixo y (inclinação estimado/real; 1 = sem compressão), média dos
+três pares calibração → validação:
+
+| Modelo do eixo y | Erro (px) | Escala y |
+|---|---|---|
+| ganho da cabeça aprendido (sem largura da tela) | 112 | 0,99 |
+| compacto (só pálpebra, cabeça pela geometria) | 173 | 0,70 |
+| olhar geométrico calibrado | 125 | 0,81 |
+| **regressão livre, cabeça pela geometria** | **115** | **1,01** |
+
+Os modelos que dependem só da pálpebra **comprimem** o eixo y na validação
+(0,61–0,81). Na sessão de 12/11 13:25, a cabeça estava ~5° mais para cima
+na validação do que na calibração. Para ver a tela, o olho fica mais
+voltado para baixo, e a pálpebra entra na faixa em que satura: ela variou
+13% menos entre os alvos, e a íris vertical, 15% menos. A pose medida pelo
+MediaPipe também se mistura com o olhar (0,5–1,4° de "inclinação" por
+1000 px de olhar para baixo, sem mexer a cabeça). A validação cruzada na
+grade não mostrava isso, porque ali a postura é a mesma da calibração. Por
+isso o modelo do eixo y passou a ser a regressão livre (todas as medidas do
+olho) com o ganho da cabeça pela geometria (`Y_MODEL_KINDS`). Ela mantém
+a escala e tem o ganho físico da cabeça.
+
+#### Escolha do modelo do eixo x e número de pontos
+
+**Viés de escolha no eixo x.** O erro na etapa da cabeça, em que o alvo é
+sempre o **centro**, também entrava na escolha do modelo principal (que dá
+o eixo x) e da força do ridge. Em 5 das 15 calibrações gravadas, isso
+escolhia um modelo "encolhido" (o físico, ou ridge forte): escala
+horizontal de 0,44 a 0,89, ou seja, o cursor não alcançava as laterais. Na
+pior (12/11 09:45, ridge 1,0), o erro horizontal **nos próprios alvos da
+calibração** era de 304 px. Com a escolha só pelos alvos da grade
+(`X_SCORE_HEAD = False`), médias das 15 calibrações:
+
+| | erro x nos alvos (ajuste) | erro em alvos novos (LOO) | menor escala x | validação (3 pares) |
+|---|---|---|---|---|
+| escolha com o erro da cabeça | 75 px | 130 px | 0,44 | 115 px |
+| **escolha só pela grade** | **39 px** | **102 px** | **0,90** | **111 px** |
+
+O custo é a compensação da cabeça no eixo x medida na etapa da cabeça:
+o erro x com a cabeça em poses novas subiu de 150 para 184 px. Essa métrica
+favorece exatamente os modelos encolhidos, mas parte da piora é real.
+
+**Mais pontos de calibração?** Curva de aprendizado: o modelo foi ajustado
+com subconjuntos sorteados de k alvos da grade 4×4 (6 sorteios por k, 13
+calibrações) e medido nos alvos que ficaram de fora e na validação (3
+pares):
+
+| alvos usados | erro nos alvos de fora | erro na validação |
+|---|---|---|
+| 6 | 206 px | 176 px |
+| 8 | 173 px | 141 px |
+| 10 | 148 px | 133 px |
+| 12 | 145 px | 125 px |
+| 14 | 135 px | 115 px |
+| 15–16 | 134 px | 118–121 px |
+
+O erro cai até ~14 pontos e depois praticamente para. Ir de 16 para 25
+pontos (grade 5×5) deve render pouco (≤ ~10 px, extrapolando a curva) e
+alongaria a calibração em ~60%. O limite está nas medidas do olho e na
+mudança de postura, não na quantidade de pontos. A grade continua 4×4 e
+pode ser mudada em `CalibrationConfig.grid_cols/grid_rows`.
+
 ### 5.4 Coleta
 
-**Etapa 1, grade 4×4:** margem de 8%, percorrida em **ordem aleatória**.
+**Etapa 1, grade 4×4:** margem de 5% (era 8%), percorrida em **ordem
+aleatória**. Com 8%, a última linha ficava a 92% da altura, e abaixo dela,
+na barra de tarefas, o modelo extrapolava medidas do olho que saturam ao
+olhar para baixo. Alvos mais perto da borda dão ao ajuste exemplos dessa
+região. Alvos colados na borda não ajudariam: ali a pálpebra cobre a íris e
+o MediaPipe é menos preciso, e essas amostras ruidosas puxariam o ajuste.
 Na ordem linha a linha, o tempo andava junto com a posição vertical: nos
 dados reais, a abertura do olho caiu de 0,27 para 0,16 ao longo dos ~35 s
 da grade (cansaço, olho ressecando), e o modelo aprendia essa deriva como
@@ -306,6 +665,36 @@ giravam até 30° (yaw) e 40° (pitch). Nesses ângulos os landmarks do olho
 deixam de ser confiáveis e o erro do modelo na própria etapa chegava a
 ~210 px (mediana).
 
+**Calibração manual (tecla C).** Cada alvo só avança quando o usuário,
+olhando para ele, aperta ESPAÇO ou ENTER. As amostras usadas são as de 1 s
+**antes** da tecla, sem os últimos 0,15 s (tempo de reação): ao apertar a
+tecla é comum piscar ou olhar para o teclado, então as amostras de depois
+não servem. A confirmação é recusada (com aviso) se o olhar ainda se movia
+nessa janela (80% das amostras a mais de 1,6° da mediana) ou se faltam
+amostras, e ignorada nos primeiros 0,5 s do alvo. As etapas da cabeça e da
+boca continuam automáticas. Ela não substitui a automática: o público do
+projeto (pessoas com deficiência motora) muitas vezes não consegue
+apertar uma tecla a cada alvo. Ela serve para quem pode apertar, ou com um
+ajudante, e garante que cada alvo é coletado com a atenção da pessoa.
+
+**Etapa 3, boca:** depois da etapa da cabeça, o ponto fica no centro e a
+pessoa abre e fecha a boca devagar (≥ 4 s; segue em 7 s se a boca não
+abrir). O MediaPipe estima a malha inteira de uma vez, e abrir a boca
+contamina a pose da cabeça e os pontos do olho. Na sessão de 12/11 09:47,
+nos quadros de boca aberta durante a coleta de alvos (olhar fixo e
+conhecido), o ponto estimado descia ~50 px. A pose medida "inclinava"
+−0,85° e a íris descia em relação aos cantos do olho. Uma pose só com
+pontos rígidos (cantos dos olhos, ponte do nariz, testa, têmporas) foi
+testada e não resolveu: esses pontos também se moviam. Na etapa da boca o
+olhar está fixo, então todo deslocamento da previsão que acompanha a
+abertura é artefato. Ajusta-se esse deslocamento por unidade de abertura
+acima da abertura típica da grade (mínimos quadrados pela origem, com
+rejeição de outliers e descontando o desvio com a boca fechada), e a
+previsão passa a descontá-lo (`fit_mouth_correction`). Sem a etapa, ou se
+a boca quase não abriu (variação < 0,04), a correção é zero. No usuário
+sintético com o artefato, o cursor andava 451 px ao abrir a boca sem a
+etapa, e 0 px com ela.
+
 **Repetição de alvos ruins:** depois do ajuste, alvos com erro na validação
 cruzada acima de 2,5× a mediana e acima de 8% da largura da tela (até 3
 alvos) são coletados de novo, uma vez, e o modelo é reajustado. Isso cobre
@@ -319,9 +708,10 @@ para comparar alternativas com os mesmos dados, sem refazer as sessões.
 
 ### 5.5 Escolha do modelo e erro em pontos e poses novos
 
-A força do ridge (α ∈ {10⁻⁴, …, 1}), o grau dos termos do olho (1 ou 2) e a
-fonte da posição da íris (MediaPipe ou refinada na imagem) são escolhidos por
-validação cruzada com dois tipos de dobra:
+A força do ridge (α ∈ {10⁻⁴, …, 1}), o tipo de modelo (livre ou físico), o
+grau dos termos do olho (1 ou 2, no livre) e a fonte da posição da íris
+(MediaPipe ou refinada na imagem) são escolhidos por validação cruzada com
+dois tipos de dobra:
 
 - **alvos**: cada alvo da grade fica fora do ajuste por vez, e o erro é a
   distância da mediana das previsões a ele (pontos novos, cabeça parada);
@@ -374,6 +764,71 @@ cabeça foram gravadas sem guia, com giros extremos. Uma das duas validações
 favoreceu o grau 1 e a outra o grau 2, por isso a escolha é feita por
 sessão pela validação cruzada. Sessões novas, com o protocolo guiado, devem
 ser comparadas no benchmark para confirmar essas escolhas.
+
+#### Sessões de 11/11 (protocolo guiado) e efeito de lid_up
+
+Duas sessões gravadas com a etapa da cabeça guiada, recalculadas a partir
+dos landmarks com cada versão do estimador (`tools/benchmark.py`, erro
+médio em px):
+
+| Versão | Alvos novos (LOO) | Poses novas da cabeça |
+|---|---|---|
+| lid_v, só regressão livre (anterior) | 159 (166 / 153) | 412 (294 / 531) |
+| lid_up, livre ou físico pela validação cruzada | 116 (92 / 140) | 321 (252 / 390) |
+
+Na sessão 1 a validação cruzada escolheu a regressão livre; na sessão 2, o
+modelo físico. Pela validação cruzada interna da sessão 2, o erro com a
+cabeça em poses novas foi de 405 px (livre) para 290 px (físico). Também
+foram testadas, sem ganho: a íris refinada como medida horizontal única, a
+íris relativa ao centro do contorno do olho, a abertura com o z do
+MediaPipe e termos quadráticos no modelo físico.
+
+#### Sessões de 11/11 e 12/11: ganho da cabeça pela geometria
+
+Três sessões, tela de 34,4 cm. Erro médio por eixo em px (LOO: alvos
+novos; cabeça: direções da etapa da cabeça deixadas de fora) e ganho do
+cursor por grau de inclinação da cabeça com o olho acompanhando:
+
+| Sessão | Modelo | \|x\| LOO | \|y\| LOO | \|x\| cabeça | \|y\| cabeça | Ganho pitch (px/°) |
+|---|---|---|---|---|---|---|
+| 11/11 08:53 | aprendido | 57 | 65 | 102 | 203 | 12 |
+| | **y pela geometria** | 57 | 72 | 102 | **102** | **35** |
+| 11/11 08:57 | aprendido | 87 | 89 | 258 | 200 | 27 |
+| | **y pela geometria** | 87 | 97 | 258 | **148** | **40** |
+| 12/11 08:09 | aprendido | 82 | 106 | 186 | 371 | 23 |
+| | **y pela geometria** | 82 | 128 | 186 | **349** | **37** |
+
+O horizontal não muda. No vertical, o erro com a cabeça em movimento cai e
+o ganho passa ao valor físico. Nessa primeira versão, o modelo de y ainda
+era escolhido pela média do erro na grade e na etapa da cabeça, o que o
+comprimia (ver "Escolha do modelo de y só pelos alvos da grade").
+
+Versão final (escolha de y só pela grade e viés da face), com as cinco
+sessões. Alcance vertical em pontos novos com a cabeça parada (LOO):
+inclinação prevista/real no eixo y e erro médio na linha de baixo de
+alvos:
+
+| Sessão | Ganho aprendido: inclinação / linha de baixo | Versão final: inclinação / linha de baixo |
+|---|---|---|
+| 11/11 08:53 | 1,00 / −9 px | 0,99 / −12 px |
+| 11/11 08:57 | 0,80 / −91 px | 0,94 / −46 px |
+| 12/11 08:09 | 0,82 / −113 px | 0,83 / −156 px |
+| 12/11 09:06 | 0,96 / −63 px | 0,90 / −74 px |
+| 12/11 09:07 | 0,68 / −205 px | 0,88 / −96 px |
+| média | 0,85 / −96 px | 0,91 / −77 px |
+
+Ganho do cursor por grau de inclinação da cabeça: 10–27 px/° (aprendido)
+contra 38–44 px/° (geometria). Em `tools/benchmark.py` (médias das cinco
+sessões), a configuração padrão ficou com 117 px em alvos novos e 390 px
+em poses novas da cabeça, contra 137 e 364 px com o ganho aprendido.
+
+**Limite que continua.** Com a cabeça parada, as medidas verticais
+saturam ao olhar para baixo (na sessão de 12/11 a pálpebra superior andou
+0,030 entre a 2ª e a 3ª linha de alvos e 0,015 entre a 3ª e a 4ª), e a
+linha de alvos mais baixa fica a 92% da altura da tela (margem de 8%).
+Abaixo dela, por exemplo na barra de tarefas, o modelo extrapola uma medida
+saturada. Na prática, para olhar bem para baixo as pessoas também abaixam
+a cabeça, e aí o ganho geométrico cobre a diferença.
 
 Para referência: a ~35 cm de um monitor de 34,5 cm de largura (1920 px),
 1° de ângulo visual ≈ 34 px. 100 px ≈ 3°, próximo do que se obtém com
