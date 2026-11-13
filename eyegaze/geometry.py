@@ -5,9 +5,13 @@ Referencial da CÂMERA (usado em todo o pipeline), em centímetros:
 origem no centro óptico da webcam, x para a direita da imagem, y para
 baixo, z para longe da câmera (z > 0 = à frente dela).
 
-Câmera pinhole com campo de visão horizontal suposto (``ASSUMED_HFOV_DEG``):
-webcams comuns ficam entre 55° e 70°, e o erro dessa suposição é absorvido
-pela calibração.
+Câmera pinhole com campo de visão horizontal suposto (``ASSUMED_HFOV_DEG``,
+ajustável por ``set_camera_hfov`` / ``--camera-fov``). Ele define a escala de
+tudo: a distância do rosto sai da largura do rosto em pixels e desse campo
+de visão. Nas sessões gravadas (webcam de notebook), 90° deixou o rosto em
+escala real (olho de ~3 cm) e deu o menor erro com a cabeça em movimento;
+com 60°, a pessoa ficava a ~66 cm e o erro com a cabeça em movimento subia
+de ~325 para ~410 px (docs/metodologia.md, seção 3).
 
 Monitor (real e virtual): plano z = 0, com a webcam centralizada logo acima
 da borda superior (notebook ou webcam presa no monitor). Como a imagem NÃO
@@ -26,7 +30,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
-ASSUMED_HFOV_DEG = 60.0
+ASSUMED_HFOV_DEG = 90.0
+
+
+def set_camera_hfov(deg: float):
+    """Muda o campo de visão horizontal suposto da câmera (graus)."""
+    global ASSUMED_HFOV_DEG
+    ASSUMED_HFOV_DEG = float(deg)
 # Distância da webcam à borda superior da tela (cm).
 SCREEN_GAP_CM = 1.0
 

@@ -75,5 +75,14 @@ HEAD_Y_TOP: tuple[int, ...] = (151, 9, 8)
 HEAD_Y_BOTTOM: tuple[int, ...] = (2, 164)
 # Ponto usado como origem para desenhar os eixos da cabeça.
 NOSE_BRIDGE = 168
+# Ponte do nariz (entre os olhos): pontos rígidos que NÃO se movem com as
+# pálpebras, na altura e quase na profundidade dos olhos. Âncora vertical do
+# globo ocular (eyeball.EyeballModel, âncora "misto"). Os cantos do olho
+# fazem parte do contorno das pálpebras e sobem/descem com o olhar, o que
+# "come" o sinal vertical da pupila. O projeto de referência (Webcam3DTracker)
+# ancora o globo na região do nariz inteira (inclui a ponta, ~4 cm abaixo e à
+# frente dos olhos); nas sessões gravadas, esse braço de alavanca amplificava
+# os erros da pose da cabeça (ver docs/metodologia.md, seção 5.6).
+RIGID_NOSE: tuple[int, ...] = (168, 6, 197, 8, 9)
 
 NUM_LANDMARKS = 478

@@ -140,8 +140,9 @@ def main(argv=None) -> int:
     model, _, stats = fit_from_samples(data, screen, width_cm, args.mad)
     print("\nGlobo ajustado (cm, referencial da cabeça):")
     for eye, g in stats["globo"].items():
-        print(f"  olho {eye:8s}: pupila em repouso {np.round(g['repouso_pupila_cm'], 3)}, "
-              f"raio efetivo (x, y) {np.round(g['raio_efetivo_cm'], 3)}")
+        print(f"  olho {eye:8s}: raio {g['raio_cm']:.2f} cm, pupila em repouso "
+              f"{np.round(g['repouso_pupila_cm'], 3)}, ganho da pupila (x, y) "
+              f"{np.round(g['ganho_pupila'], 2)}")
     if "interseccao_dist_tela_cm" in stats:
         print(f"Intersecção dos feixes na grade: z mediano {stats['interseccao_dist_tela_cm']:+.1f} cm "
               f"(convergem em {100 * stats['feixes_convergem_frac']:.0f}% das amostras)")

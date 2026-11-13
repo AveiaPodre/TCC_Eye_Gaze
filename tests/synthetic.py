@@ -25,6 +25,7 @@ BASE = {
     127: (-7.0, 0.5, 4.0), 356: (7.0, 0.5, 4.0),
     151: (0.0, -6.0, 1.5), 9: (0.0, -3.5, 0.5), 8: (0.0, -2.5, 0.3),
     2: (0.0, 5.0, -1.5), 164: (0.0, 6.0, -0.8), 168: (0.0, -1.0, 0.0),
+    6: (0.0, 0.5, -0.4), 197: (0.0, 1.5, -0.8),   # ponte do nariz
     13: (0.0, 7.0, -1.2), 14: (0.0, 7.05, -1.2),   # lábios internos (boca fechada)
 }
 
@@ -134,7 +135,10 @@ def make_points(gaze_yaw=0.0, gaze_pitch=0.0, head=(0.0, 0.0, 0.0),
 
 
 IMG_W, IMG_H = 1280, 720
-FOCAL = 0.5 * IMG_W / math.tan(math.radians(30))   # câmera com FOV horizontal de 60°
+# Câmera sintética com 60° de campo horizontal. Os testes ajustam o pipeline
+# para a mesma câmera (conftest.py); o padrão do app é 90° (notebook).
+SYNTH_HFOV_DEG = 60.0
+FOCAL = 0.5 * IMG_W / math.tan(math.radians(SYNTH_HFOV_DEG / 2))
 
 
 def make_transform(head=(0.0, 0.0, 0.0), head_pos_cm=(0.0, 0.0, 50.0)) -> np.ndarray:

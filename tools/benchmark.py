@@ -48,6 +48,9 @@ VARIANTS: list[tuple[str, dict]] = [
     ("só monitor virtual", dict(corrections=())),
     ("correção só deslocamento", dict(corrections=("deslocamento",))),
     ("pupila só MediaPipe", dict(pupil_sources=("mediapipe",))),
+    ("pupila só refinada", dict(pupil_sources=("refinada",))),
+    ("âncora nos cantos do olho", dict(anchors=("cantos",))),
+    ("âncora na ponte do nariz", dict(anchors=("nariz",))),
     ("sem etapa da cabeça", dict(_no_head=True)),
 ]
 WIDTH_CM: float | None = None

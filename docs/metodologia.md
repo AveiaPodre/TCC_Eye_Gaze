@@ -99,54 +99,114 @@ Esta seção cobre as etapas 2, 3 e 4 do pipeline. Tudo é calculado em
 centímetros no **referencial da câmera**: origem no centro óptico da
 webcam, x para a direita da imagem, y para baixo e z para longe da câmera.
 Os landmarks viram cm por uma câmera pinhole com campo de visão horizontal
-suposto de 60° (webcams comuns ficam entre 55° e 70°) e com o rosto à
-distância dada pela translação da matriz de pose do MediaPipe. Sem a
-matriz, a distância é estimada pela distância entre os cantos externos dos
-olhos (~9 cm em adultos). Erros nessas suposições são absorvidos pela
-calibração.
+suposto (padrão 90°, `--camera-fov`). A distância do rosto sai da mesma
+câmera: z = f · 9 cm / distância 3D entre os cantos externos dos olhos em
+pixels (9 cm é a média adulta; o z do MediaPipe está na escala de x, então
+essa distância quase não muda com a rotação da cabeça).
+
+**Escala métrica.** Até a versão anterior, a distância vinha da translação
+da matriz de pose do MediaPipe e o campo de visão suposto era 60°. Os dois
+não são coerentes: o MediaPipe supõe uma câmera com ~63° de campo
+*vertical* (~95° na horizontal, em 16:9). Nas sessões gravadas, a matriz
+dava o rosto a ~37 cm, e com 60° o rosto inteiro em cm ficava a 56% do
+tamanho real (olho com 1,6 cm de largura, olhos a 3,6 cm um do outro). Era
+por isso que o globo ocular desenhado parecia grande demais. Agora a escala
+sai da própria câmera suposta e é coerente (olho com ~3 cm). O campo de
+visão foi escolhido pelos dados (26 sessões; erro em pontos novos / com a
+cabeça em poses novas / na validação, sem o desvio constante entre
+parênteses):
+
+| Distância | campo de visão | LOO | cabeça | validação | rosto a | olho |
+|---|---|---|---|---|---|---|
+| matriz do MediaPipe | 60° (incoerente) | 132 | 319 | 142 (86) | 37 cm | 1,6 cm |
+| pinhole | 60° | 139 | 413 | 226 (97) | 66 cm | 2,9 cm |
+| pinhole | 75° | 135 | 341 | 210 (91) | 50 cm | 3,0 cm |
+| **pinhole** | **90°** | **133** | **326** | **190 (89)** | **38 cm** | **3,0 cm** |
+| pinhole | 105° | 133 | 327 | 215 (86) | 29 cm | 3,0 cm |
+
+Com 60°, a pessoa ficava a 66 cm e a compensação da cabeça (a cabeça girar
+θ desloca o olhar ~distância · tan θ) ficava grande demais. De 90° para
+cima, os erros robustos (LOO e cabeça) se estabilizam, e 90° é típico de
+webcam de notebook. A combinação incoerente (matriz do MediaPipe com 60°)
+teve validação melhor (142 px), mas só há 4 validações, todas dominadas
+pelo desvio constante entre calibrar e validar; sem ele, as variantes
+ficam entre 86 e 97 px. Ela continua disponível
+(`GazeConfig.depth_source = "mediapipe"` com `CameraConfig.hfov_deg = 60`).
+O campo de visão fica gravado na calibração: mudá-lo exige recalibrar.
 
 ### 3.1 Etapa 2: âncora, pupila e centro do globo
 
 Para cada olho, a cada quadro:
 
-- **Âncora A**: ponto médio dos cantos interno e externo. Os cantos são
-  presos ao crânio e quase não se movem com o olhar.
+- **Âncora A**: ponto de partida, preso ao crânio, do deslocamento até o
+  centro do globo. Na horizontal e na profundidade, é o ponto médio dos
+  cantos interno e externo. Na **vertical**, é a **ponte do nariz** (pontos
+  168, 6, 197, 8 e 9, entre os olhos) mais um deslocamento fixo de cada olho
+  no referencial da cabeça, medido na calibração (mediana das amostras). O
+  motivo: os cantos do olho fazem parte do contorno das pálpebras e sobem
+  ou descem um pouco quando o olhar muda na vertical. Ancorada neles, a
+  âncora acompanhava a pupila e "comia" o sinal vertical. A ideia vem do
+  projeto de referência (seção 5.9). Cada landmark é convertido para cm
+  antes de tirar a média: a perspectiva não comuta com a média em pixels,
+  e fazer a média em pixels fazia o deslocamento ponte → olho variar
+  ~0,01 cm com a inclinação da cabeça (~1° no feixe).
 - **Pupila P**: centro da íris na imagem (média do anel de 4 pontos e do
   ponto central do MediaPipe, ou o centro refinado na imagem, seção 5.3).
   O z da íris do MediaPipe é a coordenada mais ruidosa e, ao girar a
   cabeça, contaminava as outras. Por isso a pupila 3D é a interseção da
   linha de visada da câmera pelo pixel da íris com o **plano do olho**
   (plano que passa pela âncora, perpendicular ao eixo z da cabeça).
-- **Centro do globo C**: não aparece na imagem. Fica num deslocamento fixo
-  no referencial da cabeça a partir da âncora:
+- **Centro do globo C**: não aparece na imagem. É uma esfera com o tamanho
+  de um olho real, raio r = 0,4 × largura do olho (cantos; ~12 mm / ~30 mm,
+  como na versão original e no projeto de referência), com o centro r atrás
+  da pupila, num deslocamento fixo no referencial da cabeça:
 
-  C = A + R · (c_x, c_y, s̄)
+  C = A + R · (c_x, c_y, r)
 
   onde (c_x, c_y) é a posição da pupila no plano do olho quando o olho
-  aponta para a frente da cabeça, e s̄ é o raio do globo. Antes de calibrar
-  usam-se os valores anatômicos típicos (c = 0, raio 1,2 cm). A calibração
-  ajusta esses parâmetros por pessoa e por olho (seção 5.2).
+  aponta para a frente da cabeça. Antes de calibrar, r vem da largura do
+  olho de cada quadro, c = 0 e a âncora é a dos cantos. A calibração fixa r
+  (mediana da largura) e ajusta c por pessoa e por olho (seção 5.2).
+
+**Filtro da pupila.** A posição da pupila em relação à âncora, no
+referencial da cabeça, p = Rᵀ(P − A), passa por um filtro One-Euro (Casiez
+et al., 2012; corte mínimo 0,7 Hz, β = 10 cm⁻¹) antes de virar ângulo. O
+raio efetivo é pequeno (~0,3 cm, seção 5.6), então 0,01 cm de ruído da
+pupila vira ~2° no feixe: é daí que vinha a instabilidade dos feixes e da
+intersecção. Filtrar aqui suaviza só o movimento do olho; a rotação e a
+translação da cabeça entram depois (R e A) sem atraso. O filtro reinicia
+quando o olho fecha ou há um intervalo de mais de 0,3 s sem quadro. Nas
+sessões gravadas, o tremor quadro a quadro do ponto previsto caiu de 16
+para 7,7 px, com atraso de 3 quadros (~100 ms) numa sacada e sem mudar o
+erro. A média móvel de 10 quadros do projeto de referência tremia menos
+(6,3 px), mas atrasava 9 quadros (~300 ms) e piorava o erro com a cabeça
+em movimento (338 → 396 px).
 
 ### 3.2 Etapa 3: feixe de cada olho e intersecção
 
-O **feixe** de cada olho é a reta que sai do centro do globo e passa pela
-pupila. No referencial da cabeça, com p = Rᵀ(P − A):
+O **feixe** de cada olho sai do centro do globo na direção da pupila. No
+referencial da cabeça, com p = Rᵀ(P − A):
 
-  direção_cabeça ∝ ( (p_x − c_x)/s_x , (p_y − c_y)/s_y , −1 )
+  direção_cabeça ∝ ( g_x·(p_x − c_x)/r , g_y·(p_y − c_y)/r , −1 )
   direção_câmera = R · direção_cabeça
 
-O raio tem um valor por eixo (s_x, s_y). O MediaPipe "encolhe" o movimento
-da íris, mais na vertical que na horizontal (seção 5.6). Com raio único, o
-feixe não acertaria os alvos nos dois eixos ao mesmo tempo. O raio efetivo
-de cada eixo corrige essa compressão na própria medida da pupila, antes de
-somar a rotação da cabeça. Assim, girar a cabeça continua girando o olhar
-1:1.
+g = (g_x, g_y) é o **ganho da pupila**, ajustado na calibração. O MediaPipe
+"encolhe" o movimento da íris (seção 5.6): a íris medida anda menos que a
+pupila de verdade, e mais ainda na vertical. O ganho corrige essa
+compressão na própria medida da pupila, antes de somar a rotação da
+cabeça, então girar a cabeça continua girando o olhar 1:1. Com g = 1 (olho
+medido sem compressão), o feixe passa exatamente pela pupila medida. Com
+g > 1, ele passa pela **pupila corrigida**, o ponto da superfície do globo
+onde a pupila de verdade estaria. O projeto de referência faz o mesmo no
+mapeamento ângulo → tela, com ±15° na horizontal e só ±5° na vertical
+(3× mais ganho na vertical).
 
-Num globo esférico ideal a pupila andaria s·sen(ângulo), e não s·tan. As
-duas formas estão implementadas (`eyeball.EYE_MODEL`). A forma tangente é a
-padrão porque errou menos nas 25 sessões gravadas (seção 5.6): com o raio
-efetivo de ~0,3 cm que os dados reais exigem, o ruído da pupila satura o
-seno.
+Na versão anterior, a compressão era um "globo menor" (raio efetivo
+~0,3 cm). A direção do feixe é a mesma (r/g faz o papel daquele raio), mas
+o centro ficava a ~3 mm da pupila, e não a ~12 mm como num olho real. Agora
+o globo tem o tamanho real e a compressão é tratada como o que ela é, um
+erro de medida da íris. A forma esférica (pupila = c + s·sen em vez de
+tan) foi testada antes e errou mais nos dados reais.
 
 A **intersecção** dos dois feixes é o ponto fixado. Duas retas no espaço
 quase nunca se cruzam exatamente, então a intersecção é o ponto médio do
@@ -189,7 +249,10 @@ O estimador entrega, por quadro, um vetor com tudo o que as etapas 2–5
 precisam, e é isso que é gravado nas sessões:
 
   raw = [R (9) | E (3) | A_d, P_d, A_e, P_e (12) | P_d e P_e refinadas (6) |
-         olho direito aberto, olho esquerdo aberto | abertura da boca]
+         olho direito aberto, olho esquerdo aberto | abertura da boca |
+         ponte do nariz (3)]
+
+(A = meio dos cantos; as pupilas já filtradas.)
 
 (d = olho direito, e = esquerdo; tudo em cm no referencial da câmera.) O
 globo, os feixes, a intersecção e o pixel virtual são recalculados a partir
@@ -392,15 +455,24 @@ Olhando para T, a direção do centro do globo até o alvo é conhecida. No
 referencial da cabeça, τ = Rᵀ(T − C), e a pupila medida deve satisfazer,
 em cada eixo j ∈ {x, y}:
 
-  p_j = c_j + s_j · tan_j(T),   tan_j = τ_j / (−τ_z)
+  p_j = c_j + (r / g_j) · tan_j(T),   tan_j = τ_j / (−τ_z)
 
 Para cada olho e cada eixo, é uma regressão linear com duas incógnitas:
-**(c_j, s_j)**. Ela é resolvida por mínimos quadrados ponderados (cada alvo
-pesa 1, e a etapa da cabeça inteira pesa 1 alvo), com uma regularização
-fraca de s_j em direção ao raio anatômico (λ = 0,002 em unidades de tan²,
-~5% de puxão) e limites de 0,05 a 5 cm. Como o centro depende de (c, s) e
-a direção até o alvo depende do centro, o ajuste é repetido duas vezes (a
-mudança é de milímetros a ~60 cm).
+**c_j** e **r/g_j** (r é fixo, 0,4 × mediana da largura do olho). Ela é
+resolvida por mínimos quadrados ponderados **robustos** (Huber, k = 1,345,
+por repesagem iterativa em 4 passos): quadros em que a pessoa piscou,
+olhou para fora do alvo ou o landmark falhou pesam menos, em vez de puxar o
+globo. Cada alvo pesa 1, a etapa da cabeça inteira pesa 1 alvo, e uma
+regularização fraca (λ = 0,002 em unidades de tan²) puxa o ganho para 1,
+com limites de 0,2 a 25. Como o centro depende de c e a direção até o alvo
+depende do centro, o ajuste é repetido duas vezes (a mudança é de
+milímetros a dezenas de cm).
+
+Do projeto de referência, foi considerado e descartado o "travamento" do
+globo num único quadro, olhando o centro da tela (centro = íris + raio na
+direção da câmera). Ele herda todo o ruído daquele quadro, e o ajuste em 16
+alvos mais a etapa da cabeça estima o mesmo centro com centenas de
+amostras.
 
 A **etapa da cabeça** (olhar fixo, cabeça girando) entra no mesmo ajuste.
 É ela que separa o movimento do olho do movimento da cabeça: com o olhar
@@ -422,10 +494,12 @@ O ajuste é ridge nos termos não constantes (α ∈ {10⁻³, 10⁻², 10⁻¹}
 encolhe a correção em direção à identidade. A quadrática só é candidata com
 9 alvos ou mais.
 
-A fonte da pupila também é escolhida: o centro da íris do MediaPipe ou o
-centro refinado na imagem (`iris_refine.py`: centróide dos pixels escuros
-dentro do contorno das pálpebras, com resolução sub-pixel e sem a
-regularização do modelo).
+**Fonte da pupila.** Há duas medidas do centro da íris: a do MediaPipe e
+a refinada na imagem (`iris_refine.py`: centróide dos pixels escuros dentro
+do contorno das pálpebras, com resolução sub-pixel e sem a regularização do
+modelo). A calibração usa a **média das duas**: os erros delas são em parte
+independentes, e a média errou menos que cada uma sozinha (seção 5.10). Sem
+o refinamento (desligado ou indisponível), usa-se a do MediaPipe.
 
 ### 5.4 Coleta
 
@@ -515,54 +589,77 @@ largura da tela, razoável até 8%, ruim acima disso).
 
 ### 5.6 Resultados nas sessões gravadas
 
-`tools/benchmark.py`, 25 calibrações gravadas em 11 e 12/11/2026 (4 delas
+`tools/benchmark.py`, 33 calibrações gravadas de 11 a 13/11/2026 (4 delas
 com validação logo depois), tela de 1920×1080 com 34,4 cm (detectada pelo
-EDID), medidas recalculadas a partir dos landmarks gravados. Erros médios
-em px (média das sessões):
+EDID), medidas recalculadas a partir dos landmarks gravados, câmera suposta
+com 90° (seção 3). Erros médios em px (média das sessões):
 
 | Variante | pontos novos (LOO) | cabeça em poses novas | validação (sem o desvio constante) |
 |---|---|---|---|
-| **pipeline (padrão)** | **145** | **347** | **161 (95)** |
-| só o monitor virtual (sem a etapa 5b) | 182 | 335 | 158 (111) |
-| correção só por deslocamento | 182 | 334 | 158 (111) |
-| pupila só do MediaPipe | 159 | 327 | 175 (84) |
-| sem a etapa da cabeça | 140 | 371 | 170 (105) |
-| forma esférica do globo (sen em vez de tan) | 151 | 363 | 163 (99) |
-| modelo anterior (regressão, seção 5.7) | 118 | 374 | 113 (~100) |
+| **pipeline (padrão: escala pela câmera, globo anatômico + ganho, âncora mista, pupila filtrada e média das duas medidas)** | **123** | **292** | **211 (77)** |
+| pupila só do MediaPipe | 148 | 299 | 245 (99) |
+| pupila só refinada na imagem | 139 | 328 | 213 (91) |
+| âncora nos cantos do olho | 137 | 330 | 162 (87) |
+| âncora na ponte do nariz (x e y) | 118 | 303 | 242 (78) |
+| só o monitor virtual (sem a correção 5.3) | 152 | 329 | 211 (74) |
+| correção só por deslocamento | 152 | 326 | 212 (74) |
+| sem a etapa da cabeça | 121 | 304 | 212 (78) |
+| versão de 12/11 (pupila escolhida entre as duas; 28 sessões) | 133 | 332 | 190 (88) |
+| versão anterior (escala do MediaPipe, "globo menor"; 26 sessões) | 134 | 330 | 146 (87) |
+| modelo de regressão (seção 5.7; 25 sessões) | 118 | 374 | 113 (~100) |
+
+Em relação à versão anterior, o erro em pontos novos e com a cabeça em
+poses novas é o mesmo, e a validação sem o desvio constante também; a
+validação bruta piorou (146 → 190 px) nas 4 sessões com validação, por
+causa do desvio constante (ver a escolha do campo de visão, seção 3). A
+mudança corrige a geometria (escala real do rosto, globo do tamanho de um
+olho) sem ganho de acurácia mensurável com os dados atuais.
+
+Experimentos à parte (25 sessões, mesma metodologia; seção 5.9):
+
+| Variante | LOO | cabeça | validação | raio efetivo vertical | erro y, cabeça para cima |
+|---|---|---|---|---|---|
+| âncora nos cantos | 143 | 349 | 164 (94) | 0,19 cm | 470 px |
+| **âncora mista (y pela ponte do nariz)** | **134** | **327** | **146 (87)** | **0,31 cm** | **216 px** |
+| âncora na região do nariz da referência (com a ponta) | 135 | 462 | 288 (102) | 0,29 cm | 441 px |
+| forma esférica do globo (sen em vez de tan) | 151 | 363 | 163 (99) | — | — |
+| pálpebra superior como vertical da pupila | 162 | 370 | — | — | 605 px |
 
 O que os números mostram, etapa por etapa:
 
-- **Etapa 2 (globo).** O raio efetivo ajustado fica em ~0,2–0,6 cm na
-  horizontal e ~0,1–0,3 cm na vertical, contra ~1,2 cm de um globo real: o
-  MediaPipe entrega ~25% do movimento horizontal da pupila e ~15% do
-  vertical. Por isso a pupila precisa de raio por eixo. O erro angular de
-  cada feixe nas próprias amostras de ajuste é de 3,4–6,7° (uma sessão,
-  20261112_155411, com 10,6°).
-- **Etapa 3 (intersecção).** Os feixes convergem à frente do rosto em
-  50–100% das amostras da grade, com a intersecção de 0 a 30 cm além do
-  plano da tela. Usar sempre a bissetriz em vez da intersecção dá o mesmo
-  erro (145/341 px): a intersecção não acrescenta ruído.
+- **Etapa 2 (globo).** O raio efetivo ajustado fica em ~0,3–0,4 cm na
+  horizontal e ~0,3 cm na vertical (0,19 cm com a âncora nos cantos),
+  contra ~1,2 cm de um globo real: o MediaPipe entrega ~25–30% do movimento
+  da pupila. Por isso a pupila precisa de raio por eixo. Com a âncora nos
+  cantos, a vertical parecia ainda mais comprimida (~15%), porque os cantos
+  acompanham as pálpebras; ancorar a vertical na ponte do nariz recuperou
+  ~60% de sinal vertical. O erro angular de cada feixe nas próprias
+  amostras de ajuste é de 3–7°.
+- **Etapa 3 (feixes e intersecção).** O filtro da pupila (seção 3.1) reduz
+  o tremor quadro a quadro do ponto de 16 para 7,7 px, sem mudar o erro.
+  Os feixes convergem à frente do rosto em ~85% das amostras da grade, e a
+  profundidade da intersecção varia ~4–5 cm (desvio-padrão) com o olhar
+  fixo num alvo: com os olhos a ~6 cm um do outro e a tela a ~60 cm, a
+  profundidade é a coordenada mais sensível ao ruído. A direção até a
+  intersecção é estável, e usar sempre a bissetriz dá o mesmo erro.
 - **Etapa 4 → 5.** Só com o monitor virtual, o erro em pontos novos é de
-  182 px; a correção (quase sempre quadrática) o reduz para 145 px. A
+  155 px; a correção (quase sempre quadrática) o reduz para 134 px. A
   correção não muda o erro com a cabeça em poses novas.
 - **Cabeça em poses novas.** Separando por direção (mediana do erro
-  absoluto em x e y): direita (195, 149), esquerda (131, 202), **cima (89,
-  474)**, baixo (141, 277). O pior caso é vertical, com a cabeça
-  inclinando. Com o olhar fixo e a cabeça inclinando para cima, a pupila do
-  MediaPipe quase não contra-rotaciona na vertical dentro do olho, e o
-  feixe sobe junto com a cabeça. É uma limitação da medida da pupila, não da
-  geometria: no usuário sintético cuja pupila contra-rotaciona, o erro com
-  a cabeça inclinada a 9° fica abaixo de 50 px. Usar a pálpebra superior
-  como coordenada vertical da pupila foi testado e piorou tudo (LOO 162,
-  cabeça 370, cabeça para cima 605 px). A recentralização (R), o aviso de
-  postura e o ajuste fino pela cabeça (tecla A) são as formas de conviver
-  com isso.
-- **Comparação com o modelo anterior.** O pipeline geométrico erra ~25% a
-  mais em pontos novos com a cabeça parada (145 contra 118 px) e um pouco
-  menos com a cabeça em poses novas (347 contra 374 px). Na validação, tem
-  um desvio constante maior entre calibrar e validar (161 contra 113 px),
-  mas, sem esse desvio, que a recentralização corrige, os dois ficam iguais
-  (95 contra ~100 px). As 4 validações são poucas para separar os dois.
+  absoluto em x e y, âncora mista): direita (234, 225), esquerda (137,
+  217), cima (96, 216), baixo (144, 353). Com a âncora nos cantos, a
+  cabeça para cima dava 470 px em y: com o olhar fixo, a pupila do
+  MediaPipe quase não contra-rotaciona na vertical em relação aos cantos.
+  Em relação à ponte do nariz, contra-rotaciona mais. Sobra um erro grande
+  ao inclinar a cabeça para baixo (353 px em y), onde as pálpebras cobrem
+  mais a íris. A recentralização (R), o aviso de postura e o ajuste fino
+  pela cabeça (tecla A) são as formas de conviver com isso.
+- **Comparação com o modelo anterior.** O pipeline geométrico erra ~14% a
+  mais em pontos novos com a cabeça parada (134 contra 118 px), menos com
+  a cabeça em poses novas (330 contra 374 px) e o mesmo na validação sem o
+  desvio constante (87 contra ~100 px). O desvio constante entre calibrar
+  e validar ainda é maior (146 contra 113 px), e a recentralização o
+  corrige. As 4 validações são poucas para separar os dois.
 
 ### 5.7 Histórico: modelo de regressão (versões 3 a 6)
 
@@ -596,6 +693,77 @@ Num usuário sintético com o movimento da íris encolhido como no MediaPipe
 
 Esses testes validam a matemática e o software. A acurácia real é a da
 seção 5.6 e deve ser medida com a validação (seção 6).
+
+### 5.9 Comparação com o projeto de referência (Webcam3DTracker)
+
+O projeto de referência (`docs/Webcam3DTracker.zip`, `MonitorTracking.py`)
+implementa o mesmo pipeline de forma mais simples. O que foi aproveitado
+e o que não foi:
+
+| Referência | Aqui | Decisão |
+|---|---|---|
+| Centro do globo "travado" num único quadro, olhando o centro da tela (tecla C): centro = íris + 20 px na direção da câmera | Ajustado por mínimos quadrados em 16 alvos + etapa da cabeça (seção 5.2) | Mantido o ajuste: o travamento num quadro herda todo o ruído daquele quadro |
+| Centro ancorado na **região do nariz** (24 pontos, PCA), "para estabilizar o rastreamento vertical" | Âncora **mista**: horizontal pelos cantos, vertical pela **ponte do nariz** (5 pontos entre os olhos) | A ideia está certa (os cantos se movem com as pálpebras), mas a região inteira inclui a ponta do nariz, ~4 cm abaixo e à frente dos olhos. Esse braço de alavanca amplificava os erros da pose: com ela, o erro com a cabeça em movimento foi de 349 para 462 px. A ponte do nariz fica na altura dos olhos |
+| Raio fixo de 20 px; o ganho fica no mapeamento ângulo → tela (±15° na horizontal, ±5° na vertical, ou seja, 3× mais ganho na vertical) | Raio efetivo por eixo, ajustado (s_x, s_y) | Equivalentes em espírito: os dois compensam a compressão maior na vertical. Aqui o ganho entra antes de somar a rotação da cabeça, que continua valendo 1:1 |
+| z da íris do MediaPipe usado no feixe | Pupila na linha de visada da câmera até o plano do olho | Mantido: o z da íris é a coordenada mais ruidosa |
+| Média móvel de 10 quadros na direção combinada | Filtro One-Euro na pupila, no referencial da cabeça | One-Euro: tremor de 7,7 px com 3 quadros de atraso, contra 6,3 px com 9 quadros de atraso e mais erro com a cabeça em movimento (seção 3.1) |
+| Direções dos dois olhos combinadas pela média; monitor virtual a 50 cm à frente do rosto, na direção do olhar no momento da calibração | Intersecção dos feixes; monitor virtual no plano da tela, com a geometria real (webcam acima da tela) e correção virtual → real em 16 pontos | A referência usa só um ponto de calibração (o centro); a correção em vários pontos é a etapa 5 |
+
+### 5.10 Precisão do ponto no monitor: de onde vem o erro
+
+Decomposição do erro nas 33 calibrações gravadas até 13/11 (px):
+
+- erro em pontos novos (LOO): 132; nos próprios alvos do ajuste, ~65 por
+  eixo. A diferença é erro sistemático: a relação pupila medida → ângulo do
+  olho não se repete bem de um alvo para outro;
+- ruído dentro de cada alvo (olhar parado): 55 RMS. O LOO usa a mediana
+  de cada alvo e quase não depende dele; no cursor, o filtro da pupila e o
+  estabilizador o tratam;
+- cada olho sozinho (só o monitor virtual): 175 (direito) e 198
+  (esquerdo). Combinar os dois feixes ajuda pouco, e em 7 das 33 sessões
+  um olho era mais de 1,5× pior que o outro.
+
+O que foi testado para reduzir o erro (LOO / cabeça em poses novas /
+validação, sem o desvio constante entre parênteses):
+
+| Variante | LOO | cabeça | validação |
+|---|---|---|---|
+| base (pupila refinada ou do MediaPipe, escolhida por validação cruzada) | 132 | 324 | 190 (88) |
+| termo quadrático no olho (compressão não linear da íris) | 131 | 332 | 228 (91) |
+| intersecção ponderada pelo erro de cada olho | 130 | 333 | 186 (91) |
+| compensação da cabeça aprendida na etapa da cabeça | 128 | 441 | 231 (87) |
+| **pupila = média das duas medidas (adotada)** | **123** | **297** | 211 (**77**) |
+
+Num segundo experimento, a íris foi medida de novo nos quadros originais
+dos vídeos das sessões (18 sessões, 25 calibrações, landmarks idênticos),
+trocando o centróide por um **ajuste de círculo à borda íris/esclera**
+(raios a partir do centro do MediaPipe procurando a transição escuro →
+claro dentro da abertura do olho, círculo por RANSAC):
+
+| Medida da íris | fonte | LOO | cabeça | validação |
+|---|---|---|---|---|
+| centróide (atual) | refinada | 144 | 322 | 193 (91) |
+| centróide (atual) | **média com o MediaPipe** | **125** | **292** | 192 (**78**) |
+| borda (círculo) | refinada | 289 | 394 | 330 (193) |
+| borda (círculo) | média com o MediaPipe | 193 | 356 | 297 (143) |
+
+O ajuste de borda falhou em 8,6% dos olhos e foi muito pior: a 720p, a íris
+tem ~5 px de raio na imagem, e um círculo ajustado a um arco tão pequeno,
+cortado pelas pálpebras, é instável. O centróide usa a área inteira da
+íris e é mais robusto nessa resolução.
+
+Conclusões:
+
+- O limite é a **medida da pupila**, não a geometria nem a forma da
+  calibração: modelos mais flexíveis (quadrático, compensação da cabeça)
+  não generalizam, e só medidas melhores (a média das duas) reduziram o
+  erro.
+- Na validação, a maior parte do erro bruto é um **desvio constante**
+  entre calibrar e usar (190 px brutos contra 77–88 px sem ele), que a
+  recentralização (`R`) e a correção por alvos conhecidos tratam.
+- O próximo ganho provável é de **resolução**: a 1080p a íris tem 1,5× mais
+  pixels que a 720p padrão (`--width 1920 --height 1080`, se a webcam
+  suportar). Não há sessões gravadas em 1080p para medir.
 
 ## 6. Validação (`procedures.py` → `ValidationProcedure`)
 
@@ -683,10 +851,10 @@ Cada camada é ligada e desligada por uma tecla, durante a execução:
 | Tecla | Camada |
 |---|---|
 | `L` | landmarks: malha facial, contorno dos olhos, contorno e centro das íris, cantos usados como âncora |
-| `G` | olhar (etapas 2–3): centro do globo de cada olho (círculo com raio até a pupila), pupila, feixe de cada olho, vetor do olhar (seta), yaw/pitch e a posição da intersecção dos feixes |
+| `G` | olhar (etapas 2–3): para cada olho, o globo (círculo com raio de 0,4 × a largura do olho, o tamanho de um olho real), o centro, a pupila **medida** (ponto verde), a pupila **corrigida** pelo ganho da calibração (anel laranja, onde o feixe sai do globo) e o feixe; o vetor do olhar (seta), yaw/pitch e a posição da intersecção dos feixes. A distância entre o ponto verde e o anel laranja mostra quanto o MediaPipe encolhe o movimento da íris |
 | `P` | eixos da cabeça (x vermelho, y verde, frente azul) e yaw/pitch/roll, com a fonte da pose |
 | `V` | minimapa da tela: alvos de calibração, rastro recente, ponto filtrado (amarelo), ponto bruto (cinza) e progresso do dwell |
-| `3` | vista 3D (`scene3d.py`): rosto, eixos da cabeça, globos e pupilas, feixes até a tela, intersecção (branco), vetor do olhar até o monitor virtual (magenta) e cursor no monitor real (amarelo). A diferença entre o magenta e o amarelo é o que a correção da etapa 5 faz |
+| `3` | vista 3D (`scene3d.py`): rosto, eixos da cabeça, globos (0,4 × largura do olho), pupilas medidas e corrigidas (laranja), feixes até a tela, intersecção (branco), vetor do olhar até o monitor virtual (magenta) e cursor no monitor real (amarelo). A diferença entre o magenta e o amarelo é o que a correção da etapa 5 faz |
 
 As camadas geométricas são desenhadas no frame original e só depois
 espelhadas (tecla `F`), para que textos e minimapa não fiquem invertidos.
@@ -705,6 +873,18 @@ resultados vão para `results/reproducoes/`, sem tocar na calibração salva.
 Isso permite avaliar mudanças no estimador do olhar (por exemplo, o
 refinamento da íris na imagem) com dados reais, coisa que as medidas
 gravadas em `.npz` não permitem.
+
+**Limitação.** A reprodução só é fiel enquanto o app se comporta no tempo
+como na gravação. A coleta de cada alvo começa quando o olhar *estimado*
+fixa, e o resultado de um procedimento (recentralização aplicada ou
+rejeitada) muda quanto tempo a tela de resultado fica aberta. Com outro
+modelo, o app pode mostrar um alvo enquanto a pessoa do vídeo ainda olha
+o anterior: numa reprodução de 12/11 14:49, a validação ficou ~1 s
+atrasada em relação ao vídeo e o erro medido (810 px) não tinha relação
+com o modelo. A repetição de alvos ruins é desligada na reprodução, porque
+o vídeo não atende a pedidos novos. Para comparar modelos, use
+`tools/benchmark.py`, que reaproveita as janelas de coleta originais; a
+reprodução serve para verificar o app de ponta a ponta.
 
 ## 11. Verificação (`tests/`)
 

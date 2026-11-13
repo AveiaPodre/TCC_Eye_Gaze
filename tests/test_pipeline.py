@@ -97,7 +97,7 @@ def test_anchor_and_pupil_measured_in_cm():
                                       gaze_vec=np.array([0, 0, -1.0])))
     a = np.array([e.anchor_cm for e in s.eyes])
     assert np.linalg.norm(a[0] - a[1]) == pytest.approx(6.0, abs=0.2)
-    assert a[:, 2] == pytest.approx([60.0, 60.0], abs=1.5)
+    assert a[:, 2] == pytest.approx([60.0, 60.0], abs=2.5)   # distância pelos cantos externos
     for e in s.eyes:
         assert np.linalg.norm(e.pupil_cm[:2] - e.anchor_cm[:2]) < 0.1
     assert s.raw.shape == (RAW_SIZE,)
@@ -116,6 +116,53 @@ def test_pupil_ignores_iris_depth_noise():
             for k in (eye.iris_center,) + eye.iris_ring:
                 obs.points[k, 2] += 8.0
         assert np.allclose(base.raw, est.estimate(obs).raw, atol=1e-9), head
+
+
+def test_bridge_to_eye_offset_is_rigid():
+    """O deslocamento ponte do nariz -> meio dos cantos, no referencial da
+    cabeça, não muda com a pose (âncora "misto"). Regressão: tirar a média
+    dos landmarks em pixels antes de converter para cm fazia esse
+    deslocamento variar ~0,01 cm com a inclinação da cabeça (~1° no feixe)."""
+    from eyegaze.gaze import RAW_NOSE, raw_parts
+    est = GazeEstimator(GazeConfig(pupil_filter=False))
+    rel = []
+    for head in [(0, 0, 0), (0, -8, 0), (0, 8, 0), (12, 0, 0), (-10, 6, 4)]:
+        s = est.estimate(make_observation(head=head, head_pos_cm=EYE_POS, with_transform=True,
+                                          gaze_vec=np.array([0, 0, -1.0])))
+        R, A, _, _ = raw_parts(s.raw)
+        rel.append(R[0].T @ (A[0] - s.raw[RAW_NOSE]).T)
+    rel = np.array(rel)
+    # A distância estimada varia ~0,25% com a pose (perspectiva), o que muda
+    # a escala do deslocamento; o bug antigo dava ~1% só na vertical.
+    assert (np.ptp(rel, axis=0) / np.abs(rel.mean(axis=0))).max() < 0.005
+
+
+def test_pupil_filter_smooths_eye_but_not_head():
+    """O filtro da pupila age sobre a posição do olho NA CABEÇA: o tremor dos
+    landmarks é suavizado, mas girar a cabeça move o feixe na hora."""
+    geom = ScreenGeometry()
+    T = geom.px_to_cm(960, 540)
+
+    def run(filt, frames):
+        est = GazeEstimator(GazeConfig(pupil_filter=filt))
+        rng = np.random.default_rng(0)
+        out = []
+        for i, head in enumerate(frames):
+            o = make_observation(head=head, head_pos_cm=EYE_POS, with_transform=True,
+                                 gaze_vec=T - np.array(EYE_POS), noise_px=0.3, rng=rng,
+                                 timestamp_ms=33 * i)
+            out.append(est.estimate(o).features())
+        return np.array(out)
+    still = [(0, 0, 0)] * 60
+    raw, smooth = run(False, still), run(True, still)
+    jitter = lambda f: np.median(np.linalg.norm(np.diff(f[20:], axis=0), axis=1))  # noqa: E731
+    assert jitter(smooth) < 0.6 * jitter(raw)
+    # Cabeça girando a ~30°/s com o olhar fixo: o olho contra-rotaciona na
+    # cabeça e esse movimento é filtrado, então o olhar estimado "arrasta" um
+    # pouco a cabeça enquanto ela gira. O desvio tem de ficar pequeno.
+    turn = [(0, 0, 0)] * 30 + [(float(k), 0, 0) for k in range(1, 13)] + [(12, 0, 0)] * 10
+    a, b = run(False, turn), run(True, turn)
+    assert np.abs(a[30:] - b[30:]).max() < 1.5, np.abs(a[30:] - b[30:]).max(axis=0)
 
 
 def test_blink_detected_and_invalid():

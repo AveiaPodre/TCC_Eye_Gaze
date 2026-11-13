@@ -4,7 +4,9 @@ Vista 3D da cena: o pipeline do olhar, etapa por etapa.
 Numa câmera virtual que orbita a cena, desenha:
 
 * o rosto (landmarks) e os eixos da cabeça (etapa 1);
-* para cada olho, o CENTRO DO GLOBO (círculo) e a PUPILA (ponto) (etapa 2);
+* para cada olho, o GLOBO (raio = 0,4 × largura do olho), a PUPILA medida
+  (ponto) e a pupila CORRIGIDA pelo ganho da calibração (anel laranja,
+  onde o feixe sai do globo) (etapa 2);
 * o FEIXE de cada olho, do centro do globo passando pela pupila, até o
   plano da tela (azul claro) e a INTERSECÇÃO dos dois feixes (etapa 3);
 * o VETOR DO OLHAR, do ponto entre os olhos até a intersecção, prolongado
@@ -27,9 +29,12 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from .eyeball import RADIUS_CM
 from .face_tracker import FaceObservation
 from .gaze import RAW_FACE, GazeSample, direction_to_angles
 from .geometry import VirtualScreen, px3d_to_cm
+
+C_CORRECTED = (0, 140, 255)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -232,10 +237,13 @@ def render_scene(view: OrbitView, screen: VirtualScreen, sample: GazeSample | No
             for k in range(2):
                 c, p, d = gaze.centers[k], gaze.pupils[k], gaze.directions[k]
                 color = C_EYE if gaze.open[k] else C_RAW
-                pj.circle_3d(img, c, float(np.linalg.norm(p - c)), color)
+                r = RADIUS_CM if gaze.radii is None else float(gaze.radii[k])
+                pj.circle_3d(img, c, r, color, 1)
                 q = pj(p)
                 if q is not None:
                     cv2.circle(img, q, 2, C_BEAM, -1, cv2.LINE_AA)
+                if gaze.open[k]:
+                    pj.circle_3d(img, gaze.corrected[k], 0.15, C_CORRECTED, 1)
                 if gaze.open[k]:
                     hit = screen.hit(c, d)[0]
                     end = hit if np.all(np.isfinite(hit)) else c + 80.0 * d
@@ -271,7 +279,8 @@ def render_scene(view: OrbitView, screen: VirtualScreen, sample: GazeSample | No
                       f"yaw {hy:+.1f}  pitch {hp:+.1f} graus   distancia {E[2]:.0f} cm",
                       (220, 220, 220)))
 
-    legend = [("circulo/ponto: centro do globo / pupila", C_EYE),
+    legend = [("globo (0,4 x largura do olho); ponto = pupila medida", C_EYE),
+              ("laranja: pupila corrigida pelo ganho da calibracao", C_CORRECTED),
               ("azul claro: feixe centro -> pupila de cada olho", C_BEAM),
               ("branco: interseccao dos feixes", C_VERGENCE),
               ("magenta: vetor do olhar -> monitor virtual", C_VIRTUAL),

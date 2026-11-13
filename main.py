@@ -39,6 +39,9 @@ def parse_args(argv=None):
                    help="largura física da tela em cm (padrão: detecta no Windows). É o "
                         "tamanho do monitor virtual onde o olhar é projetado e dá o erro em "
                         "graus na validação")
+    p.add_argument("--camera-fov", type=float, default=None,
+                   help="campo de visão HORIZONTAL da câmera em graus (padrão 90, notebook); "
+                        "define a escala do rosto em cm")
     p.add_argument("--distance-cm", type=float, default=None,
                    help="distância olho-tela (para erro em graus na validação)")
     p.add_argument("--gravar", action="store_true",
@@ -69,6 +72,10 @@ def _replay(args, cfg: AppConfig) -> int:
     if cfg.calibration.save_path.exists():
         cfg.calibration.save_path.unlink()
     cfg.calibration.random_seed = source.seed
+    # O vídeo gravado não atende a pedidos novos: a repetição de alvos ruins
+    # coletaria o alvo de novo num momento em que a pessoa do vídeo olhava
+    # para outro lugar (ex.: durante a etapa da cabeça).
+    cfg.calibration.retry_bad_targets = False
     _set_screen_width(cfg, args.screen_width_cm or source.screen_width_cm)
     print(f"[Reprodução] {name}: tela {source.screen_size}, resultados em {out}")
     tracker = FaceTracker(cfg.tracker)
@@ -87,6 +94,8 @@ def main(argv=None) -> int:
     if args.no_mirror:
         cfg.camera.mirror_display = False
     cfg.validation.viewing_distance_cm = args.distance_cm
+    if args.camera_fov:
+        cfg.camera.hfov_deg = args.camera_fov
 
     if args.reproduzir:
         return _replay(args, cfg)

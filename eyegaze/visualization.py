@@ -13,7 +13,8 @@ import numpy as np
 
 from .face_tracker import FaceObservation
 from .gaze import GazeSample
-from .geometry import cm_to_px
+from .eyeball import RADIUS_CM
+from .geometry import cm_to_px, focal_px
 from .landmarks import LEFT_EYE, RIGHT_EYE
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -54,8 +55,16 @@ def draw_landmarks(img, obs: FaceObservation):
 
 
 def draw_gaze(img, sample: GazeSample):
-    """Etapas 2-3 sobre a imagem: centro do globo (círculo com o raio até a
-    pupila), pupila e feixe de cada olho (do centro, passando pela pupila),
+    """Etapas 2-3 sobre a imagem, para cada olho:
+
+    * o globo (círculo, raio = 0,4 × largura do olho, em volta do centro),
+      com o tamanho de um olho real;
+    * a pupila MEDIDA (ponto verde) e a pupila CORRIGIDA pelo ganho da
+      calibração (anel laranja, onde o feixe sai do globo): o MediaPipe
+      encolhe o movimento da íris, e a distância entre as duas mostra essa
+      correção;
+    * o feixe, do centro do globo pela pupila corrigida;
+
     e o vetor do olhar a partir do ponto entre os olhos (seta amarela)."""
     gaze = sample.gaze
     if gaze is None:
@@ -63,15 +72,18 @@ def draw_gaze(img, sample: GazeSample):
             cv2.circle(img, _p(eye.iris_px), 3, (120, 120, 120), -1, cv2.LINE_AA)
         return
     size = (img.shape[1], img.shape[0])
+    f = focal_px(size[0])
     for k in range(2):
         c_px = cm_to_px(gaze.centers[k], size)
-        p_px = cm_to_px(gaze.pupils[k], size)
+        z = max(float(gaze.centers[k][2]), 1e-3)
         color = (255, 255, 0) if gaze.open[k] else (120, 120, 120)
-        r = max(2, int(round(np.linalg.norm(p_px - c_px))))
-        cv2.circle(img, _p(c_px), r, color, 1, cv2.LINE_AA)
+        r = RADIUS_CM if gaze.radii is None else float(gaze.radii[k])
+        cv2.circle(img, _p(c_px), max(2, int(round(f * r / z))), color, 1, cv2.LINE_AA)
         cv2.circle(img, _p(c_px), 2, color, -1, cv2.LINE_AA)
-        cv2.circle(img, _p(sample.eyes[k].iris_px), 3, (0, 255, 120), -1, cv2.LINE_AA)
+        cv2.circle(img, _p(sample.eyes[k].iris_px), 2, (0, 255, 120), -1, cv2.LINE_AA)
         if gaze.open[k]:
+            cv2.circle(img, _p(cm_to_px(gaze.corrected[k], size)), 4, (0, 140, 255), 1,
+                       cv2.LINE_AA)
             far = cm_to_px(gaze.centers[k] + 6.0 * gaze.directions[k], size)
             cv2.line(img, _p(c_px), _p(far), (0, 255, 120), 1, cv2.LINE_AA)
     o_px = cm_to_px(gaze.origin, size)

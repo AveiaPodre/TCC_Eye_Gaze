@@ -24,6 +24,8 @@ def _cfg(tmp_path, sub):
     cfg.calibration.save_path = tmp_path / sub / "cal.json"
     cfg.calibration.results_dir = tmp_path / sub
     cfg.validation.results_dir = tmp_path / sub
+    from synthetic import SYNTH_HFOV_DEG
+    cfg.camera.hfov_deg = SYNTH_HFOV_DEG
     return cfg
 
 

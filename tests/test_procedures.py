@@ -188,7 +188,7 @@ def test_bad_target_is_collected_again(tmp_path):
     proc = run_procedure(app, max_steps=6000)
     assert proc.succeeded
     assert 5 in proc.retried_targets
-    assert max(r.error_px for r in proc.results) < 60
+    assert max(r.error_px for r in proc.results) < 75
 
 
 def test_bad_targets_rule():

@@ -25,7 +25,7 @@ from collections import deque
 import cv2
 import numpy as np
 
-from . import scene3d
+from . import geometry, scene3d
 from . import visualization as vis
 from .calibration import CalibrationModel, build_grid
 from .config import AppConfig
@@ -59,6 +59,7 @@ class EyeGazeApp:
         self.headless = headless
         self.mouse = mouse if mouse is not None else MouseController(screen_size)
 
+        geometry.set_camera_hfov(cfg.camera.hfov_deg)
         self.estimator = GazeEstimator(cfg.gaze)
         st = cfg.stabilizer
         self.stabilizer = FixationStabilizer(

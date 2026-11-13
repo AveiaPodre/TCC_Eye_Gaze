@@ -51,6 +51,7 @@ python main.py --camera 1           # outra webcam
 python main.py --video sessao.mp4   # roda sobre um vídeo gravado
 python main.py --screen 1920x1080   # se a resolução não for detectada
 python main.py --screen-width-cm 53 --distance-cm 60   # largura física da tela (fora do Windows) e erro em graus
+python main.py --camera-fov 75      # campo de visão horizontal da webcam (padrão 90°, notebook)
 python main.py --gravar             # grava vídeo + teclas (results/sessao_*.avi/.json)
 python main.py --reproduzir results/sessao_X.json --sem-janela   # refaz a sessão offline
 python main.py --help
@@ -130,7 +131,7 @@ automaticamente. Ela é descartada se a resolução da tela mudar.
 | `D` | liga/desliga o dwell-click |
 | `A` | liga/desliga o **ajuste fino pela cabeça**: o olhar leva o cursor à região e, enquanto você continua olhando, pequenos giros da cabeça (direita/esquerda/cima/baixo) movem o cursor a partir dali com precisão de poucos pixels. Um novo salto do olhar zera o ajuste. Parâmetros em `FineConfig` |
 | `L` | liga/desliga a visualização dos **landmarks** (malha, contorno dos olhos, íris, cantos) |
-| `G` | liga/desliga a visualização do **olhar** (centro do globo e pupila de cada olho, feixe de cada olho, vetor do olhar, ângulos e posição da intersecção dos feixes) |
+| `G` | liga/desliga a visualização do **olhar**: para cada olho, o globo (0,4 × largura do olho), a pupila medida (verde), a pupila corrigida pelo ganho da calibração (anel laranja) e o feixe; vetor do olhar, ângulos e posição da intersecção dos feixes |
 | `P` | liga/desliga os **eixos da cabeça** e os ângulos de pose |
 | `V` | liga/desliga o **minimapa** da tela com o ponto estimado em tempo real |
 | `3` | liga/desliga a **vista 3D** (janela própria), com as etapas do pipeline: rosto, globo e pupila de cada olho, feixes até a tela (azul claro), intersecção dos feixes (branco), vetor do olhar até o monitor virtual (magenta) e cursor no monitor real depois da calibração (amarelo). Arraste para girar, use a roda para zoom e o botão direito para voltar à vista inicial. Informe `--screen-width-cm` para a tela ficar em escala |
@@ -273,15 +274,14 @@ que está sendo removido.
   lente muito diferente geram um pequeno erro de escala. A calibração
   absorve a maior parte dele, e `R` corrige o resto.
 - **Eixo vertical.** É a principal limitação medida (ver
-  `docs/metodologia.md`, seção 5.6). A pupila do MediaPipe anda só ~15% do
-  que um olho real andaria na vertical, então o raio efetivo vertical
-  ajustado é ~0,15 cm: um deslocamento de décimos de milímetro da pupila
-  em relação aos cantos do olho (mudança de postura, abertura do olho)
-  move o cursor centenas de pixels na vertical. Além disso, com o olhar
-  fixo e a cabeça inclinando, a pupila quase não contra-rotaciona na
-  vertical, e o cursor acompanha a cabeça. Nas sessões gravadas, o erro
-  com a cabeça inclinada para cima chega a ~470 px na vertical. Use a
-  recentralização (R) quando o cursor ficar deslocado na vertical.
+  `docs/metodologia.md`, seção 5.6). A pupila do MediaPipe anda só ~25–30%
+  do que um olho real andaria, então um deslocamento de décimos de
+  milímetro da pupila (mudança de postura, abertura do olho) move o cursor
+  bastante. A vertical do globo é ancorada na ponte do nariz, e não nos
+  cantos do olho, que sobem e descem com as pálpebras: isso aumentou o
+  sinal vertical em ~60% e reduziu à metade o erro com a cabeça inclinada
+  para cima (470 → 216 px). Inclinar a cabeça para baixo ainda erra ~350 px
+  na vertical. Use a recentralização (R) quando o cursor ficar deslocado.
 - **Óculos e iluminação.** Reflexos nas lentes e contraluz pioram os
   landmarks da íris.
 - **Acurácia.** Rastreadores por webcam costumam ter erro de alguns graus de

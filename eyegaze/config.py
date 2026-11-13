@@ -25,6 +25,10 @@ class CameraConfig:
     width: int = 1280
     height: int = 720
     fps: int = 30
+    # Campo de visão HORIZONTAL suposto da câmera (graus). Define a escala
+    # métrica do rosto (geometry.py). Webcams de notebook: ~80-95°; webcams
+    # externas comuns: ~65-80°. Mudá-lo invalida a calibração salva.
+    hfov_deg: float = 90.0
     # Espelha apenas a IMAGEM EXIBIDA (efeito "espelho"). O processamento é
     # sempre feito sobre o frame original, então isso não afeta o olhar.
     mirror_display: bool = True
@@ -46,6 +50,30 @@ class GazeConfig:
     # Fonte da rotação da cabeça: "matrix" (matriz do FaceLandmarker, com
     # verificação de coerência) ou "landmarks" (eixos geométricos).
     head_pose_source: str = "matrix"
+
+    # Filtro One-Euro (Casiez et al., 2012) na posição da pupila em relação
+    # à âncora, no referencial da cabeça, ANTES de virar ângulo. O ruído da
+    # pupila (~0,01 cm) vira graus porque o raio efetivo é pequeno (~0,3 cm);
+    # filtrar aqui estabiliza os feixes e a intersecção sem atrasar a
+    # rotação da cabeça, que entra depois (R). Corte em Hz; beta em 1/cm.
+    # Nas sessões gravadas: tremor quadro a quadro do ponto 16 -> 7,7 px, com
+    # atraso de 3 quadros numa sacada, sem mudar o erro (seção 5.6).
+    pupil_filter: bool = True
+    pupil_min_cutoff: float = 0.7
+    pupil_beta: float = 10.0
+    pupil_filter_reset_s: float = 0.3   # intervalo sem amostra que reinicia o filtro
+
+    # Escala métrica do rosto: distância entre os cantos externos dos olhos
+    # (média adulta ~9 cm). A distância do rosto à câmera sai da câmera
+    # pinhole com essa medida. A translação da matriz do MediaPipe NÃO é
+    # usada: nas sessões gravadas ela dava ~36 cm com a pessoa a ~64 cm (a
+    # escala dela não é coerente com o campo de visão suposto), e o rosto
+    # inteiro em cm ficava a 56% do tamanho real.
+    outer_canthi_cm: float = 9.0
+    # "pinhole" (acima) ou "mediapipe" (translação da matriz do modelo).
+    depth_source: str = "pinhole"
+    # Razão raio do globo / largura do olho (cantos): ~12 mm / ~30 mm.
+    eyeball_radius_ratio: float = 0.40
 
     # Detecção de piscada pelo EAR (eye aspect ratio = altura/largura do
     # olho). O limiar é RELATIVO ao EAR típico do usuário com o olho aberto

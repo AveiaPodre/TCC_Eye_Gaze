@@ -48,9 +48,10 @@ import numpy as np
 from .eyeball import EYE_NAMES, EyeballModel
 from .face_tracker import FaceObservation
 from .gaze import MOUTH_COL, RAW_FACE, RAW_R, RAW_SIZE, has_refined_pupil
+from . import geometry
 from .geometry import VirtualScreen
 
-FEATURE_VERSION = 7  # incremente se o layout de ``raw`` mudar (invalida calibrações antigas)
+FEATURE_VERSION = 9  # incremente se o layout de ``raw`` mudar (invalida calibrações antigas)
 
 CORRECTIONS = ("nenhuma", "deslocamento", "afim", "quadratica")
 ALPHAS = (1e-3, 1e-2, 1e-1)       # ridge da correção (coordenadas normalizadas)
@@ -269,6 +270,7 @@ class CalibrationModel:
     def to_dict(self) -> dict:
         return {
             "feature_version": FEATURE_VERSION,
+            "camera_hfov_deg": geometry.ASSUMED_HFOV_DEG,
             "screen": {"size_px": list(self.screen.size_px), "width_cm": self.screen.width_cm,
                        "gap_cm": self.screen.gap_cm},
             "eyeball": self.eyeball.to_dict(),
@@ -302,6 +304,9 @@ class CalibrationModel:
             return None
         if d.get("feature_version") != FEATURE_VERSION:
             print("[Calibração] Arquivo salvo é de uma versão antiga; recalibre.")
+            return None
+        if abs(float(d.get("camera_hfov_deg", -1)) - geometry.ASSUMED_HFOV_DEG) > 1e-6:
+            print("[Calibração] Arquivo salvo é de outro campo de visão da câmera; recalibre.")
             return None
         if tuple(d.get("screen_size", ())) != tuple(screen_size):
             print("[Calibração] Arquivo salvo é de outra resolução de tela; recalibre.")
@@ -467,6 +472,7 @@ def fit_from_samples(
     assumed_width_cm: float = 34.5,
     corrections: tuple[str, ...] | None = None,
     pupil_sources: tuple[str, ...] | None = None,
+    anchors: tuple[str, ...] = ("misto",),
 ) -> tuple[CalibrationModel, list[PointResult], dict]:
     """Ajusta o pipeline. Devolve (modelo, resultados por alvo, estatísticas).
 
@@ -514,9 +520,12 @@ def fit_from_samples(
     raw_all, Y_all = np.vstack(raws), np.vstack(Ys)
     w_all, g_all = np.concatenate(ws), np.concatenate(gs)
     T_all = screen.px_to_cm(Y_all)
-    sources = ["mediapipe"] + (["refinada"] if has_refined_pupil(raw_all) else [])
+    # Fonte da pupila: com o refinamento na imagem disponível, a MÉDIA das duas
+    # medidas (MediaPipe e refinada), cujos erros são em parte independentes;
+    # nas sessões gravadas, ela errou menos que cada uma sozinha (seção 5.6).
+    sources = ["media"] if has_refined_pupil(raw_all) else ["mediapipe"]
     if pupil_sources is not None:
-        sources = [s for s in sources if s in pupil_sources] or ["mediapipe"]
+        sources = list(pupil_sources)
     cands = _candidates(len(cleaned), max_degree)
     if corrections is not None:
         cands = [c for c in cands if c[0] in corrections or c[0] == "nenhuma"]
@@ -527,27 +536,27 @@ def fit_from_samples(
              and not (g <= HEAD_GROUP_BASE and np.sum(g_all == g) < MIN_HEAD_FOLD)]
     scores: dict = {}
     if len(cleaned) >= 5:
-        for src in sources:
+        for src, anc in [(s_, a_) for s_ in sources for a_ in anchors]:
             preds = {c: {} for c in cands}
             for g in folds:
                 tr, te = g_all != g, g_all == g
-                eb = EyeballModel.fit(raw_all[tr], T_all[tr], w_all[tr], src)
+                eb = EyeballModel.fit(raw_all[tr], T_all[tr], w_all[tr], src, anchor=anc)
                 tmp = CalibrationModel(screen, eb)
                 V_tr, V_te = tmp.virtual_px(raw_all[tr]), tmp.virtual_px(raw_all[te])
                 for kind, alpha in cands:
                     coef = fit_correction(V_tr, Y_all[tr], w_all[tr], kind, alpha, screen_size)
                     preds[(kind, alpha)][int(g)] = apply_correction(V_te, coef, kind, screen_size)
             for c in cands:
-                scores[(src, *c)] = cv_errors_from(preds[c], Y_all, g_all)
+                scores[(src, anc, *c)] = cv_errors_from(preds[c], Y_all, g_all)
         kinds = set(corrections or ("nenhuma",)) if corrections is not None else None
-        allowed = [k for k in scores if kinds is None or k[1] in kinds]
+        allowed = [k for k in scores if kinds is None or k[2] in kinds]
         best = min(allowed, key=lambda k: np.mean(scores[k][0]))
     else:
-        best = (sources[0], "deslocamento" if corrections is None or "deslocamento"
-                in corrections else "nenhuma", 0.0)
-    src, kind, alpha = best
+        best = (sources[0], anchors[0], "deslocamento" if corrections is None
+                or "deslocamento" in corrections else "nenhuma", 0.0)
+    src, anc, kind, alpha = best
 
-    eyeball = EyeballModel.fit(raw_all, T_all, w_all, src)
+    eyeball = EyeballModel.fit(raw_all, T_all, w_all, src, anchor=anc)
     model = CalibrationModel(screen, eyeball, kind, fitted=True)
     V_all = model.virtual_px(raw_all)
     model.coef = fit_correction(V_all, Y_all, w_all, kind, alpha, screen_size)
@@ -556,13 +565,14 @@ def fit_from_samples(
     resid = model.predict(raw_all) - Y_all
     ok = np.all(np.isfinite(resid), axis=1)
     info = {
-        "fonte_pupila": src, "correcao": kind, "ridge_alpha": float(alpha),
+        "fonte_pupila": src, "ancora": anc, "correcao": kind, "ridge_alpha": float(alpha),
         "largura_tela_cm": screen.width_cm, "largura_conhecida": bool(screen_width_cm),
         "usa_etapa_cabeca": bool(has_head),
         "rmse_ajuste_px": float(np.sqrt(np.sum(w_all[ok] * np.sum(resid[ok] ** 2, 1))
                                         / w_all[ok].sum())),
-        "globo": {name: {"repouso_pupila_cm": eyeball.c[k].tolist(),
-                         "raio_efetivo_cm": eyeball.s[k].tolist()}
+        "globo": {name: {"raio_cm": float(eyeball.r[k]),
+                         "repouso_pupila_cm": eyeball.c[k].tolist(),
+                         "ganho_pupila": eyeball.gain[k].tolist()}
                   for k, name in enumerate(EYE_NAMES)},
         "erro_angular_ajuste_graus": eyeball.info.get("erro_angular_ajuste_graus"),
     }
@@ -579,10 +589,10 @@ def fit_from_samples(
         info["erro_loo_alvos"] = target_ids
         if head_errs:
             info["erro_cv_cabeca_px"] = float(np.mean(head_errs))
-        geo = scores[(src, "nenhuma", 0.0)]
+        geo = scores[(src, anc, "nenhuma", 0.0)]
         info["erro_loo_monitor_virtual_px"] = float(np.mean(geo[0]))
         info["candidatos"] = [
-            {"fonte": k[0], "correcao": k[1], "alpha": k[2],
+            {"fonte": k[0], "ancora": k[1], "correcao": k[2], "alpha": k[3],
              "erro_loo_px": float(np.mean(v[0])),
              "erro_cv_cabeca_px": float(np.mean(v[1])) if v[1] else None}
             for k, v in scores.items()]
