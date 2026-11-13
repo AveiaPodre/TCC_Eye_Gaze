@@ -240,11 +240,47 @@ class SimUser:
             data.mouth_features, data.mouth_raw = np.array(F), np.array(Rw)
         return data
 
-    def mean_error(self, model, head=(0, 0, 0), pos=EYE_POS, mouth=0.0):
+    def drifting_calibration(self, drift_cm, checks=True, n=12, every=4):
+        """Grade 4×4 com a pupila derivando linearmente de 0 a ``drift_cm`` ao
+        longo da coleta, com (ou sem) checagens do centro no início e a cada
+        ``every`` alvos, e os instantes de cada amostra."""
+        from eyegaze.calibration import CalibrationData
+        grid = build_grid(1920, 1080, 4, 4, 0.05)
+        seq = []
+        for j, t in enumerate(grid):
+            if checks and j % every == 0:
+                seq.append(("chk", (960.0, 540.0)))
+            seq.append(("alvo", t))
+        if checks:
+            seq.append(("chk", (960.0, 540.0)))
+        data, t_now = CalibrationData(), 0.0
+        for j, (kind, t) in enumerate(seq):
+            F, Rw, T = [], [], []
+            for _ in range(n):
+                drift = drift_cm * j / (len(seq) - 1)
+                g = self.geom.gaze_vector(*t, EYE_POS)
+                o = make_observation(head_pos_cm=EYE_POS, with_transform=True, gaze_vec=g,
+                                     rng=self.rng, pupil_drift=drift, **self.user)
+                s = self.est.estimate(o)
+                F.append(s.features()); Rw.append(s.raw); T.append(t_now)
+                t_now += 1 / 30
+            t_now += 1.0
+            if kind == "alvo":
+                data.grid.append((t, np.array(F), np.array(Rw)))
+                data.grid_times.append(np.array(T))
+            else:
+                data.checks.append((t, np.array(F), np.array(Rw), np.array(T)))
+        return data
+
+    def mean_error(self, model, head=(0, 0, 0), pos=EYE_POS, mouth=0.0, drift=0.0):
         errs = []
         for tx, ty in [(480, 270), (1440, 270), (960, 540), (480, 810), (1440, 810),
                        (300, 540), (1600, 600)]:
-            _, r = self.sample(tx, ty, head, pos, mouth)
+            g = self.geom.gaze_vector(tx, ty, pos)
+            o = make_observation(head=head, head_pos_cm=pos, with_transform=True, gaze_vec=g,
+                                 noise_px=self.noise, rng=self.rng, mouth_open=mouth,
+                                 pupil_drift=drift, **self.user)
+            r = self.est.estimate(o).raw
             errs.append(math.hypot(*(model.predict(r) - [tx, ty])))
         return float(np.mean(errs))
 
@@ -355,6 +391,32 @@ def test_correction_absorbs_unknown_screen_width():
     assert not stats["largura_conhecida"] and stats["correcao"] != "nenhuma"
     assert stats["erro_loo_monitor_virtual_px"] > 1.5 * stats["erro_loo_medio_px"]
     assert user.mean_error(model) < 45
+
+
+def test_drift_checks_correct_pupil_drift():
+    """A pupila deriva ao longo da grade (sem o olho girar). Com as checagens
+    do centro, a deriva é medida, descontada e o modelo fica ajustado ao
+    estado do FIM da calibração; sem elas, o modelo mistura os estados."""
+    user = SimUser(21)
+    drift = 0.04                                  # cm (~1/3 do raio efetivo vertical)
+    with_chk, _, st = _fit(user.drifting_calibration(drift, checks=True))
+    no_chk, _, _ = _fit(user.drifting_calibration(drift, checks=False))
+    assert st["deriva_corrigida"] and st["deriva_centro_px"] > 40
+    e_with = user.mean_error(with_chk, drift=drift)
+    e_without = user.mean_error(no_chk, drift=drift)
+    assert e_with < 0.6 * e_without, (e_with, e_without)
+    # Sem deriva, as checagens não atrapalham.
+    clean, _, st0 = _fit(user.drifting_calibration(0.0, checks=True))
+    assert st0["deriva_centro_px"] < 25
+    assert user.mean_error(clean) < 35
+
+
+def test_drift_data_roundtrip(tmp_path):
+    data = SimUser(22).drifting_calibration(0.02, n=4)
+    data.save(tmp_path / "d.npz")
+    loaded = CalibrationData.load(tmp_path / "d.npz")
+    assert len(loaded.checks) == 5 and len(loaded.grid_times) == 16
+    assert np.allclose(loaded.checks[2][3], data.checks[2][3])
 
 
 def test_cv_report():

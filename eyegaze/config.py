@@ -52,12 +52,12 @@ class GazeConfig:
     head_pose_source: str = "matrix"
 
     # Filtro One-Euro (Casiez et al., 2012) na posição da pupila em relação
-    # à âncora, no referencial da cabeça, ANTES de virar ângulo. O ruído da
-    # pupila (~0,01 cm) vira graus porque o raio efetivo é pequeno (~0,3 cm);
-    # filtrar aqui estabiliza os feixes e a intersecção sem atrasar a
-    # rotação da cabeça, que entra depois (R). Corte em Hz; beta em 1/cm.
-    # Nas sessões gravadas: tremor quadro a quadro do ponto 16 -> 7,7 px, com
-    # atraso de 3 quadros numa sacada, sem mudar o erro (seção 5.6).
+    # à âncora, no referencial da cabeça, SÓ para o feixe exibido (desenho,
+    # HUD, detecção de fixação na coleta): estabiliza os feixes e a
+    # intersecção. O cursor e a calibração usam a pupila sem filtro: nas
+    # sessões gravadas, o filtro atrasava o cursor (47 ms de mediana) e até
+    # aumentava o tremor depois do estabilizador (metodologia, seção 4.1).
+    # Corte em Hz; beta em 1/cm.
     pupil_filter: bool = True
     pupil_min_cutoff: float = 0.7
     pupil_beta: float = 10.0
@@ -91,7 +91,10 @@ class StabilizerConfig:
     saccade_ratio: float = 0.07   # salto mínimo (fração da largura da tela) p/ sacada
     confirm_frames: int = 2       # amostras seguidas fora da fixação p/ confirmar salto
     window_frames: int = 30       # amostras guardadas da fixação atual (~1 s a 30 fps)
-    follow: float = 0.6           # fração do caminho até o destino percorrida por frame
+    # Fração do caminho até o destino percorrida por quadro. 0,85 (era 0,6):
+    # chega mais rápido e se mexe menos na fixação (2,7% contra 3,8% dos
+    # quadros), sem mudar o tremor (metodologia, seção 4.1).
+    follow: float = 0.85
     # Trava da fixação: depois de ``settle_frames`` quadros o cursor para e
     # só volta a andar se ``shift_frames`` amostras seguidas ficarem fora do
     # raio de trava = max(lock_ratio * largura, lock_k * passeio medido).
@@ -102,7 +105,10 @@ class StabilizerConfig:
     # 3,5 e teto 0,9, ~6,5 vezes, sem mudar o atraso após sacadas.
     lock_k: float = 3.5
     lock_cap: float = 0.9         # raio de trava <= lock_cap x limiar de sacada
-    shift_frames: int = 8         # ~0,27 s
+    # Quadros seguidos fora da trava para seguir um movimento PEQUENO do
+    # olhar (menor que o limiar de sacada). 5 (~0,17 s; era 8): degraus de
+    # 60-100 px passam a ser seguidos em ~130 ms em vez de ~230 ms.
+    shift_frames: int = 5
     settle_frames: int = 8
     noise_k: float = 3.0          # limiar de sacada = max(base, k * ruído medido)
 
@@ -137,6 +143,16 @@ class CalibrationConfig:
     # na validação cruzada passa de ``retry_ratio`` x a mediana (e de
     # ``retry_min_frac`` da largura da tela) são coletados de novo, uma vez
     # (piscada longa, distração, olhar fora do alvo).
+    # Controle de deriva: um ponto de checagem no CENTRO no início e a cada
+    # ``drift_check_every`` alvos da grade. Como a pessoa olha sempre para o
+    # mesmo ponto conhecido, a mudança da pupila entre as checagens é deriva
+    # (cansaço, olho ressecando, postura escorregando); a calibração a
+    # desconta e fica ajustada ao estado do fim (calibration.correct_drift).
+    drift_checks: bool = True
+    drift_check_every: int = 4
+    # Ao abrir o app com uma calibração salva, recentraliza (1 ponto) antes
+    # de usar: reancora o desvio da nova sessão.
+    recenter_on_start: bool = True
     retry_bad_targets: bool = True
     retry_max_targets: int = 3
     retry_ratio: float = 2.5
@@ -198,7 +214,12 @@ class CalibrationConfig:
 
 @dataclass
 class ValidationConfig:
+    # Validação IMEDIATA, logo depois da calibração (mede o erro do modelo,
+    # sem tempo para a postura mudar). A tecla T faz o RETESTE, mais tarde:
+    # o primeiro ponto (centro) mede a deriva desde a calibração e reancora.
+    after_calibration: bool = True
     # Alvos de validação (frações da tela), diferentes dos de calibração.
+    # O PRIMEIRO precisa ser o centro (ponto de reancoragem do reteste).
     points: tuple = (
         (0.5, 0.5),
         (0.3, 0.3), (0.7, 0.3),

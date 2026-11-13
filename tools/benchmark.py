@@ -51,6 +51,7 @@ VARIANTS: list[tuple[str, dict]] = [
     ("pupila só refinada", dict(pupil_sources=("refinada",))),
     ("âncora nos cantos do olho", dict(anchors=("cantos",))),
     ("âncora na ponte do nariz", dict(anchors=("nariz",))),
+    ("sem correção de deriva", dict(drift_correction=False)),
     ("sem etapa da cabeça", dict(_no_head=True)),
 ]
 WIDTH_CM: float | None = None

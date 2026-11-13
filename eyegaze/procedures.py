@@ -76,8 +76,9 @@ class TargetProcedure:
         self.min_samples = min_samples
         # Por alvo: lista de (features (2,), raw (RAW_SIZE,)).
         self.samples: list[list[tuple[np.ndarray, np.ndarray]]] = [[] for _ in self.targets]
-        # Landmarks de cada amostra (para recalcular o olhar offline).
+        # Landmarks e instante (s, relógio do app) de cada amostra.
         self.observations: list[list] = [[] for _ in self.targets]
+        self.times: list[list[float]] = [[] for _ in self.targets]
         # Ordem de visita (índices em ``targets``) e posição atual nela.
         self.order: list[int] = list(range(len(self.targets))) if order is None else list(order)
         self.pos = 0
@@ -188,6 +189,7 @@ class TargetProcedure:
             if valid:
                 self.samples[self.index].append((sample.features(), sample.raw))
                 self.observations[self.index].append(sample.obs)
+                self.times[self.index].append(now)
             enough = len(self.samples[self.index]) >= self.min_samples
             if now - self._collect_start >= self.collect_s and enough:
                 self.pos += 1
@@ -227,9 +229,10 @@ class TargetProcedure:
         if float(np.percentile(np.hypot(*(feats - med).T), 80)) > 2.0 * self.fixation_max_deg:
             self._manual_msg = ("Olhar ainda se movendo: fixe o ponto e aperte de novo", now)
             return False
-        for _, f, r, o in win:
+        for t, f, r, o in win:
             self.samples[self.index].append((f, r))
             self.observations[self.index].append(o)
+            self.times[self.index].append(t)
         self._manual_msg = None
         self.pos += 1
         self._start_phase(now)
@@ -382,14 +385,29 @@ class CalibrationProcedure(TargetProcedure):
 
     def __init__(self, screen_size, cfg: CalibrationConfig):
         targets = build_grid(*screen_size, cfg.grid_cols, cfg.grid_rows, cfg.margin_ratio)
-        order = list(range(len(targets)))
+        n_grid = len(targets)
+        order = list(range(n_grid))
         if cfg.shuffle_targets:
             np.random.default_rng(cfg.random_seed).shuffle(order)
+        if getattr(cfg, "drift_checks", False):
+            # Checagens do centro: no início e a cada ``drift_check_every``
+            # alvos (cada uma com índice próprio, depois dos alvos da grade).
+            center = (screen_size[0] / 2, screen_size[1] / 2)
+            every = max(1, int(cfg.drift_check_every))
+            new_order = []
+            for j, idx in enumerate([None] + order):
+                if idx is not None:
+                    new_order.append(idx)
+                if idx is None or (j % every == 0):
+                    targets.append(center)
+                    new_order.append(len(targets) - 1)
+            order = new_order
         super().__init__(targets, screen_size, cfg.settle_s, cfg.collect_s,
                          cfg.min_samples_per_point, settle_max_s=cfg.settle_max_s,
                          fixation_window=cfg.fixation_window,
                          fixation_max_deg=cfg.fixation_max_deg, order=order)
         self.cfg = cfg
+        self.n_grid = n_grid       # índices >= n_grid são checagens do centro
         self.manual = bool(getattr(cfg, "manual", False))
         self.model: CalibrationModel | None = None
         self.raw_path: Path | None = None
@@ -530,6 +548,10 @@ class CalibrationProcedure(TargetProcedure):
                 else super().current_target())
 
     def status_line(self) -> str:
+        if not self.collecting_done and self.index >= self.n_grid and not self.in_head_stage \
+                and not self.in_mouth_stage:
+            return (f"Calibracao: ponto de referencia no centro ({self.pos + 1}/{len(self.order)})"
+                    "  -  ESC cancela")
         if self.retrying:
             return (f"Calibracao: repetindo alvos com erro alto ({self.pos + 1}/{len(self.order)})"
                     "  -  ESC cancela")
@@ -619,8 +641,14 @@ class CalibrationProcedure(TargetProcedure):
         data = CalibrationData()
         for i, t in enumerate(self.targets):
             feats, raws = self.arrays(i)
-            data.grid.append((t, feats, raws))
-            data.grid_obs.append(self.observations[i])
+            times = np.asarray(self.times[i], dtype=float)
+            if i < self.n_grid:
+                data.grid.append((t, feats, raws))
+                data.grid_obs.append(self.observations[i])
+                data.grid_times.append(times)
+            elif len(raws):
+                data.checks.append((t, feats, raws, times))
+                data.check_obs.append(self.observations[i])
         data.head_obs = self.head_observations
         if self.mouth_samples:
             data.mouth_target = self.head_target
@@ -669,6 +697,7 @@ class CalibrationProcedure(TargetProcedure):
                 for i in bad:
                     self.samples[i] = []
                     self.observations[i] = []
+                    self.times[i] = []
                 self.order = bad
                 self.pos = 0
                 self.restart_collection = True
@@ -715,9 +744,14 @@ class CalibrationProcedure(TargetProcedure):
                 f"Etapa da boca: abrir a boca deslocava ~{shift:.0f} px; agora e descontado")
         elif self.mouth_samples:
             self.message_lines.append("Etapa da boca: a boca nao abriu o suficiente; sem correcao")
+        if "deriva_centro_px" in st:
+            self.message_lines.append(
+                f"Deriva durante a calibracao: o centro variou ate {st['deriva_centro_px']:.0f} px"
+                + ("; descontada" if st.get("deriva_corrigida") else ""))
         if self.retried_targets:
             self.message_lines.append(f"{len(self.retried_targets)} alvo(s) repetido(s)")
-        self.message_lines.append("Branco = alvo, ponto colorido = estimativa. Use T para validar.")
+        self.message_lines.append("Branco = alvo, ponto colorido = estimativa. "
+                                  "Em seguida: validacao imediata.")
         print(f"[Calibração] Concluída. Erro médio de ajuste {errs.mean():.1f} px, "
               f"máx {errs.max():.1f} px. Estatísticas: "
               f"{ {k: v for k, v in st.items() if k not in ('candidatos', 'erro_loo_por_alvo_px', 'erro_loo_alvos')} }")
@@ -735,76 +769,152 @@ def _gating(calib_cfg: CalibrationConfig) -> dict:
 
 
 class ValidationProcedure(TargetProcedure):
-    """Mede acurácia e precisão em alvos NÃO usados na calibração."""
+    """Mede o erro em alvos NÃO usados na calibração.
+
+    Dois tipos:
+
+    * ``"imediata"``: roda sozinha logo depois da calibração. Mede o erro do
+      MODELO, sem tempo para a postura mudar.
+    * ``"reteste"`` (tecla T, mais tarde): mede também a DERIVA desde a
+      calibração. O primeiro alvo é o centro: o deslocamento medido nele é a
+      deriva, e o erro nos outros alvos é reportado bruto e depois de
+      reancorar por ele. No fim, a reancoragem é aplicada ao modelo (como a
+      recentralização), se não for grande demais.
+
+    O erro sai em px e em graus (com a distância do rosto medida pelo próprio
+    pipeline, se ``--distance-cm`` não for dado) e por região da tela.
+    """
 
     title = "Validacao"
 
     def __init__(self, screen_size, model: CalibrationModel, cfg: ValidationConfig,
-                 calib_cfg: CalibrationConfig):
+                 calib_cfg: CalibrationConfig, kind: str = "reteste"):
         targets = [(fx * screen_size[0], fy * screen_size[1]) for fx, fy in cfg.points]
         super().__init__(targets, screen_size, cfg.settle_s, cfg.collect_s,
                          calib_cfg.min_samples_per_point, **_gating(calib_cfg))
         self.cfg = cfg
+        self.kind = kind
+        self.title = "Validacao imediata" if kind == "imediata" else "Reteste"
         self.mad = calib_cfg.outlier_mad_threshold
+        self.max_frac = calib_cfg.recenter_max_frac
         self.model = model
         self.results: list[PointResult] = []
         self.summary: dict = {}
         self.csv_path: Path | None = None
+        self.applied_offset: np.ndarray | None = None
 
-    def _px_to_deg(self, px: float) -> float | None:
-        if not (self.cfg.screen_width_cm and self.cfg.viewing_distance_cm):
+    def _width_cm(self) -> float:
+        return float(self.cfg.screen_width_cm or self.model.screen.width_cm)
+
+    def _px_to_deg(self, px: float, distance_cm: float | None) -> float | None:
+        if not distance_cm or not np.isfinite(px):
             return None
-        cm = px * self.cfg.screen_width_cm / self.screen_w
-        return math.degrees(math.atan2(cm, self.cfg.viewing_distance_cm))
+        cm = px * self._width_cm() / self.screen_w
+        return math.degrees(math.atan2(cm, distance_cm))
+
+    def _region(self, target) -> str:
+        fx, fy = target[0] / self.screen_w - 0.5, target[1] / self.screen_h - 0.5
+        d = max(abs(fx), abs(fy))
+        return "centro" if d < 0.1 else ("intermediaria" if d <= 0.25 else "borda")
 
     def on_complete(self):
-        rows = []
-        accuracies, precisions = [], []   # NaN: olhar fora do plano da tela
+        rows, preds_all, n_ok = [], [], []
+        precisions = []
         raw_data = CalibrationData()
+        faces = []
         for i, target in enumerate(self.targets):
             feats, raws = self.arrays(i)
             raw_data.grid.append((target, feats, raws))
             raw_data.grid_obs.append(self.observations[i])
-            keep = outlier_mask(feats, self.mad)
-            s, raws = feats[keep], raws[keep]
-            preds = self.model.predict(raws)
-            fin = np.all(np.isfinite(preds), axis=1)
-            preds, s = preds[fin], s[fin]
+            raw_data.grid_times.append(np.asarray(self.times[i], dtype=float))
+            if len(raws):
+                keep = outlier_mask(feats, self.mad)
+                s, raws = feats[keep], raws[keep]
+                faces.append(raws[:, RAW_FACE])
+                preds = self.model.predict(raws)
+                fin = np.all(np.isfinite(preds), axis=1)
+                preds, s = preds[fin], s[fin]
+            else:
+                preds, s = np.zeros((0, 2)), np.zeros((0, 2))
             if not len(preds):
                 preds = np.full((1, 2), np.nan)
-            med = np.median(preds, axis=0)
-            pr = PointResult(target, (float(med[0]), float(med[1])), len(s))
-            self.results.append(pr)
-            accuracies.append(pr.error_px)
-            # Precisão: dispersão (RMS) das estimativas em torno da média.
+            preds_all.append(np.median(preds, axis=0))
+            n_ok.append(len(s))
             precisions.append(float(np.sqrt(np.mean(np.sum((preds - preds.mean(0)) ** 2, 1)))))
             for p, f in zip(preds, s):
                 rows.append([i, target[0], target[1], p[0], p[1], f[0], f[1],
                              float(np.hypot(p[0] - target[0], p[1] - target[1]))])
+        T = np.array(self.targets)
+        P = np.array(preds_all)
+        err = P - T
+        dist_err = np.hypot(*err.T)
+        self.results = [PointResult(tuple(t), (float(p[0]), float(p[1])), n)
+                        for t, p, n in zip(self.targets, P, n_ok)]
 
-        acc = float(np.nanmean(accuracies))
+        # Distância do rosto: a informada ou a medida pelo pipeline.
+        distance = self.cfg.viewing_distance_cm
+        if not distance and faces:
+            distance = float(np.median(np.vstack(faces)[:, 2]))
+        # Reancoragem pelo primeiro alvo (centro): deriva desde a calibração.
+        anchor = -err[0] if np.all(np.isfinite(err[0])) else np.zeros(2)
+        others = np.arange(1, len(T))
+        acc = float(np.nanmean(dist_err))
+        acc_others = float(np.nanmean(dist_err[others])) if len(others) else acc
+        acc_anchor = (float(np.nanmean(np.hypot(*(err[others] + anchor).T)))
+                      if len(others) else acc)
+        offset = np.nanmean(err, axis=0)
+        acc_recentered = float(np.nanmean(np.hypot(*(err - offset).T)))
         prec = float(np.nanmean(precisions))
-        errs = np.array([r.prediction for r in self.results]) - np.array(self.targets)
-        offset = np.nanmean(errs, axis=0)
-        acc_recentered = float(np.nanmean(np.hypot(*(errs - offset).T)))
+        regions: dict = {}
+        for t, e in zip(self.targets, dist_err):
+            regions.setdefault(self._region(t), []).append(e)
+        by_region = {k: float(np.nanmean(v)) for k, v in regions.items()}
+        minutes = None
+        if self.model.created_at:
+            try:
+                created = time.mktime(time.strptime(self.model.created_at, "%Y-%m-%d %H:%M:%S"))
+                minutes = (time.time() - created) / 60.0
+            except ValueError:
+                pass
+        deg = lambda px: self._px_to_deg(px, distance)  # noqa: E731
         self.summary = {
             "data": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "tipo": self.kind,
+            "minutos_desde_calibracao": minutes,
             "tela_px": [self.screen_w, self.screen_h],
+            "distancia_cm": distance,
             "n_alvos": len(self.targets),
             "acuracia_media_px": acc,
-            "acuracia_mediana_px": float(np.nanmedian(accuracies)),
+            "acuracia_media_graus": deg(acc),
+            "acuracia_mediana_px": float(np.nanmedian(dist_err)),
             "precisao_rms_media_px": prec,
-            "acuracia_media_graus": self._px_to_deg(acc),
-            "precisao_rms_media_graus": self._px_to_deg(prec),
-            # Deslocamento médio (constante) e a acurácia sem ele: quanto do
-            # erro a recentralização (R) corrigiria.
+            "precisao_rms_media_graus": deg(prec),
+            # Deriva desde a calibração (medida no centro, primeiro alvo) e o
+            # erro nos demais alvos depois de reancorar por ela.
+            "deriva_centro_px": (-anchor).tolist(),
+            "deriva_centro_graus": deg(float(np.hypot(*anchor))),
+            "acuracia_outros_px": acc_others,
+            "acuracia_reancorada_px": acc_anchor,
+            "acuracia_reancorada_graus": deg(acc_anchor),
+            # Desvio médio (constante) e a acurácia sem ele.
             "deslocamento_medio_px": offset.tolist(),
             "acuracia_sem_deslocamento_px": acc_recentered,
+            "por_regiao_px": by_region,
             "calibracao": {k: v for k, v in self.model.info.items()
-                           if k not in ("candidatos", "erro_loo_por_alvo_px", "erro_loo_alvos")},
-            "por_alvo": [{"alvo": r.target, "estimativa": r.prediction,
-                          "erro_px": r.error_px, "n": r.n_samples} for r in self.results],
+                           if k not in ("candidatos", "erro_loo_por_alvo_px", "erro_loo_alvos",
+                                        "checagens_centro_px")},
+            "por_alvo": [{"alvo": r.target, "estimativa": r.prediction, "regiao":
+                          self._region(r.target), "erro_px": r.error_px, "n": r.n_samples}
+                         for r in self.results],
         }
+
+        # Reteste: aplica a reancoragem ao modelo (como a recentralização).
+        if (self.kind == "reteste" and np.all(np.isfinite(anchor)) and np.any(anchor)
+                and abs(anchor[0]) <= self.max_frac * self.screen_w
+                and abs(anchor[1]) <= self.max_frac * self.screen_h):
+            self.model.offset = self.model.offset + anchor
+            self.applied_offset = anchor
+            self.summary["reancoragem_aplicada_px"] = anchor.tolist()
 
         self.cfg.results_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -821,20 +931,26 @@ class ValidationProcedure(TargetProcedure):
             json.dumps(self.summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
         self.succeeded = True
-        deg = self.summary["acuracia_media_graus"]
-        deg_s = f" (~{deg:.1f} graus)" if deg is not None else ""
-        self.message_lines = [
-            "Validacao concluida",
-            f"Acuracia (erro medio): {acc:.0f} px{deg_s}",
-            f"Precisao (RMS): {prec:.0f} px",
-            f"Desvio constante: ({offset[0]:+.0f}, {offset[1]:+.0f}) px;"
-            f" sem ele, {acc_recentered:.0f} px",
-            f"Salvo em results/{self.csv_path.name}",
-        ]
-        if acc - acc_recentered > 0.3 * acc:
-            self.message_lines.insert(-1, "Boa parte do erro e um desvio constante: R corrige")
-        print(f"[Validação] Acurácia {acc:.1f} px{deg_s}, precisão RMS {prec:.1f} px, "
-              f"sem desvio constante {acc_recentered:.1f} px. Resultados em {self.csv_path}")
+        fmt_deg = lambda px: (f" ({deg(px):.1f} graus)" if deg(px) is not None else "")  # noqa
+        reg = "  ".join(f"{k} {v:.0f}" for k, v in sorted(by_region.items()))
+        self.message_lines = [f"{self.title} concluida"
+                              + (f" ({minutes:.0f} min apos calibrar)" if minutes else ""),
+                              f"Erro medio: {acc:.0f} px{fmt_deg(acc)}   precisao RMS {prec:.0f} px",
+                              f"Por regiao (px): {reg}"]
+        if self.kind == "reteste":
+            self.message_lines += [
+                f"Deriva desde a calibracao (centro): {np.hypot(*anchor):.0f} px{fmt_deg(np.hypot(*anchor))}",
+                f"Erro nos outros alvos: {acc_others:.0f} px; reancorado pelo centro: {acc_anchor:.0f} px",
+                ("Reancoragem aplicada ao cursor" if self.applied_offset is not None
+                 else "Deriva grande demais para reancorar: recalibre (ESPACO)")]
+        else:
+            self.message_lines.append(
+                f"Desvio constante: ({offset[0]:+.0f}, {offset[1]:+.0f}) px;"
+                f" sem ele, {acc_recentered:.0f} px")
+        self.message_lines.append(f"Salvo em results/{self.csv_path.name}")
+        print(f"[{self.title}] erro {acc:.1f} px{fmt_deg(acc)}, precisão RMS {prec:.1f} px, "
+              f"deriva no centro {np.hypot(*anchor):.1f} px, reancorado {acc_anchor:.1f} px, "
+              f"por região {by_region}. Resultados em {self.csv_path}")
 
     def render_result(self, canvas):
         _draw_point_results(canvas, self.results, tol_px=0.05 * self.screen_w)

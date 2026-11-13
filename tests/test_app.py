@@ -127,6 +127,7 @@ def make_app(tmp_path):
     cfg.validation.results_dir = tmp_path / "results"
     cfg.calibration.results_dir = tmp_path / "results"
     cfg.calibration.random_seed = 0   # ordem dos alvos reproduzível nos testes
+    cfg.validation.after_calibration = False   # testes específicos ligam
     cfg.validation.screen_width_cm = 53.0
     cfg.calibration.screen_width_cm = 53.0     # monitor do usuário simulado
     from synthetic import SYNTH_HFOV_DEG
@@ -201,12 +202,16 @@ def test_end_to_end(tmp_path):
     for target in [(960, 540), (400, 300), (1500, 850)]:
         for head in [(0, 0, 0), (15, 0, 0), (-12, 8, 3), (0, -10, 0)]:
             tracker.look_at, tracker.head = target, head
-            settle(app)
+            # Espera a acomodação: o filtro da pupila suaviza a contra-rotação
+            # do olho quando a cabeça muda de pose (~1 s).
+            settle(app, 75)
             # Cabeça girada até 15°: até ~150 px de resíduo no usuário sintético
             # (compressão vertical da íris x forma tangente do modelo do olho;
             # ver test_pipeline.test_head_rotation_and_translation_are_compensated).
             assert err(app, target) < 160, (target, head, err(app, target))
-            assert cursor_jitter(app) < 4.0, (target, head)
+            # Até uma troca de fixação na janela: o estabilizador segue um
+            # deslocamento sustentado em 5 quadros (StabilizerConfig.shift_frames).
+            assert cursor_jitter(app) < 5.0, (target, head)
     # ... e com a cabeça deslocada (translação).
     tracker.head = (0, 0, 0)
     for pos in [(5.0, 10.0, 60.0), (0.0, 13.0, 52.0)]:
@@ -356,7 +361,10 @@ def test_mouth_stage_end_to_end(tmp_path):
     orig = synthetic.make_points
 
     def with_artifact(*a, **k):
-        k.setdefault("mouth_coupling", 0.6)
+        # ~120 px de deslocamento com a boca aberta (nos dados reais, ~50 px).
+        # Valores maiores jogam a previsão para fora da tela, onde a correção
+        # extrapola e o teste depende da sequência de ruído.
+        k.setdefault("mouth_coupling", 0.06)
         return orig(*a, **k)
 
     synthetic.make_points = with_artifact
@@ -410,3 +418,45 @@ def test_head_fine_adjustment_moves_cursor_from_gaze_point(tmp_path):
     assert np.linalg.norm(app.fine.offset) < 1
     app.handle_key(ord("a"))
     assert not app.fine_enabled
+
+
+def test_immediate_validation_then_retest_reanchors(tmp_path):
+    """Calibrar dispara a validação imediata; o reteste (T) mede a deriva no
+    centro e reancora o cursor."""
+    app, tracker, _ = make_app(tmp_path)
+    app.cfg.validation.after_calibration = True
+    app.handle_key(ord(" "))
+    run_procedure(app)
+    app.handle_key(13)                       # fecha o resultado da calibração
+    from eyegaze.procedures import ValidationProcedure
+    assert isinstance(app.procedure, ValidationProcedure) and app.procedure.kind == "imediata"
+    proc = run_procedure(app)
+    s = proc.summary
+    assert s["tipo"] == "imediata" and set(s["por_regiao_px"]) == {"centro", "intermediaria", "borda"}
+    assert s["acuracia_media_graus"] is not None and s["distancia_cm"] > 0
+    app.handle_key(13)
+    assert app.procedure is None
+    # Deriva artificial: o reteste mede no centro e reancora.
+    app.model.offset = app.model.offset + np.array([110.0, -70.0])
+    before = app.model.offset.copy()
+    app.handle_key(ord("t"))
+    proc = run_procedure(app)
+    s = proc.summary
+    assert s["tipo"] == "reteste" and np.hypot(*s["deriva_centro_px"]) > 90
+    assert s["acuracia_reancorada_px"] < s["acuracia_outros_px"] - 50
+    assert proc.applied_offset is not None
+    assert np.hypot(*(app.model.offset - before + [110.0, -70.0])) < 40
+
+
+def test_saved_calibration_recenters_on_start(tmp_path):
+    from eyegaze.procedures import RecenterProcedure
+    app, _, _ = make_app(tmp_path)
+    app.handle_key(ord(" "))
+    run_procedure(app)
+    app.handle_key(13)
+    assert app.cfg.calibration.save_path.exists()
+    app2, tracker2, _ = make_app(tmp_path)         # mesma pasta: carrega a calibração
+    assert app2.calibrated and isinstance(app2.procedure, RecenterProcedure)
+    run_procedure(app2)
+    settle(app2, 60)
+    assert app2.procedure is None

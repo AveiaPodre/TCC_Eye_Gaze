@@ -53,6 +53,7 @@ def make_points(gaze_yaw=0.0, gaze_pitch=0.0, head=(0.0, 0.0, 0.0),
                 gaze_vec=None, rho_true: float = RHO, v_scale: float = 1.0,
                 pitch_coupling: float = 0.0, lid_follow: float = 0.0,
                 mouth_open: float = 0.0, mouth_coupling: float = 0.0,
+                pupil_drift: float = 0.0,
                 perspective_cm=None) -> np.ndarray:
     """Landmarks sintéticos.
 
@@ -112,6 +113,13 @@ def make_points(gaze_yaw=0.0, gaze_pitch=0.0, head=(0.0, 0.0, 0.0),
 
     # Boca: lábio inferior desce com a abertura (largura entre cantos = 9).
     local[14] = local[14] + np.array([0.0, 9.0 * mouth_open, 0.0])
+    if pupil_drift:
+        # Deriva da medida da pupila (cm, vertical no referencial da cabeça):
+        # a íris "escorrega" em relação aos cantos sem o olho girar, como a
+        # deriva lenta observada nas calibrações reais.
+        for eye in (RIGHT_EYE, LEFT_EYE):
+            for k in (eye.iris_center,) + eye.iris_ring:
+                local[k] = local[k] + np.array([0.0, pupil_drift, 0.0])
     if mouth_coupling and mouth_open:
         shift = np.array([0.0, mouth_coupling * mouth_open * 3.0, 0.0])
         for eye in (RIGHT_EYE, LEFT_EYE):

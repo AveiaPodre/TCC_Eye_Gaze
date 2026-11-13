@@ -244,6 +244,21 @@ class EyeballModel:
                        X[0] if conv else None, float(gap[0]) if conv else None,
                        np.array(self._radii(raw)[0]))
 
+    def pupil_residual(self, raw, targets_cm) -> np.ndarray:
+        """(n, 2 olhos, 2 eixos) pupila medida menos a prevista pelo modelo
+        para quem olha para ``targets_cm`` (cm, no referencial da cabeça; NaN
+        com o olho fechado). Usado para medir a deriva da pupila."""
+        raw = np.atleast_2d(raw)
+        T = np.atleast_2d(np.asarray(targets_cm, dtype=np.float64))
+        R, A, P, op = self._parts(raw)
+        radii = self._radii(raw)
+        p = _rt(R, P - A)
+        tau = _rt(R, T[:, None, :] - self._centers(R, A, radii))
+        tan = tau[..., :2] / np.maximum(-tau[..., 2:3], 1e-6)
+        res = p[..., :2] - (self.c + (radii[..., None] / self.gain) * tan)
+        res[~op] = np.nan
+        return res
+
     # ------------------------------------------------------------ ajuste
     @classmethod
     def fit(cls, raw, targets_cm, weights=None, source: str = "mediapipe",

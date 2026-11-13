@@ -26,11 +26,12 @@ Este módulo mede, a cada quadro, tudo em cm no referencial da câmera
   iris_refine.py), levado a 3D pela linha de visada da câmera até o plano
   do olho (plano que passa pela âncora, perpendicular ao eixo z da cabeça).
   O z da íris do MediaPipe não é usado: é a coordenada mais ruidosa e, ao
-  girar a cabeça, contaminava as outras. A posição da pupila em relação à
-  âncora, no referencial da cabeça, passa por um filtro One-Euro
-  (GazeConfig.pupil_filter): o ruído dela vira graus no feixe, e filtrá-la
-  aqui estabiliza os feixes e a intersecção sem atrasar a rotação da
-  cabeça, que entra depois;
+  girar a cabeça, contaminava as outras. Para o FEIXE EXIBIDO (desenho e
+  HUD), a posição da pupila em relação à âncora passa por um filtro
+  One-Euro (GazeConfig.pupil_filter), que estabiliza os feixes e a
+  intersecção. O vetor bruto (cursor e calibração) leva a pupila sem
+  filtro: para o cursor, o estabilizador de fixação trata o ruído melhor e
+  sem atraso;
 * se cada olho está aberto (EAR relativo à linha de base de cada pessoa).
 
 O CENTRO DO GLOBO não aparece na imagem: ele fica num deslocamento fixo no
@@ -238,32 +239,44 @@ class GazeEstimator:
         ref = obs.iris_refined
         eyes = [self._eye(obs, head, float(face[2]), idx, None if ref is None else ref[k])
                 for k, idx in enumerate(EYES)]
+        nose = px3d_to_cm(obs.points[list(RIGID_NOSE)], (obs.image_width, obs.image_height),
+                          float(face[2])).mean(axis=0)
+        mouth = mouth_ratio(obs.points)
+
+        def pack(p_mp, p_ref):
+            return np.concatenate([head.R.reshape(-1), face,
+                                   eyes[0].anchor_cm, p_mp[0], eyes[1].anchor_cm, p_mp[1],
+                                   p_ref[0], p_ref[1],
+                                   [float(eyes[0].open), float(eyes[1].open), mouth], nose,
+                                   [eyes[0].width_cm, eyes[1].width_cm]])
+
+        # ``raw`` (cursor e calibração) leva a pupila SEM filtro: o
+        # estabilizador de fixação trata o ruído melhor e sem atraso (seção
+        # 4.1 da metodologia). O filtro vale só para o feixe exibido.
+        raw = pack([e.pupil_cm for e in eyes], [e.pupil_ref_cm for e in eyes])
+        raw_view = raw
         if self.cfg.pupil_filter:
             t = obs.timestamp_ms / 1000.0
             gap = self._last_t is None or not 0 < t - self._last_t <= self.cfg.pupil_filter_reset_s
             self._last_t = t
+            p_mp, p_ref = [], []
             for k, e in enumerate(eyes):
                 if gap or not e.open:
                     for src in range(2):
                         self._pupil_filters[(k, src)].reset()
                 if e.open:
-                    e.pupil_cm = self._filter_pupil((k, 0), e.pupil_cm, e.anchor_cm, head.R, t)
-                    e.pupil_ref_cm = self._filter_pupil((k, 1), e.pupil_ref_cm, e.anchor_cm,
-                                                        head.R, t)
-        nose = px3d_to_cm(obs.points[list(RIGID_NOSE)], (obs.image_width, obs.image_height),
-                          float(face[2])).mean(axis=0)
-        mouth = mouth_ratio(obs.points)
-        raw = np.concatenate([head.R.reshape(-1), face,
-                              eyes[0].anchor_cm, eyes[0].pupil_cm,
-                              eyes[1].anchor_cm, eyes[1].pupil_cm,
-                              eyes[0].pupil_ref_cm, eyes[1].pupil_ref_cm,
-                              [float(eyes[0].open), float(eyes[1].open), mouth], nose,
-                              [eyes[0].width_cm, eyes[1].width_cm]])
+                    p_mp.append(self._filter_pupil((k, 0), e.pupil_cm, e.anchor_cm, head.R, t))
+                    p_ref.append(self._filter_pupil((k, 1), e.pupil_ref_cm, e.anchor_cm,
+                                                    head.R, t))
+                else:
+                    p_mp.append(e.pupil_cm)
+                    p_ref.append(e.pupil_ref_cm)
+            raw_view = pack(p_mp, p_ref)
         extras = {"pose_source": pose_source, "boca": mouth,
                   "iris_refinada": ref is not None and bool(np.all(np.isfinite(ref)))}
         blink = not any(e.open for e in eyes)
         sample = GazeSample(obs.timestamp_ms, head, eyes, raw, blink=blink, extras=extras,
                             obs=obs)
         if not blink:
-            sample.gaze = self.eyeball.ray(raw)
+            sample.gaze = self.eyeball.ray(raw_view)
         return sample

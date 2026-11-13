@@ -349,6 +349,13 @@ class CalibrationData:
     mouth_features: np.ndarray | None = None
     mouth_raw: np.ndarray | None = None
     mouth_obs: list = field(default_factory=list)
+    # Instante (s) de cada amostra da grade (mesma ordem de ``grid``), para a
+    # correção de deriva.
+    grid_times: list = field(default_factory=list)
+    # Checagens do ponto central intercaladas na grade, para medir a deriva:
+    # lista de (alvo_px, features (n, 2), raw (n, RAW_SIZE), instantes (n,)).
+    checks: list = field(default_factory=list)
+    check_obs: list = field(default_factory=list)     # landmarks das checagens
     # Versão do layout das medidas gravadas (``raw``). Diferente da atual:
     # só serve depois de recalcular a partir dos landmarks.
     feature_version: int = FEATURE_VERSION
@@ -368,6 +375,15 @@ class CalibrationData:
             arrays[f"raw_{i}"] = np.atleast_2d(r)
             if i < len(self.grid_obs):
                 _pack_obs(arrays, f"obs_{i}", self.grid_obs[i])
+            if i < len(self.grid_times):
+                arrays[f"t_{i}"] = np.asarray(self.grid_times[i], dtype=float)
+        for k, (t, f, r, tt) in enumerate(self.checks):
+            arrays[f"chk_alvo_{k}"] = np.asarray(t, dtype=float)
+            arrays[f"chk_feats_{k}"] = np.atleast_2d(f)
+            arrays[f"chk_raw_{k}"] = np.atleast_2d(r)
+            arrays[f"chk_t_{k}"] = np.asarray(tt, dtype=float)
+            if k < len(self.check_obs):
+                _pack_obs(arrays, f"chk_obs_{k}", self.check_obs[k])
         if self.head_raw is not None:
             arrays["head_target"] = np.asarray(self.head_target, dtype=float)
             arrays["head_feats"] = np.atleast_2d(self.head_features)
@@ -388,7 +404,17 @@ class CalibrationData:
         while f"alvo_{i}" in z:
             data.grid.append((tuple(z[f"alvo_{i}"]), z[f"feats_{i}"], z[f"raw_{i}"]))
             data.grid_obs.append(_unpack_obs(z, f"obs_{i}"))
+            if f"t_{i}" in z:
+                data.grid_times.append(z[f"t_{i}"])
             i += 1
+        if len(data.grid_times) != len(data.grid):
+            data.grid_times = []
+        k = 0
+        while f"chk_alvo_{k}" in z:
+            data.checks.append((tuple(z[f"chk_alvo_{k}"]), z[f"chk_feats_{k}"],
+                                z[f"chk_raw_{k}"], z[f"chk_t_{k}"]))
+            data.check_obs.append(_unpack_obs(z, f"chk_obs_{k}"))
+            k += 1
         if "head_raw" in z:
             data.head_target = tuple(z["head_target"])
             data.head_features, data.head_raw = z["head_feats"], z["head_raw"]
@@ -473,6 +499,7 @@ def fit_from_samples(
     corrections: tuple[str, ...] | None = None,
     pupil_sources: tuple[str, ...] | None = None,
     anchors: tuple[str, ...] = ("misto",),
+    drift_correction: bool = True,
 ) -> tuple[CalibrationModel, list[PointResult], dict]:
     """Ajusta o pipeline. Devolve (modelo, resultados por alvo, estatísticas).
 
@@ -480,26 +507,56 @@ def fit_from_samples(
     usa ``assumed_width_cm`` e a correção absorve a diferença de escala.
     max_degree: 1 = correções até afim; 2 = também a quadrática.
     corrections / pupil_sources: restringem os candidatos (análises offline).
+    drift_correction: com as checagens do centro gravadas (``data.checks``),
+    desconta a deriva da pupila ao longo da grade (ver correct_drift).
     """
     if data.stale:
         raise ValueError("Medidas gravadas com outra versão do estimador; recalcule "
                          "a partir dos landmarks (tools/reavaliar.py).")
     screen = VirtualScreen(tuple(int(v) for v in screen_size),
                            float(screen_width_cm or assumed_width_cm))
-    raws, Ys, ws, gs, cleaned = [], [], [], [], []
+    has_times = len(data.grid_times) == len(data.grid) and len(data.grid) > 0
+    kept, cleaned = [], []    # (índice, raw, instantes) de cada alvo utilizável
     for i, (target, feats, raw) in enumerate(data.grid):
         raw = np.atleast_2d(raw)
         if len(raw) < 3 or raw.shape[1] != RAW_SIZE:
             continue   # alvo sem amostras suficientes (rosto perdido): ignora
-        r = raw[outlier_mask(feats, mad_threshold)]
+        keep = outlier_mask(feats, mad_threshold)
+        times = np.asarray(data.grid_times[i], dtype=float)[keep] if has_times else None
+        kept.append((i, raw[keep], times))
+    if not kept:
+        raise ValueError("Nenhum alvo com amostras suficientes para calibrar.")
+    checks = []
+    for t, f, r, tt in data.checks:
+        r = np.atleast_2d(r)
+        if len(r) >= 3 and r.shape[1] == RAW_SIZE:
+            keep = outlier_mask(f, mad_threshold)
+            checks.append((t, r[keep], np.asarray(tt, dtype=float)[keep]))
+    checks_orig = [(t, r.copy(), tt) for t, r, tt in checks]
+    drift_info: dict = {}
+    if drift_correction and has_times and len(checks) >= 2:
+        targets_px = [data.grid[i][0] for i, _, _ in kept]
+        new_raws, checks, drift_info = correct_drift(
+            [r for _, r, _ in kept], [tt for _, _, tt in kept], targets_px, checks, screen,
+            anchors[0])
+        kept = [(i, r, tt) for (i, _, tt), r in zip(kept, new_raws)]
+
+    raws, Ys, ws, gs = [], [], [], []
+    for i, r, _ in kept:
+        target = data.grid[i][0]
         cleaned.append((target, r))
         raws.append(r)
         Ys.append(np.tile(target, (len(r), 1)))
         ws.append(np.full(len(r), 1.0 / len(r)))   # cada alvo pesa 1
         gs.append(np.full(len(r), i))
-    if not raws:
-        raise ValueError("Nenhum alvo com amostras suficientes para calibrar.")
     grid_raw = np.vstack(raws)
+    # As checagens do centro também ensinam o globo: entram sempre no treino
+    # e, juntas, pesam como 1 alvo.
+    for t, r, _ in checks:
+        raws.append(r)
+        Ys.append(np.tile(t, (len(r), 1)))
+        ws.append(np.full(len(r), 1.0 / (len(r) * len(checks))))
+        gs.append(np.full(len(r), ALWAYS_TRAIN))
 
     stats_head: dict = {}
     hr, head_span = None, np.zeros(2)
@@ -611,12 +668,110 @@ def fit_from_samples(
         pred = np.nanmedian(model.predict(r), axis=0)
         results.append(PointResult(target, (float(pred[0]), float(pred[1])), len(r)))
 
+    if checks_orig:
+        # Onde o centro foi visto em cada checagem, pelo modelo final e SEM a
+        # correção de deriva: a variação entre elas é a deriva da calibração.
+        seen = np.array([np.nanmedian(model.predict(r), axis=0) - np.asarray(t, dtype=float)
+                         for t, r, _ in checks_orig])
+        model.info["checagens_centro_px"] = seen.tolist()
+        model.info["deriva_centro_px"] = float(np.nanmax(np.hypot(*(seen - seen[-1]).T)))
+        model.info["deriva_corrigida"] = bool(drift_info)
+        model.info.update(drift_info)
     fit_mouth_correction(model, data, grid_raw, mad_threshold)
     stats = dict(model.info)
     if has_head:
         err = np.hypot(*(model.predict(hr) - np.asarray(data.head_target)).T)
         stats["erro_mediano_cabeca_px"] = float(np.nanmedian(err))
     return model, results, stats
+
+
+PUPIL_COLS = {"mediapipe": ((15, 18), (21, 24)), "refinada": ((24, 27), (27, 30))}
+
+
+def correct_drift(grid_raws, grid_times, grid_targets, checks, screen, anchor="misto",
+                  iterations=2):
+    """Desconta a deriva da pupila ao longo da calibração.
+
+    Durante a grade, a posição medida da pupila em relação à âncora deriva
+    devagar (cansaço, olho ressecando, postura escorregando): nos dados
+    reais, a abertura do olho caiu de 0,27 para 0,16 em ~35 s. As checagens
+    do centro, intercaladas na grade, olham sempre para o mesmo ponto: a
+    diferença entre a pupila medida e a prevista pelo modelo em cada
+    checagem é a deriva naquele instante (por olho e eixo, no referencial
+    da cabeça, separando o efeito da cabeça pela geometria). Ajusta-se uma
+    tendência LINEAR no tempo a essas medidas (a deriva é lenta, e a reta
+    filtra o ruído de cada checagem), subtraída de cada amostra em relação
+    ao FIM da calibração: o modelo fica ajustado ao estado do fim da
+    calibração, o mais próximo do uso. O ajuste é repetido ``iterations``
+    vezes (o modelo usado para medir a deriva melhora com os dados
+    corrigidos). Cada fonte da pupila é corrigida à parte.
+
+    Devolve (raws da grade corrigidos, checagens corrigidas, informações)."""
+    grid_raws = [np.array(r, dtype=float) for r in grid_raws]
+    checks = [(t, np.array(r, dtype=float), np.asarray(tt, dtype=float)) for t, r, tt in checks]
+    T_grid = [np.repeat(screen.px_to_cm([t]), len(r), axis=0)
+              for t, r in zip(grid_targets, grid_raws)]
+    T_chk = [np.repeat(screen.px_to_cm([t]), len(r), axis=0) for t, r, _ in checks]
+    info = {}
+
+    def shift(raw, times, delta_fn, cols):
+        d = delta_fn(times)                                  # (n, 2 olhos, 2 eixos)
+        R = raw[:, RAW_R].reshape(-1, 3, 3)
+        for k, (a, b) in enumerate(cols):
+            dh = np.column_stack([d[:, k], np.zeros(len(raw))])
+            raw[:, a:b] -= np.einsum("nij,nj->ni", R, dh)
+
+    for src, cols in PUPIL_COLS.items():
+        total = None
+        for _ in range(iterations):
+            R_all = np.vstack(grid_raws + [r for _, r, _ in checks])
+            T_all = np.vstack(T_grid + T_chk)
+            w_all = np.concatenate([np.full(len(r), 1.0 / len(r)) for r in grid_raws]
+                                   + [np.full(len(r), 1.0 / (len(r) * len(checks)))
+                                      for _, r, _ in checks])
+            eb = EyeballModel.fit(R_all, T_all, w_all, src, anchor=anchor)
+            tk = np.array([np.median(tt) for _, _, tt in checks])
+            res = [eb.pupil_residual(r, T) for (_, r, _), T in zip(checks, T_chk)]
+            dk = np.nan_to_num(np.array([np.nanmedian(x, axis=0) for x in res]))
+            # Erro-padrão da mediana de cada checagem (dispersão robusta).
+            se = np.array([1.2533 * 1.4826 * np.nanmedian(np.abs(x - np.nanmedian(x, axis=0)),
+                                                          axis=0)
+                           / np.sqrt(max(np.sum(np.isfinite(x[:, :, 0]), axis=0).min(), 1))
+                           for x in res])
+            se = np.nan_to_num(se, nan=0.0)
+            # Tendência LINEAR no tempo (a deriva é lenta): com 5 checagens, a
+            # reta filtra o ruído de cada uma, que a interpolação ponto a ponto
+            # aplicaria como se fosse deriva. Só a inclinação importa: a
+            # correção é inclinação × (t − fim).
+            t_end = tk.max()
+            tc = tk - tk.mean()
+            ss = max(float(tc @ tc), 1e-9)
+            slope = (tc @ dk.reshape(len(tk), -1)).reshape(2, 2) / ss
+            # Só a deriva distinguível do ruído: a inclinação é encolhida por
+            # s²/(s² + 4·EP²), EP = erro-padrão da inclinação. Sem isso, num
+            # usuário sintético SEM deriva e com ruído realista nos landmarks,
+            # a "deriva" estimada do ruído dobrava o erro (26 -> 60 px).
+            var = ((tc ** 2) @ (se ** 2).reshape(len(tk), -1)).reshape(2, 2) / ss ** 2
+            # O filtro da pupila correlaciona amostras seguidas, e a dispersão
+            # DENTRO de cada checagem subestima o erro. Estimativa ENTRE as
+            # checagens: resíduo em torno da reta (K − 2 graus de liberdade).
+            if len(tk) > 2:
+                fit_line = dk.mean(axis=0) + tc[:, None, None] * slope
+                s2 = np.sum((dk - fit_line) ** 2, axis=0) / (len(tk) - 2)
+                var = np.maximum(var, s2 / ss)
+            slope = slope * slope ** 2 / np.maximum(slope ** 2 + 4.0 * var, 1e-18)
+
+            def delta_fn(times, slope=slope, t_end=t_end):
+                return (np.asarray(times, dtype=float) - t_end)[:, None, None] * slope
+
+            for r, tt in zip(grid_raws, grid_times):
+                shift(r, tt, delta_fn, cols)
+            for _, r, tt in checks:
+                shift(r, tt, delta_fn, cols)
+            step = float(np.abs(slope).max() * (t_end - tk.min()))
+            total = step if total is None else total + step
+        info[f"deriva_pupila_{src}_cm"] = float(total)
+    return grid_raws, checks, info
 
 
 MOUTH_MIN_RANGE = 0.04   # variação mínima de abertura na etapa da boca

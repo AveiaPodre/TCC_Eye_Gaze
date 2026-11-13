@@ -36,8 +36,12 @@ def test_targets_visited_in_random_order_and_all_collected(tmp_path):
     app.cfg.calibration.random_seed = 3
     app.handle_key(ord(" "))
     proc = app.procedure
-    assert sorted(proc.order) == list(range(16))
-    assert proc.order != list(range(16))          # não é linha a linha
+    grid = [o for o in proc.order if o < proc.n_grid]
+    assert sorted(grid) == list(range(16))
+    assert grid != list(range(16))                 # não é linha a linha
+    # Checagens do centro no início e a cada 4 alvos (controle de deriva).
+    assert [j for j, o in enumerate(proc.order) if o >= proc.n_grid] == [0, 5, 10, 15, 20]
+    assert all(proc.targets[o] == (960.0, 540.0) for o in proc.order if o >= proc.n_grid)
     visited = []
     for _ in range(4000):
         app.step()
@@ -304,21 +308,24 @@ def test_known_target_correction_reduces_drift(tmp_path):
     key = (700.0, 450.0)
     tracker.look_at = key
 
-    def error():   # erro médio dos quadros recentes (um quadro só é ruidoso)
-        return float(np.hypot(*(np.median(app.model.predict(np.array(app.recent_raw)), 0)
-                                - key)))
+    def error_vec():   # erro médio dos quadros recentes (um quadro só é ruidoso)
+        return np.median(app.model.predict(np.array(app.recent_raw)), 0) - key
 
     settle(app, 20)
-    base = error()
+    base = error_vec()
     app.model.offset = app.model.offset + np.array([100.0, -60.0])   # deriva artificial
-    errs = []
+    shift, errs = [], []
     for _ in range(8):                    # 8 "teclas" selecionadas no mesmo lugar
         settle(app, 20)
-        errs.append(error())
+        e = error_vec()
+        shift.append(float(np.hypot(*(e - base))))   # quanto o erro mudou com a deriva
+        errs.append(float(np.hypot(*e)))              # erro até o alvo
         step = app.confirm_target(key)
         assert step is not None and np.linalg.norm(step) <= app.cfg.adapt.max_step_px + 1e-6
-    assert errs[0] > base + 50                       # a deriva apareceu
-    assert np.mean(errs[-3:]) < base + 0.3 * (errs[0] - base)   # e foi quase toda corrigida
+    assert shift[0] > 80                              # a deriva apareceu (~117 px)
+    # A correção leva o erro TOTAL (deriva + erro de base) para perto de zero.
+    assert np.mean(errs[-3:]) < 0.3 * errs[0]
+    assert np.mean(errs[-3:]) <= float(np.hypot(*base)) + 15
 
 
 def test_wrong_selection_moves_offset_only_a_little(tmp_path):

@@ -43,26 +43,45 @@ def recompute(data: CalibrationData) -> CalibrationData:
     est = GazeEstimator(GazeConfig())
 
     def run(observations):
-        F, R, O = [], [], []
-        for o in observations:
+        F, R, O, idx = [], [], [], []
+        for i, o in enumerate(observations):
             s = est.estimate(o)
             if s.valid:
                 F.append(s.features())
                 R.append(s.raw)
                 O.append(o)
-        return np.array(F).reshape(-1, 2), np.array(R), O
+                idx.append(i)
+        return np.array(F).reshape(-1, 2), np.array(R), O, np.array(idx, dtype=int)
+
+    def times(tt, n_obs, idx):
+        # Instantes gravados correspondem às amostras válidas na gravação;
+        # só servem se a contagem bater com os landmarks.
+        tt = np.asarray(tt, dtype=float)
+        return tt[idx] if len(tt) == n_obs else None
 
     out = CalibrationData()
-    for (t, _, _), obs in zip(data.grid, data.grid_obs):
-        f, r, o = run(obs)
+    grid_times = []
+    for j, ((t, _, _), obs) in enumerate(zip(data.grid, data.grid_obs)):
+        f, r, o, idx = run(obs)
         out.grid.append((t, f, r))
         out.grid_obs.append(o)
+        if len(data.grid_times) == len(data.grid):
+            grid_times.append(times(data.grid_times[j], len(obs), idx))
+    if grid_times and all(g is not None for g in grid_times):
+        out.grid_times = grid_times
+    for (t, _, _, tt), obs in zip(data.checks, data.check_obs):
+        if obs:
+            f, r, o, idx = run(obs)
+            ct = times(tt, len(obs), idx)
+            if ct is not None and len(r):
+                out.checks.append((t, f, r, ct))
+                out.check_obs.append(o)
     if data.head_obs:
         out.head_target = data.head_target
-        out.head_features, out.head_raw, out.head_obs = run(data.head_obs)
+        out.head_features, out.head_raw, out.head_obs, _ = run(data.head_obs)
     if data.mouth_obs:
         out.mouth_target = data.mouth_target
-        out.mouth_features, out.mouth_raw, out.mouth_obs = run(data.mouth_obs)
+        out.mouth_features, out.mouth_raw, out.mouth_obs, _ = run(data.mouth_obs)
     out.feature_version = FEATURE_VERSION
     return out
 

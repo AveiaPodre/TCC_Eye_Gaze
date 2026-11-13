@@ -62,7 +62,10 @@ Fluxo recomendado:
 1. Sente-se como vai usar o computador, com o rosto bem iluminado e de frente
    para a câmera.
 2. Pressione **ESPAÇO** e olhe para cada um dos 16 alvos, que aparecem em
-   ordem aleatória. O círculo laranja encolhe enquanto o olho chega ao alvo.
+   ordem aleatória, intercalados com um **ponto de referência no centro**
+   (no início e a cada 4 alvos). As checagens do centro medem a deriva
+   (cansaço, postura escorregando) para descontá-la. O círculo laranja
+   encolhe enquanto o olho chega ao alvo.
    A coleta (ponto verde com anel de progresso) só começa quando o olhar
    estabiliza no alvo. Na **calibração manual** (tecla **C**), cada alvo só
    avança quando você, olhando para ele, aperta **ESPAÇO** (ou ENTER). São
@@ -89,10 +92,13 @@ Fluxo recomendado:
    novos (validação cruzada), quanto desse erro sobra só com o monitor
    virtual (sem a correção da etapa 5), o erro com a cabeça em poses novas
    e uma classificação da qualidade (boa / razoável / ruim).
-7. Pressione **T** para validar: 9 alvos novos, que não entram na
-   calibração, medem a acurácia e a precisão. O resultado vai para
-   `results/` e mostra também quanto do erro é um desvio constante, que o
-   **R** corrige.
+7. Em seguida vem a **validação imediata** (9 alvos novos): mede o erro do
+   modelo, em px e em graus, por região da tela. Mais tarde, a tecla **T**
+   faz o **reteste**: o primeiro ponto (centro) mede quanto o olhar derivou
+   desde a calibração, o relatório mostra o erro bruto e reancorado, e a
+   reancoragem é aplicada ao cursor. Os resultados vão para `results/`.
+   Ao abrir o app com uma calibração salva, uma recentralização de 1 ponto
+   roda sozinha antes do uso.
 8. Pressione **M** para ligar o mouse e **D** para ligar o clique por
    permanência (*dwell-click*).
 9. Se o HUD mostrar **"Postura fora da calibração"** (você se mexeu ou
@@ -125,7 +131,7 @@ automaticamente. Ela é descartada se a resolução da tela mudar.
 |---|---|
 | `ESPAÇO` | calibrar, automática (16 pontos + etapas da cabeça e da boca) |
 | `C` | calibrar, manual: cada alvo avança com ESPAÇO/ENTER enquanto você olha para ele |
-| `T` | validar (mede o erro em alvos novos e salva CSV/JSON em `results/`) |
+| `T` | reteste: mede a deriva desde a calibração e o erro em alvos novos, reancora o cursor e salva CSV/JSON em `results/` |
 | `R` | recentralizar (corrige deslocamento com 1 ponto) |
 | `M` | liga/desliga o controle do mouse (exige calibração) |
 | `D` | liga/desliga o dwell-click |

@@ -104,6 +104,10 @@ class EyeGazeApp:
                                         cfg.calibration.grid_rows, cfg.calibration.margin_ratio)
 
         self.procedure: TargetProcedure | None = None
+        if self.model is not None and cc.recenter_on_start:
+            # Calibração de outra sessão: reancora o desvio antes de usar.
+            self.procedure = RecenterProcedure(screen_size, self.model, cc)
+            print("[Calibração] Recentralizando: olhe para o ponto no centro.")
         self.sample: GazeSample | None = None
         self.obs = None
         self.screen_point: np.ndarray | None = None
@@ -251,13 +255,15 @@ class EyeGazeApp:
         self.toast("Calibracao manual: olhe e aperte ESPACO" if cc.manual
                    else "Calibracao iniciada")
 
-    def start_validation(self):
+    def start_validation(self, kind: str = "reteste"):
+        """kind: "imediata" (logo após calibrar) ou "reteste" (tecla T)."""
         if not self.calibrated:
             self.toast("Calibre primeiro (ESPACO)")
             return
         self.procedure = ValidationProcedure(self.screen_size, self.model,
-                                             self.cfg.validation, self.cfg.calibration)
-        self.toast("Validacao iniciada")
+                                             self.cfg.validation, self.cfg.calibration, kind)
+        self.toast("Validacao imediata" if kind == "imediata"
+                   else "Reteste: olhe primeiro para o centro")
 
     def start_recenter(self):
         if not self.calibrated:
@@ -276,10 +282,15 @@ class EyeGazeApp:
             self.stabilizer.reset()
             self.model.save(self.cfg.calibration.save_path)
             self.toast("Calibracao salva")
+            if self.cfg.validation.after_calibration:
+                self.start_validation("imediata")
+                return
         elif isinstance(proc, RecenterProcedure) and proc.succeeded:
             # A postura nova passa a ser a referência do aviso.
             self.model.save(self.cfg.calibration.save_path)
             self.toast("Recentralizado")
+        elif isinstance(proc, ValidationProcedure) and proc.applied_offset is not None:
+            self.model.save(self.cfg.calibration.save_path)
         elif isinstance(proc, RecenterProcedure) and proc.collecting_done:
             self.toast("Desvio grande demais: recalibre (ESPACO)", 4.0)
         self.posture_off, self._posture_off_since = False, None
