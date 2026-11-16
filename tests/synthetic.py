@@ -26,7 +26,6 @@ BASE = {
     151: (0.0, -6.0, 1.5), 9: (0.0, -3.5, 0.5), 8: (0.0, -2.5, 0.3),
     2: (0.0, 5.0, -1.5), 164: (0.0, 6.0, -0.8), 168: (0.0, -1.0, 0.0),
     6: (0.0, 0.5, -0.4), 197: (0.0, 1.5, -0.8),   # ponte do nariz
-    13: (0.0, 7.0, -1.2), 14: (0.0, 7.05, -1.2),   # lábios internos (boca fechada)
 }
 
 
@@ -52,7 +51,6 @@ def make_points(gaze_yaw=0.0, gaze_pitch=0.0, head=(0.0, 0.0, 0.0),
                 noise_px=0.0, rng: np.random.Generator | None = None,
                 gaze_vec=None, rho_true: float = RHO, v_scale: float = 1.0,
                 pitch_coupling: float = 0.0, lid_follow: float = 0.0,
-                mouth_open: float = 0.0, mouth_coupling: float = 0.0,
                 pupil_drift: float = 0.0,
                 perspective_cm=None) -> np.ndarray:
     """Landmarks sintéticos.
@@ -66,12 +64,8 @@ def make_points(gaze_yaw=0.0, gaze_pitch=0.0, head=(0.0, 0.0, 0.0),
         pitch da cabeça (perspectiva/pálpebra), em raios por radiano.
     lid_follow: quanto as pálpebras acompanham o deslocamento vertical
         verdadeiro do olho (a superior desce ao olhar para baixo).
-    mouth_open: abertura da boca (lábios / distância entre os cantos externos,
-        como head_pose.mouth_ratio).
-    mouth_coupling: artefato do MediaPipe observado nos dados reais: com a
-        boca aberta, a íris e as pálpebras "descem" (mouth_coupling x
-        abertura x largura do olho), e o olhar estimado desce sem o olho
-        se mover.
+    pupil_drift: deriva da medida da pupila (cm, vertical no referencial da
+        cabeça), sem o olho girar.
     perspective_cm: posição da cabeça (cm, referencial da câmera). Com ela,
         x e y são a projeção em PERSPECTIVA de cada ponto (como os landmarks
         reais do MediaPipe) e z é a profundidade relativa ao rosto na escala
@@ -111,8 +105,6 @@ def make_points(gaze_yaw=0.0, gaze_pitch=0.0, head=(0.0, 0.0, 0.0),
         for k, dx in zip((eye.lower_lid,) + eye.lower_lid_ring, (0, -0.4, 0, 0.4)):
             local[k] = on_ball(dx, lo_y)
 
-    # Boca: lábio inferior desce com a abertura (largura entre cantos = 9).
-    local[14] = local[14] + np.array([0.0, 9.0 * mouth_open, 0.0])
     if pupil_drift:
         # Deriva da medida da pupila (cm, vertical no referencial da cabeça):
         # a íris "escorrega" em relação aos cantos sem o olho girar, como a
@@ -120,12 +112,6 @@ def make_points(gaze_yaw=0.0, gaze_pitch=0.0, head=(0.0, 0.0, 0.0),
         for eye in (RIGHT_EYE, LEFT_EYE):
             for k in (eye.iris_center,) + eye.iris_ring:
                 local[k] = local[k] + np.array([0.0, pupil_drift, 0.0])
-    if mouth_coupling and mouth_open:
-        shift = np.array([0.0, mouth_coupling * mouth_open * 3.0, 0.0])
-        for eye in (RIGHT_EYE, LEFT_EYE):
-            for k in ((eye.iris_center,) + eye.iris_ring + (eye.upper_lid, eye.lower_lid)
-                      + eye.upper_lid_ring + eye.lower_lid_ring):
-                local[k] = local[k] + shift
     pts = rng.uniform([-6, -6, -1], [6, 7, 3], size=(478, 3))
     for k, v in local.items():
         pts[k] = v

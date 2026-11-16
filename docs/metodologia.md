@@ -11,9 +11,10 @@ metodologia do TCC.
 2. a partir dos landmarks, obter o **centro do globo ocular** e o **centro da
    pupila** de cada olho (seção 3.1);
 3. calcular o **feixe** de cada olho (do centro do globo, passando pela
-   pupila) e a **intersecção** dos dois feixes (seção 3.2);
-4. **projetar** o vetor do olhar (até a intersecção) no **monitor virtual**,
-   o plano da tela com a geometria suposta (seção 3.3);
+   pupila) (seção 3.2);
+4. **projetar** cada feixe no **monitor virtual**, o plano da tela com a
+   geometria suposta, e combinar os dois pontos numa média ponderada pela
+   qualidade de cada olho (seção 3.3);
 5. **calibrar** com vários pontos: ajustar o globo de cada olho e a correção
    entre o monitor virtual e o monitor real (seção 5).
 
@@ -24,8 +25,8 @@ move o mouse (seção 8).
 |---|---|
 | 1. landmarks | `face_tracker.py`, `head_pose.py` |
 | 2. globo e pupila | `gaze.py` (medidas), `eyeball.py` (modelo do globo) |
-| 3. feixes e intersecção | `eyeball.py`, `geometry.closest_point_between_rays` |
-| 4. monitor virtual | `geometry.VirtualScreen` |
+| 3. feixes | `eyeball.py` |
+| 4. monitor virtual | `geometry.VirtualScreen`, `EyeballModel.screen_points` |
 | 5. calibração | `calibration.py`, `procedures.py` |
 
 ## 1. Captura e landmarks (`face_tracker.py`)
@@ -172,8 +173,8 @@ Para cada olho, a cada quadro:
 referencial da cabeça, p = Rᵀ(P − A), passa por um filtro One-Euro (Casiez
 et al., 2012; corte mínimo 0,7 Hz, β = 10 cm⁻¹) antes de virar ângulo. O
 raio efetivo é pequeno (~0,3 cm, seção 5.6), então 0,01 cm de ruído da
-pupila vira ~2° no feixe: é daí que vinha a instabilidade dos feixes e da
-intersecção. Filtrar aqui suaviza só o movimento do olho; a rotação e a
+pupila vira ~2° no feixe: é daí que vinha a instabilidade dos feixes
+desenhados. Filtrar aqui suaviza só o movimento do olho; a rotação e a
 translação da cabeça entram depois (R e A) sem atraso. O filtro reinicia
 quando o olho fecha ou há um intervalo de mais de 0,3 s sem quadro. Nas
 sessões gravadas, o tremor quadro a quadro do ponto previsto caiu de 16
@@ -187,7 +188,7 @@ fixação na coleta). O cursor e a calibração usam a pupila sem filtro: o
 estabilizador de fixação cancela o ruído rápido sem atraso, e o filtro
 atrasava o cursor em ~47 ms (seção 4.1).
 
-### 3.2 Etapa 3: feixe de cada olho e intersecção
+### 3.2 Etapa 3: feixe de cada olho
 
 O **feixe** de cada olho sai do centro do globo na direção da pupila. No
 referencial da cabeça, com p = Rᵀ(P − A):
@@ -213,16 +214,18 @@ o globo tem o tamanho real e a compressão é tratada como o que ela é, um
 erro de medida da íris. A forma esférica (pupila = c + s·sen em vez de
 tan) foi testada antes e errou mais nos dados reais.
 
-A **intersecção** dos dois feixes é o ponto fixado. Duas retas no espaço
-quase nunca se cruzam exatamente, então a intersecção é o ponto médio do
-segmento perpendicular comum (`geometry.closest_point_between_rays`). O
-**vetor do olhar** sai do ponto médio entre os dois centros (o "olho
-ciclópico") e vai até a intersecção. Quando os feixes não convergem à
-frente do rosto (entre 5 e 400 cm ao longo de cada feixe), usa-se a
-bissetriz das duas direções. Com um olho fechado, usa-se o feixe do outro.
-Nas sessões gravadas, os feixes convergiram em 50–100% das amostras da
-grade, com a intersecção de 0 a 30 cm além do plano da tela. Usar sempre a
-bissetriz deu exatamente o mesmo erro.
+O **vetor do olhar** exibido sai do ponto médio entre os dois centros (o
+"olho ciclópico") na direção da bissetriz dos dois feixes (com um olho
+fechado, o feixe do outro).
+
+**Por que não a intersecção dos feixes (versão até 15/11).** Até então, o
+ponto fixado era a intersecção 3D dos dois feixes (ponto médio do segmento
+perpendicular comum), e o vetor do olhar ia até ela. Com ~6 cm entre os
+olhos e a tela a ~60 cm, a profundidade dessa intersecção é a coordenada
+mais sensível ao ruído: ela oscilava 4–5 cm com o olhar parado, os feixes
+convergiam à frente do rosto em só 50–100% das amostras, e usar sempre a
+bissetriz dava exatamente o mesmo erro. A intersecção foi substituída pela
+projeção de cada feixe (seção 3.3), como fazem os rastreadores comerciais.
 
 (yaw, pitch) do vetor do olhar, com o globo atual (anatômico ou calibrado),
 aparecem no HUD e servem para detectar fixações e rejeitar outliers na
@@ -240,10 +243,17 @@ z = 0 da câmera, com a webcam centralizada 1 cm acima da borda superior
 34,5 cm (notebook de 15,6" 16:9). Como a imagem não é espelhada, a borda
 esquerda da tela (para o usuário) fica em +x.
 
-A reta que sai da origem do olhar na direção do vetor do olhar é cruzada
-com esse plano, e o ponto atingido vira um pixel pela geometria pura:
+O **feixe de cada olho** é prolongado até esse plano, e cada ponto
+atingido vira um pixel pela geometria pura:
 
   x_px = L/2 − x_cm · px/cm        y_px = (y_cm − 1 cm) · px/cm
+
+O pixel do olhar é a **média ponderada** dos pixels dos dois olhos. O peso
+de cada olho é o inverso do seu erro angular de ajuste ao quadrado
+(inverso da variância), medido na calibração; antes de calibrar, os dois
+pesam igual. Com um olho fechado (ou com o feixe de um olho sem atingir a
+tela), vale o outro. Nas 33 calibrações gravadas até 13/11, um olho errava
+mais de 1,5× o outro em 7 sessões.
 
 Esse é o "pixel virtual". Antes de calibrar, ele é o próprio cursor. A
 etapa 5 aprende a correção entre ele e o pixel real.
@@ -254,14 +264,14 @@ O estimador entrega, por quadro, um vetor com tudo o que as etapas 2–5
 precisam, e é isso que é gravado nas sessões:
 
   raw = [R (9) | E (3) | A_d, P_d, A_e, P_e (12) | P_d e P_e refinadas (6) |
-         olho direito aberto, olho esquerdo aberto | abertura da boca |
-         ponte do nariz (3)]
+         olho direito aberto, olho esquerdo aberto | ponte do nariz (3) |
+         largura do olho direito e esquerdo]
 
-(A = meio dos cantos; as pupilas já filtradas.)
+(A = meio dos cantos; pupilas sem filtro.) A abertura da boca saiu do vetor
+em 16/11 (versão 10 das medidas), junto com a etapa da boca (seção 5.4).
 
 (d = olho direito, e = esquerdo; tudo em cm no referencial da câmera.) O
-globo, os feixes, a intersecção e o pixel virtual são recalculados a partir
-desse vetor, então as sessões gravadas podem ser reajustadas offline com
+globo, os feixes e o pixel virtual são recalculados a partir desse vetor, então as sessões gravadas podem ser reajustadas offline com
 outro modelo do globo.
 
 ### 3.5 Piscadas
@@ -480,9 +490,8 @@ modo só com o olhar continua sendo o padrão.
 
 ## 5. Etapa 5: calibração com vários pontos (`calibration.py`, `procedures.py`)
 
-A pessoa olha para alvos conhecidos (grade 4×4) e depois mantém o olhar no
-centro enquanto gira a cabeça. Com essas amostras, a calibração ajusta, em
-ordem:
+A pessoa olha para alvos conhecidos (grade 3×4, ~30 s). Com essas amostras,
+a calibração ajusta, em ordem:
 
 1. o **globo ocular** de cada olho (seção 5.2), que faz o feixe passar pelo
    alvo;
@@ -495,7 +504,7 @@ iterativa e sem mínimos locais.
 ### 5.1 Alvos no referencial da câmera
 
 Cada alvo da tela (pixel) vira um ponto 3D T no plano do monitor virtual
-(seção 3.3). Na etapa da cabeça, o alvo é sempre o centro da tela.
+(seção 3.3).
 
 ### 5.2 Ajuste do globo ocular
 
@@ -510,22 +519,24 @@ Para cada olho e cada eixo, é uma regressão linear com duas incógnitas:
 resolvida por mínimos quadrados ponderados **robustos** (Huber, k = 1,345,
 por repesagem iterativa em 4 passos): quadros em que a pessoa piscou,
 olhou para fora do alvo ou o landmark falhou pesam menos, em vez de puxar o
-globo. Cada alvo pesa 1, a etapa da cabeça inteira pesa 1 alvo, e uma
-regularização fraca (λ = 0,002 em unidades de tan²) puxa o ganho para 1,
+globo. Cada alvo pesa 1, e uma regularização fraca (λ = 0,002 em unidades de tan²) puxa o ganho para 1,
 com limites de 0,2 a 25. Como o centro depende de c e a direção até o alvo
 depende do centro, o ajuste é repetido duas vezes (a mudança é de
 milímetros a dezenas de cm).
 
 Do projeto de referência, foi considerado e descartado o "travamento" do
 globo num único quadro, olhando o centro da tela (centro = íris + raio na
-direção da câmera). Ele herda todo o ruído daquele quadro, e o ajuste em 16
-alvos mais a etapa da cabeça estima o mesmo centro com centenas de
-amostras.
+direção da câmera). Ele herda todo o ruído daquele quadro, e o ajuste em
+12 alvos estima o mesmo centro com centenas de amostras.
 
-A **etapa da cabeça** (olhar fixo, cabeça girando) entra no mesmo ajuste.
-É ela que separa o movimento do olho do movimento da cabeça: com o olhar
-fixo, a direção até o alvo no referencial da cabeça muda só pela rotação da
-cabeça, e o ajuste aprende quanto a pupila contra-rotaciona.
+O mesmo ajuste dá o **peso de cada olho** no ponto da tela (seção 3.3): o
+inverso do erro angular médio do olho ao quadrado, nas amostras de ajuste.
+
+Até 15/11, a **etapa da cabeça** (olhar fixo, cabeça girando) também
+entrava neste ajuste, para separar o movimento do olho do da cabeça. Nas 40
+sessões gravadas, treinar com ela melhorava a validação em só ~3 px e o
+erro com a cabeça em poses novas em ~12 px: a rotação da cabeça já entra
+pela geometria (R). Ela passou a ser só um teste (seção 5.4).
 
 ### 5.3 Correção monitor virtual → monitor real
 
@@ -551,15 +562,42 @@ o refinamento (desligado ou indisponível), usa-se a do MediaPipe.
 
 ### 5.4 Coleta
 
-**Etapa 1, grade 4×4 com checagens do centro:** margem de 5% e **ordem
-aleatória**. Alvos colados na borda não ajudariam: ali a pálpebra cobre a
-íris e o MediaPipe é menos preciso. Na ordem linha a linha, o tempo andava
-junto com a posição vertical: nos dados reais, a abertura do olho caiu de
-0,27 para 0,16 ao longo dos ~35 s da grade (cansaço, olho ressecando), e o
-modelo aprendia essa deriva como "olhar para baixo". Com a ordem aleatória,
-a deriva vira ruído em vez de viés, e as **checagens do centro** permitem
-medi-la e descontá-la (seção 5.4.1): um ponto no centro da tela aparece no
-início e a cada 4 alvos (5 checagens, ~10 s a mais).
+**Grade 3×4 (3 colunas, 4 linhas):** margem de 5% e **ordem aleatória**. Alvos colados na borda
+não ajudariam: ali a pálpebra cobre a íris e o MediaPipe é menos preciso.
+Na ordem linha a linha, o tempo andava junto com a posição vertical: nos
+dados reais, a abertura do olho caiu de 0,27 para 0,16 ao longo dos ~35 s
+da grade 4×4 (cansaço, olho ressecando), e o modelo aprendia essa deriva
+como "olhar para baixo". Com a ordem aleatória, a deriva vira ruído em vez
+de viés.
+
+**Quantos alvos.** `tools/ablacao.py` ajusta o pipeline com k alvos
+sorteados de cada calibração gravada (grade 4×4) e mede o erro na validação
+gravada logo depois (10 sessões, 5 sorteios por sessão; validação bruta e,
+entre parênteses, sem o desvio constante):
+
+| Alvos no ajuste | validação (px) |
+|---|---|
+| 6 | 158 (93) |
+| 9 | 153 (87) |
+| 12 | 151 (82) |
+| 16 | 148 (80) |
+
+Com 12 alvos sorteados a validação é a mesma de 16. Com grades REGULARES
+de 12 alvos tiradas da 4×4 (mesmas 40 sessões; erro nos alvos fora do
+ajuste e validação):
+
+| Grade | alvos fora do ajuste | validação (px) |
+|---|---|---|
+| 4×4 (16) | 119 (LOO) | 148 (80) |
+| 4×3, sem a 2ª linha | 125 | 157 (83) |
+| 4×3, sem a 3ª linha | 112 | 155 (83) |
+| **3×4, sem a 2ª coluna** | **121** | **148 (79)** |
+| 3×3 (9) | 121 | 159 (89) |
+
+Tirar uma coluna não muda nada; tirar uma linha piora ~5%: o eixo vertical
+tem o sinal mais fraco e precisa das 4 linhas. A grade passou para 3×4
+(de ~45–60 s para ~25–30 s, contando as checagens do centro que
+existiam).
 
 Para cada alvo, a coleta começa quando o olhar **fixa** no alvo: depois de
 0,6 s de acomodação, espera-se que 6 quadros seguidos fiquem a menos de 0,8°
@@ -570,18 +608,19 @@ válidas. Se o rosto sumir, o alvo espera até juntar pelo menos 8 amostras.
 Em cada alvo, amostras com escore-Z modificado (MAD) > 3,5 são descartadas
 (Iglewicz e Hoaglin, 1993).
 
-**Etapa 2, movimento da cabeça (guiada):** o alvo fica no centro da tela e
-uma seta pede que a pessoa gire a cabeça para a direita, a esquerda, para
-cima e para baixo, sem tirar o olho do alvo, e depois volte ao centro. A
-seta enche conforme a cabeça gira (medida em relação à pose mediana durante
-a grade) e fica verde ao chegar a 80% do ângulo pedido (10° de yaw e 8° de
-pitch). Depois de 0,6 s ali, passa à próxima direção. Quem não alcança o
-ângulo segue depois de 4 s, e quem não pode mover a cabeça só continua
-olhando o ponto. Se a cabeça passar da faixa aproveitada (15° de yaw, 12° de
-pitch), a seta fica vermelha e aparece "girou demais". Só entram no ajuste
-as amostras dentro dessa faixa: sem guia, as pessoas giravam até 30° (yaw)
-e 40° (pitch), ângulos em que os landmarks do olho deixam de ser
-confiáveis.
+**Etapa da cabeça (só no modo pesquisa, `--pesquisa` ou `--gravar`):** o
+alvo fica no centro da tela e uma seta pede que a pessoa gire a cabeça para
+a direita, a esquerda, para cima e para baixo, sem tirar o olho do alvo, e
+depois volte ao centro. A seta enche conforme a cabeça gira (medida em
+relação à pose mediana durante a grade) e fica verde ao chegar a 80% do
+ângulo pedido (10° de yaw e 8° de pitch). Depois de 0,6 s ali, passa à
+próxima direção. Quem não alcança o ângulo segue depois de 4 s. Se a
+cabeça passar de 15° de yaw ou 12° de pitch, a seta fica vermelha e
+aparece "girou demais": sem guia, as pessoas giravam até 30° (yaw) e 40°
+(pitch), ângulos em que os landmarks do olho deixam de ser confiáveis.
+Essas amostras **não entram no ajuste**: medem o erro com a cabeça em
+poses novas (seção 5.5). No modo usuário (padrão) a etapa não existe: ela
+é inadequada para quem não consegue mover a cabeça.
 
 **Calibração manual (tecla C).** Cada alvo só avança quando o usuário,
 olhando para ele, aperta ESPAÇO ou ENTER. As amostras usadas são as de 1 s
@@ -589,21 +628,22 @@ olhando para ele, aperta ESPAÇO ou ENTER. As amostras usadas são as de 1 s
 tecla é comum piscar ou olhar para o teclado. A confirmação é recusada (com
 aviso) se o olhar ainda se movia nessa janela (80% das amostras a mais de
 1,6° da mediana) ou se faltam amostras, e ignorada nos primeiros 0,5 s do
-alvo. As etapas da cabeça e da boca continuam automáticas. Ela não
-substitui a automática: o público do projeto (pessoas com deficiência
+alvo. Ela não substitui a automática: o público do projeto (pessoas com deficiência
 motora) muitas vezes não consegue apertar uma tecla a cada alvo.
 
-**Etapa 3, boca:** o ponto fica no centro e a pessoa abre e fecha a boca
-devagar (≥ 4 s; segue em 7 s se a boca não abrir). O MediaPipe estima a
-malha inteira de uma vez, e abrir a boca contamina a pose da cabeça e os
-pontos do olho: na sessão de 12/11 09:47, com o olhar fixo num alvo
-conhecido, o ponto estimado descia ~50 px nos quadros de boca aberta. Na
-etapa da boca o olhar está fixo, então todo deslocamento da previsão que
-acompanha a abertura é artefato. Ajusta-se esse deslocamento por unidade
-de abertura acima da abertura típica da grade (mínimos quadrados pela
-origem, com rejeição de outliers e descontando o desvio com a boca
-fechada), e a previsão passa a descontá-lo (`fit_mouth_correction`). Sem a
-etapa, ou se a boca quase não abriu (variação < 0,04), a correção é zero.
+**Etapas removidas em 16/11.** A calibração tinha mais duas etapas:
+
+- *Boca* (~4–7 s): olhar fixo no centro, boca abrindo e fechando, para
+  aprender quanto a abertura da boca desloca a estimativa (o MediaPipe
+  deforma a malha inteira; com o olhar fixo, o ponto descia ~50 px de boca
+  aberta) e descontar. Nas 40 sessões, a correção não mudou nenhuma métrica
+  (LOO, cabeça e validação idênticos com e sem ela), porque só age de boca
+  aberta, e o benefício de boca aberta nunca foi medido.
+- *Checagens do centro* (5 pontos, ~10 s) para medir a deriva da pupila ao
+  longo da grade e descontá-la por uma tendência linear (seção 5.4.1). Nas
+  6 sessões com checagens, o LOO melhorou 8% e a validação piorou 6%:
+  inconclusivo. Com a grade 3×4, a calibração ficou curta o bastante para
+  derivar menos.
 
 **Repetição de alvos ruins:** depois do ajuste, alvos com erro na validação
 cruzada acima de 2,5× a mediana e acima de 8% da largura da tela (até 3
@@ -616,63 +656,41 @@ o estimador atual e avalia variantes do pipeline em todas as sessões
 gravadas. `tools/reavaliar.py` detalha uma sessão (globo ajustado,
 convergência dos feixes, erro por alvo na validação).
 
-#### 5.4.1 Correção da deriva (`calibration.correct_drift`)
+#### 5.4.1 Correção da deriva (removida em 16/11)
 
-Nas checagens a pessoa olha sempre para o mesmo ponto conhecido. Com o
-globo ajustado, a diferença entre a pupila medida e a prevista em cada
-checagem (por olho e eixo, no referencial da cabeça, o que separa o efeito
-da cabeça pela geometria) é a deriva da medida naquele instante. A
-calibração:
-
-1. ajusta uma **tendência linear no tempo** a essas 5 medidas (a deriva é
-   lenta; a reta filtra o ruído de cada checagem);
-2. **encolhe** a inclinação por s²/(s² + 4·EP²), onde EP é o erro-padrão da
-   inclinação (o maior entre a dispersão dentro das checagens e o resíduo
-   entre elas, já que o filtro da pupila correlaciona amostras seguidas).
-   Uma deriva bem acima de 2 erros-padrão passa quase inteira; o ruído
-   puro, quase nada;
-3. subtrai de cada amostra da grade inclinação × (t − t_fim): o modelo fica
-   ajustado ao **estado do fim da calibração**, o mais próximo do uso;
-4. repete duas vezes (o globo usado para medir a deriva melhora com os
-   dados corrigidos), para cada fonte da pupila.
-
-A tela de resultado mostra quanto o centro "andou" entre as checagens. No
-usuário sintético cuja pupila deriva linearmente ao longo da grade
-(mediana de 20 quadros por alvo, mesmas amostras para os dois modelos,
-média de 4 sementes; erro no estado do fim, em px):
-
-| Deriva da pupila na grade | sem correção | com correção |
-|---|---|---|
-| nenhuma, sem ruído | 25 | 25 |
-| nenhuma, ruído de 0,3 px nos landmarks | 27 | 27 |
-| 0,02 cm, com ruído | 63 | 27 |
-| 0,04 cm, com ruído | 102 | 27 |
-| 0,08 cm, com ruído | 168 | 27 |
-
-As sessões gravadas até 13/11 não têm checagens intercaladas, então o ganho
-com dados reais ainda não foi medido (`tools/benchmark.py` passa a medi-lo
-nas calibrações novas). A deriva DEPOIS da calibração é tratada na
-validação (reteste) e na recentralização (seções 6 e 7).
+Nas checagens do centro a pessoa olhava sempre para o mesmo ponto. A
+diferença entre a pupila medida e a prevista em cada checagem (por olho e
+eixo, no referencial da cabeça) era a deriva naquele instante; a calibração
+ajustava uma tendência linear no tempo a essas 5 medidas, encolhida por
+s²/(s² + 4·EP²) para não tomar ruído por deriva, e a subtraía de cada
+amostra em relação ao fim da calibração. No usuário sintético com deriva
+linear da pupila, o erro no estado do fim caía de 102 para 27 px (deriva de
+0,04 cm). Com dados reais o ganho não se confirmou (seção 5.4). A deriva
+DEPOIS da calibração continua tratada na validação (reteste) e na
+recentralização (seções 6 e 7).
 
 ### 5.5 Escolha e erro em pontos e poses novos
 
-A fonte da pupila, o tipo de correção e a força do ridge são escolhidos por
-**validação cruzada deixando um alvo de fora**: para cada alvo, o globo E a
+O tipo de correção e a força do ridge são escolhidos por **validação
+cruzada deixando um alvo de fora**: para cada alvo, o globo E a
 correção são reajustados sem ele, e o erro é a distância da mediana das
 previsões ao alvo (pontos novos, cabeça parada). Fica a combinação de menor
 erro médio.
 
-A etapa da cabeça também é dividida pela direção dominante do desvio de
-pose (direita, esquerda, cima, baixo). Cada direção fica fora do ajuste por
-vez, e o erro é a mediana das distâncias de suas amostras ao alvo central
-(poses novas da cabeça). Amostras a menos de 2° da pose da grade ficam
-sempre no treino. Esse erro é reportado, mas não entra na escolha: como o
-alvo da etapa é sempre o centro, ele favoreceria correções que encolhem a
-previsão para o centro da tela.
+Nas 40 sessões, fixar a correção (quadrática ou afim, α = 0,01) deu a
+mesma validação (148 px) mas LOO pior (125 e 136 contra 119 px); a escolha
+custa ~0,1 s e foi mantida.
+
+**Cabeça em poses novas.** No modo pesquisa, as amostras da etapa da cabeça
+(que não entram no ajuste) são divididas pela direção dominante do desvio
+de pose (direita, esquerda, cima, baixo), descartadas as a menos de 2° da
+pose da grade ou além de 15°/12°. O erro de cada direção é a mediana das
+distâncias de suas amostras ao alvo central, e o reportado é a média das
+direções (`erro_cabeca_px`).
 
 A tela de resultado mostra o erro em pontos novos, o erro só com o monitor
 virtual (sem correção, para ver quanto a etapa 5 corrige), o erro com a
-cabeça em poses novas e uma classificação da qualidade (boa até 4,5% da
+cabeça em poses novas (modo pesquisa) e uma classificação da qualidade (boa até 4,5% da
 largura da tela, razoável até 8%, ruim acima disso).
 
 ### 5.6 Resultados nas sessões gravadas
@@ -695,6 +713,28 @@ com 90° (seção 3). Erros médios em px (média das sessões):
 | versão de 12/11 (pupila escolhida entre as duas; 28 sessões) | 133 | 332 | 190 (88) |
 | versão anterior (escala do MediaPipe, "globo menor"; 26 sessões) | 134 | 330 | 146 (87) |
 | modelo de regressão (seção 5.7; 25 sessões) | 118 | 374 | 113 (~100) |
+
+**Versão de 16/11** (40 calibrações, 10 com validação; grade gravada 4×4;
+o erro "cabeça" passou a ser medido com a etapa da cabeça FORA do ajuste,
+então não é comparável à coluna acima):
+
+| Variante | LOO | cabeça (teste) | validação (sem desvio) |
+|---|---|---|---|
+| versão de 15/11 (intersecção dos feixes, etapas da boca e da deriva) | 118 | — | 151 (82) |
+| **16/11: ponto de cada olho na tela, média ponderada; sem boca e deriva** | **119** | **290** | **148 (80)** |
+| olhos com peso igual | 118 | 289 | 151 (82) |
+| correção quadrática fixa (α = 0,01) | 125 | 294 | 148 (82) |
+| correção afim fixa (α = 0,01) | 136 | 282 | 148 (83) |
+| só o monitor virtual | 153 | 307 | 160 (94) |
+| pupila só do MediaPipe | 146 | 312 | 180 (105) |
+| pupila só refinada | 133 | 334 | 151 (90) |
+
+Remover as etapas da boca e da deriva e trocar a intersecção pela projeção
+de cada feixe não piorou nada; a validação melhorou 3 px. Em graus, com a
+distância medida pelo pipeline (mediana de 39 cm, que depende do campo de
+visão suposto de 90°): LOO 3,0°, validação 3,9° (2,1° sem o desvio
+constante). Com a distância real, informada em `tools/benchmark.py
+--distance-cm`, os graus serão menores se a pessoa estava mais longe.
 
 Em relação à versão anterior, o erro em pontos novos e com a cabeça em
 poses novas é o mesmo, e a validação sem o desvio constante também; a
@@ -856,80 +896,120 @@ Conclusões:
 ## 6. Validação (`procedures.py` → `ValidationProcedure`)
 
 A validação usa **9 alvos diferentes dos da calibração** (centro,
-intermediários e bordas) e acontece em dois momentos, que medem coisas
-diferentes:
+intermediários e bordas) e acontece em dois momentos:
 
-- **Validação imediata**: roda sozinha logo depois da calibração
-  (`ValidationConfig.after_calibration`). Mede o erro do **modelo**, sem
-  tempo para a postura mudar.
-- **Reteste** (tecla `T`, mais tarde): mede também a **deriva** desde a
-  calibração. O primeiro alvo é o centro: o deslocamento medido nele é a
-  deriva, e o erro nos outros 8 alvos é reportado bruto e **reancorado**
-  (descontando a deriva do centro). No fim, a reancoragem é aplicada ao
-  cursor, como na recentralização (se for menor que 25% da tela; senão o
-  relatório pede para recalibrar).
+- **Validação imediata** (modo pesquisa): roda sozinha logo depois da
+  calibração (`ValidationConfig.after_calibration`) e só mede.
+- **Reteste** (tecla `T`, mais tarde): mede e **corrige o desvio médio** dos
+  alvos no cursor (se for menor que 25% da tela; senão o relatório pede
+  para recalibrar).
+
+**Por que a validação imediata continua (modo pesquisa).** Nas 15 sessões
+com validação gravada até 16/11, o erro em pontos novos estimado na própria
+calibração (LOO) quase não previa o erro da validação: correlação de 0,09
+com o erro bruto e 0,43 com o erro sem o desvio constante. O erro da
+validação é dominado por um **desvio constante** de ~106 px em média, que
+aparece segundos depois de calibrar e varia de sessão para sessão (de 7 a
+332 px). A postura mal muda nesse intervalo (em geral < 2° e < 1 cm), mas
+o desvio acompanha o deslocamento vertical do rosto (correlação 0,68 com o
+desvio em y): pequenas mudanças de postura viram desvios grandes. Só a
+validação mede isso; por isso ela fica no modo pesquisa (no modo usuário,
+não existe).
 
 Métricas, padrão em rastreamento ocular:
 
 - **Acurácia**: distância média entre o alvo e a mediana das estimativas
   (erro sistemático);
-- **Precisão (RMS)**: dispersão das estimativas em torno da própria média
-  (ruído);
-- **por região da tela**: centro, intermediária (até 25% do centro) e
-  bordas;
-- o **deslocamento médio** (erro constante) e a acurácia sem ele.
+- **Precisão**: RMS em torno da própria média (desvio) e **RMS amostra a
+  amostra** (RMS-S2S, o tremor quadro a quadro);
+- **Perda de dados**: fração dos quadros da coleta sem amostra válida
+  (rosto perdido, piscada);
+- por região da tela: centro, intermediária (até 25% do centro) e bordas;
+- o **desvio médio** (constante), a acurácia sem ele (dentro da amostra) e
+  a **acurácia recentralizada**: cada alvo corrigido pela média dos erros
+  dos OUTROS alvos (validação cruzada), o erro que sobra depois de uma
+  recentralização com vários pontos.
 
 Todos os valores também saem em **graus de ângulo visual**,
 θ = atan(erro_cm / distância_cm), com a largura física da tela e a
 distância do rosto medida pelo próprio pipeline (ou `--distance-cm`).
-Graus permitem comparar com a literatura e entre telas diferentes.
 
 Cada validação gera três arquivos em `results/`:
 
 - `validacao_<data>.csv`: uma linha por amostra (alvo, estimativa, ângulos,
   erro);
 - `validacao_<data>.json`: resumo com o tipo (imediata ou reteste), os
-  minutos desde a calibração, as métricas acima, a deriva no centro, a
-  reancoragem aplicada e o resumo da calibração usada;
+  minutos desde a calibração, as métricas acima, a correção aplicada e o
+  resumo da calibração usada;
 - `validacao_<data>.npz`: medidas brutas, instantes e landmarks, para
   reanálise.
 
-## 7. Recentralização (`RecenterProcedure`)
+## 7. Correção do desvio constante
 
-O pipeline compensa rotação e translação da cabeça pela geometria. Ainda
-assim, sobram deslocamentos sistemáticos: erro na distância estimada pelo
-MediaPipe, a pupila que quase não contra-rotaciona na vertical (seção 5.6),
-mudança grande de postura, óculos que escorregam. A recentralização mostra
-só o alvo central, mede o deslocamento entre a estimativa e o centro e o
-soma como um *offset* ao pixel do monitor real, sem refazer a calibração. A
-postura em que se recentralizou passa a ser a referência do aviso de
-postura.
+Como o desvio constante domina o erro no uso, o app tem três formas de
+corrigi-lo, todas somando um *offset* ao pixel do monitor real, sem refazer
+a calibração. O que os dados dizem sobre cada uma vem das validações
+gravadas (15 sessões; o erro em cada alvo depois de corrigir o desvio
+estimado com outros alvos):
 
-Ao abrir o app com uma calibração salva (de outra sessão), a
-recentralização roda **automaticamente** antes do uso
-(`CalibrationConfig.recenter_on_start`): a postura e a posição da pessoa
-mudam de uma sessão para outra, e esse desvio constante era a maior parte
-do erro nas validações feitas depois de calibrar.
+| Desvio estimado com | erro nos demais alvos |
+|---|---|
+| nada | 138 px |
+| 1 ponto (o centro) | 147 px |
+| 2 pontos | 103 px |
+| 3 pontos | 96 px |
+| 5 pontos | 91 px |
+| 8 pontos | 88 px |
 
-### 7.1 Aviso de postura
+Com um ponto só a correção **piora** o erro (a estimativa de um ponto tem
+o próprio erro do modelo naquele lugar, de 50-100 px); com 3 ou mais, ele
+cai ~30%.
+
+### 7.1 Recentralização (`RecenterProcedure`, tecla `R`)
+
+Mostra **4 alvos** (30%/70% da largura e da altura, em ordem aleatória;
+`CalibrationConfig.recenter_points`, ~9 s), mede o erro em cada um e soma a
+**média** como offset. Até 16/11 era só o centro, o que piorava o erro em
+média. A tela de resultado mostra também a dispersão entre os 4 erros (uma
+dispersão alta indica que o desvio não é constante e que vale recalibrar).
+Desvios maiores que 25% da tela não são aplicados. A postura em que se
+recentralizou passa a ser a referência do aviso de postura.
+
+Ao abrir o app com uma calibração salva, a recentralização roda
+**automaticamente** antes do uso (`CalibrationConfig.recenter_on_start`).
+
+### 7.2 Aviso de postura
 
 O modelo guarda a pose média da cabeça e a posição do rosto durante a
-calibração, além da faixa de giro coberta pela etapa da cabeça. Durante o
-uso, se a cabeça passar mais de 4° além dessa faixa ou o rosto se deslocar
-mais de 4 cm, por mais de 1,5 s seguidos, o HUD mostra "Postura fora da
-calibração: R para recentralizar". Movimentos rápidos não disparam o aviso.
+calibração e a faixa de giro coberta na grade. Durante o uso, se a cabeça
+passar mais de 4° além dessa faixa ou o rosto se deslocar mais de 4 cm, por
+mais de 1,5 s seguidos, o HUD mostra "Postura fora da calibração: R para
+recentralizar". Movimentos rápidos não disparam o aviso.
 
-### 7.2 Correção por alvos conhecidos
+### 7.3 Correção contínua por alvos conhecidos
 
-Quando a interface sabe para onde o usuário estava olhando (por exemplo, o
-centro de uma tecla do teclado virtual que ele acabou de selecionar),
-`EyeGazeApp.confirm_target(alvo)` usa as amostras dos últimos ~0,5 s para
-corrigir o offset. O offset anda 30% do caminho até o erro medido, com
-limite de 80 px por correção. Uma seleção errada desloca pouco o cursor, e
-seleções corretas seguidas eliminam a deriva aos poucos (recalibração
-implícita). Essa função é a base para o teclado virtual. Com o mouse do
-sistema operacional, o app não sabe onde estão os botões e não pode
-usá-la.
+Quando se sabe para onde a pessoa olhava, `EyeGazeApp.confirm_target(alvo)`
+usa as amostras dos últimos ~0,5 s para corrigir o offset: ele anda 30% do
+caminho até o erro medido, com limite de 80 px por correção. Simulando nas
+validações gravadas os alvos chegando um a um, essa regra levou o erro de
+138 para 101 px (94 px depois de 7 alvos); a média de todos os alvos
+anteriores dá o mesmo (99 px), e usar só o último alvo, 116 px.
+
+A dificuldade é saber o alvo. Num clique pelo olhar, o clique cai onde o
+cursor (a própria estimativa) está, e "a posição clicada" não ensina nada.
+As fontes de alvos conhecidos são:
+
+- **cliques depois do ajuste fino pela cabeça** (tecla `A`, seção 4.3): a
+  pessoa corrigiu o cursor com a cabeça antes do clique, então o ponto
+  final é o alvo e o ajuste feito é o erro do olhar ali. Cada clique por
+  permanência com um ajuste de mais de 15 px corrige o offset
+  (`AdaptConfig.learn_from_fine_clicks`) e zera o ajuste fino;
+- **interfaces que sabem onde estão os alvos** (teclado virtual, ou, no
+  Windows, a UI Automation, que informa o retângulo do botão sob o cursor;
+  ainda não implementada), chamando `confirm_target` com o centro do
+  elemento selecionado.
+
+A correção acumulada é salva com a calibração ao sair do app.
 
 ## 8. Controle do mouse e dwell-click (`io_devices.py`, `app.py`)
 
@@ -955,10 +1035,10 @@ Cada camada é ligada e desligada por uma tecla, durante a execução:
 | Tecla | Camada |
 |---|---|
 | `L` | landmarks: malha facial, contorno dos olhos, contorno e centro das íris, cantos usados como âncora |
-| `G` | olhar (etapas 2–3): para cada olho, o globo (círculo com raio de 0,4 × a largura do olho, o tamanho de um olho real), o centro, a pupila **medida** (ponto verde), a pupila **corrigida** pelo ganho da calibração (anel laranja, onde o feixe sai do globo) e o feixe; o vetor do olhar (seta), yaw/pitch e a posição da intersecção dos feixes. A distância entre o ponto verde e o anel laranja mostra quanto o MediaPipe encolhe o movimento da íris |
+| `G` | olhar (etapas 2–3): para cada olho, o globo (círculo com raio de 0,4 × a largura do olho, o tamanho de um olho real), o centro, a pupila **medida** (ponto verde), a pupila **corrigida** pelo ganho da calibração (anel laranja, onde o feixe sai do globo) e o feixe; o vetor do olhar (seta), yaw/pitch e o peso de cada olho. A distância entre o ponto verde e o anel laranja mostra quanto o MediaPipe encolhe o movimento da íris |
 | `P` | eixos da cabeça (x vermelho, y verde, frente azul) e yaw/pitch/roll, com a fonte da pose |
 | `V` | minimapa da tela: alvos de calibração, rastro recente, ponto filtrado (amarelo), ponto bruto (cinza) e progresso do dwell |
-| `3` | vista 3D (`scene3d.py`): rosto, eixos da cabeça, globos (0,4 × largura do olho), pupilas medidas e corrigidas (laranja), feixes até a tela, intersecção (branco), vetor do olhar até o monitor virtual (magenta) e cursor no monitor real (amarelo). A diferença entre o magenta e o amarelo é o que a correção da etapa 5 faz |
+| `3` | vista 3D (`scene3d.py`): rosto, eixos da cabeça, globos (0,4 × largura do olho), pupilas medidas e corrigidas (laranja), feixes até a tela com o ponto de cada olho (branco), ponto do olhar no monitor virtual, a média ponderada dos olhos (magenta) e cursor no monitor real (amarelo). A diferença entre o magenta e o amarelo é o que a correção da etapa 5 faz |
 
 As camadas geométricas são desenhadas no frame original e só depois
 espelhadas (tecla `F`), para que textos e minimapa não fiquem invertidos.
@@ -996,12 +1076,13 @@ Os testes usam um rosto 3D sintético, com pose da cabeça e direção do olhar
 conhecidas, projetado em perspectiva por uma câmera pinhole no mesmo
 formato de saída do MediaPipe. Eles verificam:
 
-- sinais da pose da cabeça e a geometria (intersecção de retas, monitor
-  virtual, orientação da tela);
+- sinais da pose da cabeça e a geometria (retas, monitor virtual,
+  orientação da tela);
 - as medidas do olho em cm (âncoras a ~6 cm, pupila que ignora o z ruidoso
   da íris);
 - que o ajuste do globo recupera o raio real num olho sintético "físico",
-  que o feixe passa pela pupila e que os dois feixes se cruzam no alvo;
+  que o feixe passa pela pupila, que o feixe de cada olho atinge o alvo no
+  monitor virtual e que o olho mais ruidoso pesa menos;
 - que o raio efetivo por eixo absorve a compressão da íris, e que girar ou
   deslocar a cabeça mantém o erro baixo (seção 5.8);
 - que a correção monitor virtual → real absorve uma largura de tela errada;
@@ -1011,7 +1092,8 @@ formato de saída do MediaPipe. Eles verificam:
 - generalização da calibração para alvos fora da grade, simulando um monitor
   de 53×30 cm a 60 cm;
 - o fluxo completo do aplicativo com um "usuário simulado" que olha para os
-  alvos exibidos, segue as setas da etapa da cabeça e depois usa o cursor
+  alvos exibidos, segue as setas da etapa da cabeça (modo pesquisa) e
+  depois usa o cursor
   com a cabeça girada e deslocada (erro < 130 px, tremor < 4 px/frame);
 - o protocolo de coleta (`tests/test_procedures.py`): ordem aleatória, coleta
   só depois da fixação (e no tempo limite se o olhar não estabiliza), etapa

@@ -7,8 +7,7 @@ repetição de alvos ruins, filtro de faixa da cabeça e aviso de postura.
 import numpy as np
 
 from eyegaze.gaze import RAW_SIZE
-from eyegaze.calibration import (ALWAYS_TRAIN, HEAD_GROUP_BASE,
-                                 fit_from_samples, split_head_stage)
+from eyegaze.calibration import fit_from_samples, head_test_error
 from eyegaze.config import CalibrationConfig
 from eyegaze.procedures import (CalibrationProcedure, TargetProcedure, head_progress,
                                 quality_label)
@@ -36,12 +35,9 @@ def test_targets_visited_in_random_order_and_all_collected(tmp_path):
     app.cfg.calibration.random_seed = 3
     app.handle_key(ord(" "))
     proc = app.procedure
-    grid = [o for o in proc.order if o < proc.n_grid]
-    assert sorted(grid) == list(range(16))
-    assert grid != list(range(16))                 # não é linha a linha
-    # Checagens do centro no início e a cada 4 alvos (controle de deriva).
-    assert [j for j, o in enumerate(proc.order) if o >= proc.n_grid] == [0, 5, 10, 15, 20]
-    assert all(proc.targets[o] == (960.0, 540.0) for o in proc.order if o >= proc.n_grid)
+    n = app.cfg.calibration.grid_cols * app.cfg.calibration.grid_rows
+    assert sorted(proc.order) == list(range(n)) and n == 12
+    assert proc.order != list(range(n))            # não é linha a linha
     visited = []
     for _ in range(4000):
         app.step()
@@ -107,6 +103,7 @@ class StillHeadTracker(FakeTracker):
 
 def test_head_stage_finishes_for_user_who_cannot_move_head(tmp_path):
     app, _, _ = make_app(tmp_path)
+    app.cfg.calibration.head_stage = True
     tracker = StillHeadTracker()
     tracker.app = app
     app.tracker = tracker
@@ -117,8 +114,8 @@ def test_head_stage_finishes_for_user_who_cannot_move_head(tmp_path):
     expected = cfg.head_motion_settle_s + 4 * cfg.head_step_timeout_s + cfg.head_center_s
     n = len(proc.head_samples)
     assert abs(n / 30 - (expected - cfg.head_motion_settle_s)) < 1.0, n
-    # Sem movimento, nenhuma direção vira dobra da validação da cabeça.
-    assert "erro_cv_cabeca_px" not in proc.stats
+    # Sem movimento, nenhuma amostra é "pose nova": não há teste da cabeça.
+    assert "erro_cabeca_px" not in proc.stats
 
 
 class OverTurnTracker(FakeTracker):
@@ -136,6 +133,7 @@ class OverTurnTracker(FakeTracker):
 
 def test_head_samples_beyond_range_are_not_used(tmp_path):
     app, _, _ = make_app(tmp_path)
+    app.cfg.calibration.head_stage = True
     tracker = OverTurnTracker()
     tracker.app = app
     app.tracker = tracker
@@ -145,11 +143,14 @@ def test_head_samples_beyond_range_are_not_used(tmp_path):
     assert st["n_cabeca_usadas"] < st["n_cabeca_total"]
     # A seta fica verde a 80% do alvo e a etapa avança: a pessoa passa pela
     # faixa útil antes de exagerar, então ainda sobram amostras para usar.
-    assert st["n_cabeca_usadas"] >= 20
+    # (Amostras a menos de 2° da pose da grade não são "pose nova" e não
+    # contam como usadas no teste.)
+    assert st["n_cabeca_usadas"] >= 10
 
 
 def test_head_arrow_renders_all_states(tmp_path):
     app, tracker, _ = make_app(tmp_path)
+    app.cfg.calibration.head_stage = True
     app.handle_key(ord(" "))
     proc = app.procedure
     seen = set()
@@ -206,22 +207,22 @@ def test_bad_targets_rule():
 
 
 # ------------------------------------------------------------ modelo
-def test_split_head_stage_groups_and_range():
+def test_head_test_error_range_and_directions():
     user = SimUser(11)
     data = user.calibration_data()
+    model, _, _ = fit_from_samples(data, (1920, 1080), 53.0)
     grid = np.vstack([r for _, _, r in data.grid])
-    keep, groups, delta = split_head_stage(data.head_raw, grid, (8.0, 6.0))
-    assert np.all(np.abs(delta[keep, 0]) <= 8) and np.all(np.abs(delta[keep, 1]) <= 6)
-    assert (~keep).any()                     # a etapa sintética vai a ±10°/±8°
-    assert set(np.unique(groups)) <= {ALWAYS_TRAIN, *range(HEAD_GROUP_BASE - 3, HEAD_GROUP_BASE + 1)}
-    still = np.max(np.abs(delta), axis=1) < 2.0
-    assert np.all(groups[still] == ALWAYS_TRAIN)
+    wide = head_test_error(model, data.head_raw, data.head_target, grid, (15.0, 12.0))
+    narrow = head_test_error(model, data.head_raw, data.head_target, grid, (8.0, 6.0))
+    # A etapa sintética vai a ±10°/±8°: a faixa estreita descarta o fim de cada giro.
+    assert narrow["n_cabeca_usadas"] < wide["n_cabeca_usadas"]
+    assert set(wide["erro_cabeca_por_direcao_px"]) == {"direita", "esquerda", "cima", "baixo"}
 
 
 def test_model_reports_head_cv_and_candidates():
     user = SimUser(12)
     model, _, stats = fit_from_samples(user.calibration_data(), (1920, 1080), 53.0)
-    assert stats["erro_cv_cabeca_px"] > 0
+    assert stats["erro_cabeca_px"] > 0
     assert {c["correcao"] for c in stats["candidatos"]} == {
         "nenhuma", "deslocamento", "afim", "quadratica"}
     assert stats["erro_loo_medio_px"] == model.cv_score
@@ -373,8 +374,7 @@ def test_manual_mode_refuses_when_gaze_is_moving():
 
 
 def test_manual_calibration_end_to_end(tmp_path):
-    """Tecla C: calibração manual; ESPAÇO confirma cada alvo; etapas da cabeça
-    e da boca continuam automáticas."""
+    """Tecla C: calibração manual; ESPAÇO confirma cada alvo."""
     app, tracker, _ = make_app(tmp_path)
     app.handle_key(ord("c"))
     proc = app.procedure
@@ -387,4 +387,3 @@ def test_manual_calibration_end_to_end(tmp_path):
             break
     assert proc.succeeded
     assert all(len(s) >= proc.min_samples for s in proc.samples)
-    assert len(proc.mouth_samples) > 0

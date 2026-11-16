@@ -3,17 +3,20 @@ Benchmark offline: avalia variantes do pipeline em TODAS as sessões gravadas.
 
 Para cada ``results/calibracao_*.npz`` com landmarks gravados (e a
 validação gravada logo depois dela, se houver), as medidas são recalculadas
-com o estimador ATUAL, cada variante é ajustada e avaliada com três métricas:
+com o estimador ATUAL (com cache em results/.cache), cada variante é
+ajustada e avaliada com três métricas:
 
 * ``LOO``     - erro médio em alvos da grade deixados de fora do ajuste
                 (pontos novos, cabeça parada);
-* ``cabeça``  - cada direção da etapa da cabeça (direita/esquerda/cima/
-                baixo) fica fora do ajuste e o erro é medido nela (poses
-                novas da cabeça). Teste: amostras até ±15° (yaw) e ±12°
-                (pitch) da pose da grade, iguais para todas as variantes;
+* ``cabeça``  - erro nas amostras da etapa da cabeça (que nunca entram no
+                ajuste): cabeça em poses novas, até ±15° (yaw) e ±12°
+                (pitch) da pose da grade;
 * ``valid.``  - erro médio nos alvos da validação (outro momento da sessão)
                 e, entre parênteses, o mesmo erro sem o deslocamento médio
                 (o que a recentralização R corrige).
+
+Os erros saem em px e em graus (com a distância do rosto medida pelo
+próprio pipeline em cada sessão).
 
 Uso:
     python tools/benchmark.py
@@ -35,11 +38,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
-from eyegaze.calibration import (CalibrationData, fit_from_samples,  # noqa: E402
-                                 head_angles, head_direction)
+from eyegaze.calibration import CalibrationData, fit_from_samples  # noqa: E402
+from eyegaze.gaze import RAW_FACE  # noqa: E402
 from reavaliar import load, validation_error  # noqa: E402
 
-TEST_RANGE_DEG = (15.0, 12.0)   # faixa das amostras de teste da cabeça
 PAIR_WINDOW_S = 30 * 60         # validação até 30 min depois da calibração
 
 # (nome, argumentos de fit_from_samples). A primeira é a configuração padrão.
@@ -47,12 +49,11 @@ VARIANTS: list[tuple[str, dict]] = [
     ("padrão", dict()),
     ("só monitor virtual", dict(corrections=())),
     ("correção só deslocamento", dict(corrections=("deslocamento",))),
-    ("pupila só MediaPipe", dict(pupil_sources=("mediapipe",))),
-    ("pupila só refinada", dict(pupil_sources=("refinada",))),
-    ("âncora nos cantos do olho", dict(anchors=("cantos",))),
-    ("âncora na ponte do nariz", dict(anchors=("nariz",))),
-    ("sem correção de deriva", dict(drift_correction=False)),
-    ("sem etapa da cabeça", dict(_no_head=True)),
+    ("afim fixa (alpha 0,01)", dict(correction=("afim", 1e-2))),
+    ("quadrática fixa (alpha 0,01)", dict(correction=("quadratica", 1e-2))),
+    ("pupila só MediaPipe", dict(pupil_source="mediapipe")),
+    ("pupila só refinada", dict(pupil_source="refinada")),
+    ("olhos com peso igual", dict(weight_eyes=False)),
 ]
 WIDTH_CM: float | None = None
 
@@ -93,36 +94,18 @@ def load_sessions(results: Path) -> list[Session]:
 
 
 def _fit(data: CalibrationData, screen, kw: dict):
-    kw = dict(kw)
-    if kw.pop("_no_head", False):
-        data = CalibrationData(grid=data.grid)
     model, _, stats = fit_from_samples(data, screen, WIDTH_CM, **kw)
     return model, stats
 
 
-def head_cv(data: CalibrationData, screen, kw: dict) -> float:
-    """Erro médio (px) em direções da cabeça deixadas de fora do ajuste."""
-    if data.head_raw is None or len(data.head_raw) < 10:
-        return float("nan")
-    hr, hf = np.atleast_2d(data.head_raw), np.atleast_2d(data.head_features)
-    grid_raw = np.vstack([np.atleast_2d(r) for _, _, r in data.grid if len(r)])
-    delta = head_angles(hr) - np.median(head_angles(grid_raw), axis=0)
-    direction = head_direction(delta)
-    in_test = ((np.abs(delta[:, 0]) <= TEST_RANGE_DEG[0])
-               & (np.abs(delta[:, 1]) <= TEST_RANGE_DEG[1])
-               & (np.max(np.abs(delta), axis=1) >= 2.0))
-    errs = []
-    for q in range(4):
-        test = in_test & (direction == q)
-        if test.sum() < 5:
-            continue
-        train = direction != q
-        d = CalibrationData(grid=data.grid, head_target=data.head_target,
-                            head_raw=hr[train], head_features=hf[train])
-        model, _ = _fit(d, screen, kw)
-        pred = model.predict(hr[test])
-        errs.append(float(np.nanmedian(np.hypot(*(pred - np.asarray(data.head_target)).T))))
-    return float(np.mean(errs)) if errs else float("nan")
+def _distance_cm(data: CalibrationData) -> float:
+    raws = [np.atleast_2d(r) for _, _, r in data.grid if len(r)]
+    return float(np.median(np.vstack(raws)[:, RAW_FACE][:, 2]))
+
+
+def _deg(px: float, dist_cm: float, screen_w: int) -> float:
+    cm = px * (WIDTH_CM or 34.5) / screen_w
+    return float(np.degrees(np.arctan2(cm, dist_cm)))
 
 
 def main(argv=None) -> int:
@@ -131,6 +114,9 @@ def main(argv=None) -> int:
     p.add_argument("--screen", type=str, default="1920x1080")
     p.add_argument("--screen-width-cm", type=float, default=None,
                    help="largura física da tela (padrão: detecta no Windows)")
+    p.add_argument("--distance-cm", type=float, default=None,
+                   help="distância olho-tela real, para os graus (padrão: a medida pelo "
+                        "pipeline em cada sessão, que depende do campo de visão suposto)")
     args = p.parse_args(argv)
     screen = tuple(int(v) for v in args.screen.lower().split("x"))
     global WIDTH_CM
@@ -144,22 +130,31 @@ def main(argv=None) -> int:
         print(f"Nenhuma calibração utilizável em {args.results}.")
         return 1
     print(f"{len(sessions)} sessões ({sum(s.valid is not None for s in sessions)} com validação)")
-    print("\nErros médios em px (média das sessões). valid. = erro na validação "
+    print("\nErros médios (média das sessões), em px e [graus]. valid. = erro na validação "
           "(entre parênteses, sem o deslocamento constante).")
-    print(f"{'variante':28s} {'LOO':>6s} {'cabeça':>7s} {'valid.':>13s}")
+    print(f"{'variante':30s} {'LOO':>12s} {'cabeça':>12s} {'valid.':>20s}")
+    dists = [args.distance_cm or _distance_cm(s.calib) for s in sessions]
     per_session = {}
     for name, kw in VARIANTS:
         loos, heads, vals, vals_o = [], [], [], []
-        for s in sessions:
+        dl, dh, dv, dvo = [], [], [], []
+        for s, dist in zip(sessions, dists):
             model, stats = _fit(s.calib, screen, kw)
             loos.append(stats.get("erro_loo_medio_px", np.nan))
-            heads.append(head_cv(s.calib, screen, kw))
+            heads.append(stats.get("erro_cabeca_px", np.nan))
             va, vo, _ = validation_error(model, s.valid) if s.valid else (np.nan, np.nan, [])
             vals.append(va)
             vals_o.append(vo)
+            dl.append(_deg(loos[-1], dist, screen[0]))
+            dh.append(_deg(heads[-1], dist, screen[0]))
+            dv.append(_deg(va, dist, screen[0]))
+            dvo.append(_deg(vo, dist, screen[0]))
             per_session.setdefault(s.name, []).append((loos[-1], heads[-1], va))
-        print(f"{name:28s} {np.nanmean(loos):6.0f} {np.nanmean(heads):7.0f} "
-              f"{np.nanmean(vals):7.0f} ({np.nanmean(vals_o):3.0f})")
+        print(f"{name:30s} {np.nanmean(loos):5.0f} [{np.nanmean(dl):4.2f}] "
+              f"{np.nanmean(heads):5.0f} [{np.nanmean(dh):4.2f}] "
+              f"{np.nanmean(vals):5.0f} ({np.nanmean(vals_o):3.0f}) "
+              f"[{np.nanmean(dv):4.2f} ({np.nanmean(dvo):4.2f})]", flush=True)
+    print(f"\nDistância mediana do rosto: {np.median(dists):.0f} cm")
     print("\nPor sessão (LOO / cabeça / valid.), uma coluna por variante:")
     for name, rows in per_session.items():
         print(f"  {name}: " + " | ".join(

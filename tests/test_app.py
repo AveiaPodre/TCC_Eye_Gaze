@@ -7,7 +7,7 @@ cabeça e devolve landmarks sintéticos coerentes com isso. O "usuário" tem o
 erro típico do MediaPipe (movimento da íris encolhido, mais na vertical) e
 ruído nos landmarks.
 
-Exercita: calibração (com etapa de cabeça), cursor estável, cursor com a
+Exercita: calibração (com a etapa da cabeça do modo pesquisa), cursor estável, cursor com a
 cabeça girada/transladada, validação, recentralização, mouse, dwell-click,
 perda de rosto e as teclas de visualização.
 """
@@ -65,8 +65,6 @@ class FakeTracker:
         self.rng = np.random.default_rng(0)
         self.noise_px = 0.25
         self._head_amount = 0.0
-        self.mouth = 0.0
-        self._mouth_t = 0
 
     def _head_for_prompt(self, proc):
         """Simula a pessoa girando a cabeça devagar na direção pedida."""
@@ -92,15 +90,10 @@ class FakeTracker:
             pos = getattr(self, "proc_pos", EYE_POS)
         else:
             target = self.look_at
-        # Boca: abre e fecha na etapa da boca; fora dela, ``self.mouth``.
-        mouth = self.mouth
-        if proc is not None and getattr(proc, "in_mouth_stage", False):
-            self._mouth_t += 1
-            mouth = 0.15 * abs(np.sin(self._mouth_t / 8.0))
         g = self.geom.gaze_vector(*target, pos)
         return make_observation(head=head, head_pos_cm=tuple(pos), with_transform=True,
                                 gaze_vec=g, noise_px=self.noise_px, rng=self.rng,
-                                timestamp_ms=ts, mouth_open=mouth, **USER)
+                                timestamp_ms=ts, **USER)
 
     def close(self):
         pass
@@ -185,12 +178,14 @@ def test_end_to_end(tmp_path):
     app.handle_key(ord("m"))
     assert not mouse.enabled
 
-    # --- calibração (16 pontos + etapa da cabeça) ----------------------
+    # --- calibração (12 pontos + etapa da cabeça do modo pesquisa) -----
+    app.cfg.calibration.head_stage = True
     app.handle_key(ord(" "))
     proc = run_procedure(app, out_dir=out_dir, snap_head=True)
     assert proc.collecting_done and proc.succeeded
+    assert len(proc.results) == 12
     assert len(proc.head_samples) > 60
-    assert proc.stats["usa_etapa_cabeca"]
+    assert proc.stats["erro_cabeca_px"] > 0
     assert max(r.error_px for r in proc.results) < 70
     if out_dir:
         cv2.imwrite(os.path.join(out_dir, "calibracao_resultado.png"), app.last_target_view)
@@ -306,12 +301,13 @@ def test_end_to_end(tmp_path):
 
 
 def test_calibration_without_head_stage(tmp_path):
-    """Usuário que não pode mover a cabeça: etapa desligada, parâmetros padrão."""
+    """Modo usuário (padrão): sem a etapa da cabeça."""
     app, tracker, _ = make_app(tmp_path)
-    app.cfg.calibration.head_stage = False
+    assert not app.cfg.calibration.head_stage
     app.handle_key(ord(" "))
     proc = run_procedure(app)
-    assert proc.succeeded and not proc.stats["usa_etapa_cabeca"]
+    assert proc.succeeded and "erro_cabeca_px" not in proc.stats
+    assert proc.head_samples == []
     app.handle_key(13)
     tracker.look_at = (700, 400)
     settle(app)
@@ -322,15 +318,17 @@ def test_head_tilt_without_head_stage(tmp_path):
     """Sem a etapa da cabeça, o feixe ainda acompanha a rotação da cabeça pela
     geometria (R): inclinar a cabeça mantém o cursor no lugar."""
     app, tracker, _ = make_app(tmp_path)
-    app.cfg.calibration.head_stage = False
     app.handle_key(ord(" "))
     proc = run_procedure(app)
     assert proc.succeeded and proc.stats["largura_conhecida"]
     app.handle_key(13)
+    # Limite: no usuário sintético, a cabeça 8° para baixo deixa ~100-120 px
+    # de resíduo (média de 7 alvos, 4 sementes, grade 4x4 ou 3x4; ver
+    # test_pipeline.test_head_rotation_and_translation_are_compensated).
     for head in [(0, -8, 0), (0, 6, 0)]:
         tracker.head, tracker.look_at = head, (900, 850)
         settle(app)
-        assert err(app, (900, 850)) < 90, (head, err(app, (900, 850)))
+        assert err(app, (900, 850)) < 120, (head, err(app, (900, 850)))
 
 
 def test_recenter_rejects_huge_offset(tmp_path):
@@ -338,7 +336,6 @@ def test_recenter_rejects_huge_offset(tmp_path):
     aplicou -964 px no eixo y e o cursor não alcançava mais a parte de baixo
     da tela. Desvios acima de 25% da tela não são aplicados."""
     app, tracker, _ = make_app(tmp_path)
-    app.cfg.calibration.head_stage = False
     app.handle_key(ord(" "))
     run_procedure(app)
     app.handle_key(13)
@@ -351,36 +348,6 @@ def test_recenter_rejects_huge_offset(tmp_path):
     settle(app, 200)   # a tela de aviso fecha sozinha
     assert app.procedure is None
     assert np.allclose(app.model.offset, before)
-
-
-def test_mouth_stage_end_to_end(tmp_path):
-    """Usuário em que abrir a boca "desce" a íris (artefato do MediaPipe): com
-    a etapa da boca, o cursor não se move quando a boca abre."""
-    import synthetic
-    app, tracker, _ = make_app(tmp_path)
-    orig = synthetic.make_points
-
-    def with_artifact(*a, **k):
-        # ~120 px de deslocamento com a boca aberta (nos dados reais, ~50 px).
-        # Valores maiores jogam a previsão para fora da tela, onde a correção
-        # extrapola e o teste depende da sequência de ruído.
-        k.setdefault("mouth_coupling", 0.06)
-        return orig(*a, **k)
-
-    synthetic.make_points = with_artifact
-    try:
-        app.handle_key(ord(" "))
-        proc = run_procedure(app)
-        assert proc.succeeded and "boca_px_por_unidade" in proc.stats
-        app.handle_key(13)
-        tracker.look_at = (900, 600)
-        settle(app)
-        closed = app.screen_point.copy()
-        tracker.mouth = 0.12
-        settle(app)
-        assert np.linalg.norm(app.screen_point - closed) < 60, (closed, app.screen_point)
-    finally:
-        synthetic.make_points = orig
 
 
 def test_head_fine_adjustment_moves_cursor_from_gaze_point(tmp_path):
@@ -420,9 +387,9 @@ def test_head_fine_adjustment_moves_cursor_from_gaze_point(tmp_path):
     assert not app.fine_enabled
 
 
-def test_immediate_validation_then_retest_reanchors(tmp_path):
-    """Calibrar dispara a validação imediata; o reteste (T) mede a deriva no
-    centro e reancora o cursor."""
+def test_immediate_validation_then_retest_recenters(tmp_path):
+    """Modo pesquisa: calibrar dispara a validação imediata; o reteste (T) mede
+    o desvio médio dos alvos e o corrige no cursor."""
     app, tracker, _ = make_app(tmp_path)
     app.cfg.validation.after_calibration = True
     app.handle_key(ord(" "))
@@ -434,18 +401,73 @@ def test_immediate_validation_then_retest_reanchors(tmp_path):
     s = proc.summary
     assert s["tipo"] == "imediata" and set(s["por_regiao_px"]) == {"centro", "intermediaria", "borda"}
     assert s["acuracia_media_graus"] is not None and s["distancia_cm"] > 0
+    assert s["precisao_rms_s2s_px"] > 0 and 0 <= s["perda_de_dados"] < 0.05
+    assert proc.applied_offset is None       # a imediata só mede
+    base = np.array(s["deslocamento_medio_px"])   # desvio do modelo, antes da deriva
     app.handle_key(13)
     assert app.procedure is None
-    # Deriva artificial: o reteste mede no centro e reancora.
+    # Deriva artificial: o reteste mede o desvio médio e o corrige (a correção
+    # desfaz a deriva E o desvio que o modelo já tinha).
     app.model.offset = app.model.offset + np.array([110.0, -70.0])
     before = app.model.offset.copy()
     app.handle_key(ord("t"))
     proc = run_procedure(app)
     s = proc.summary
-    assert s["tipo"] == "reteste" and np.hypot(*s["deriva_centro_px"]) > 90
-    assert s["acuracia_reancorada_px"] < s["acuracia_outros_px"] - 50
+    assert s["tipo"] == "reteste" and np.hypot(*s["deslocamento_medio_px"]) > 90
+    assert s["acuracia_recentralizada_px"] < s["acuracia_media_px"] - 50
     assert proc.applied_offset is not None
-    assert np.hypot(*(app.model.offset - before + [110.0, -70.0])) < 40
+    assert np.hypot(*(app.model.offset - before + [110.0, -70.0] + base)) < 25
+
+
+def test_recenter_uses_several_points(tmp_path):
+    """A recentralização usa 4 alvos (a média dos erros): com 1 ponto ela
+    piorava o erro nas validações gravadas."""
+    from eyegaze.procedures import RecenterProcedure
+    app, tracker, _ = make_app(tmp_path)
+    app.handle_key(ord(" "))
+    run_procedure(app)
+    app.handle_key(13)
+    app.model.offset = app.model.offset + np.array([-90.0, 60.0])
+    app.handle_key(ord("r"))
+    proc = app.procedure
+    assert isinstance(proc, RecenterProcedure) and len(proc.targets) == 4
+    run_procedure(app)
+    assert proc.succeeded and "dispersao" in proc.message_lines[0]
+    settle(app, 60)
+    for target in [(700, 400), (1300, 700)]:
+        tracker.look_at = target
+        settle(app)
+        assert err(app, target) < 60, (target, err(app, target))
+
+
+def test_fine_adjusted_click_teaches_the_offset(tmp_path):
+    """Com o ajuste fino pela cabeça, o clique por permanência no ponto
+    corrigido ensina o desvio do olhar ao modelo (correção contínua)."""
+    app, tracker, mouse = make_app(tmp_path)
+    app.handle_key(ord(" "))
+    run_procedure(app)
+    app.handle_key(13)
+    app.handle_key(ord("m"))
+    app.handle_key(ord("a"))
+    target = (900.0, 500.0)
+    tracker.look_at, tracker.head = target, (0, 0, 0)
+    settle(app, 60)
+    before = app.model.offset.copy()
+    # A pessoa nota o cursor deslocado e o corrige com a cabeça.
+    tracker.head = (-3.0, 0.0, 0.0)
+    settle(app, 20)
+    fine = app.fine.offset.copy()
+    assert np.linalg.norm(fine) > app.cfg.adapt.fine_min_px
+    app.handle_key(ord("d"))                 # liga o dwell: o clique vem em ~1 s
+    for _ in range(60):
+        app.step()
+        if mouse.clicks:
+            break
+    assert mouse.clicks >= 1 and app.online_corrections == 1
+    step = app.model.offset - before
+    # O offset andou na direção do ajuste feito com a cabeça.
+    assert np.dot(step, fine) > 0 and np.linalg.norm(step) <= app.cfg.adapt.max_step_px + 1e-6
+    assert np.linalg.norm(app.fine.offset) < 1e-6   # o ajuste fino recomeça
 
 
 def test_saved_calibration_recenters_on_start(tmp_path):

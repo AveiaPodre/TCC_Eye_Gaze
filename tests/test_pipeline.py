@@ -206,18 +206,17 @@ class SimUser:
         self.noise = noise_px
         self.user = user or COMPRESSED
 
-    def observation(self, tx, ty, head=(0, 0, 0), pos=EYE_POS, mouth=0.0, ts=0):
+    def observation(self, tx, ty, head=(0, 0, 0), pos=EYE_POS, ts=0):
         g = self.geom.gaze_vector(tx, ty, pos)
         return make_observation(head=head, head_pos_cm=pos, with_transform=True, gaze_vec=g,
-                                noise_px=self.noise, rng=self.rng, mouth_open=mouth,
-                                timestamp_ms=ts, **self.user)
+                                noise_px=self.noise, rng=self.rng, timestamp_ms=ts,
+                                **self.user)
 
-    def sample(self, tx, ty, head=(0, 0, 0), pos=EYE_POS, mouth=0.0):
-        s = self.est.estimate(self.observation(tx, ty, head, pos, mouth))
+    def sample(self, tx, ty, head=(0, 0, 0), pos=EYE_POS):
+        s = self.est.estimate(self.observation(tx, ty, head, pos))
         return s.features(), s.raw
 
-    def calibration_data(self, head_stage=True, grid=(4, 4), n=12, grid_head_sd=1.0,
-                         mouth_stage=False):
+    def calibration_data(self, head_stage=True, grid=(4, 4), n=12, grid_head_sd=1.0):
         data = CalibrationData()
         for t in build_grid(1920, 1080, *grid, 0.05):
             F, Rw = zip(*[self.sample(*t, head=tuple(self.rng.normal(0, grid_head_sd, 3)))
@@ -233,52 +232,15 @@ class SimUser:
             F, Rw = zip(*hs)
             data.head_target = (960, 540)
             data.head_features, data.head_raw = np.array(F), np.array(Rw)
-        if mouth_stage:
-            ms = [self.sample(960, 540, mouth=0.15 * abs(np.sin(k / 8.0))) for k in range(90)]
-            F, Rw = zip(*ms)
-            data.mouth_target = (960, 540)
-            data.mouth_features, data.mouth_raw = np.array(F), np.array(Rw)
         return data
 
-    def drifting_calibration(self, drift_cm, checks=True, n=12, every=4):
-        """Grade 4×4 com a pupila derivando linearmente de 0 a ``drift_cm`` ao
-        longo da coleta, com (ou sem) checagens do centro no início e a cada
-        ``every`` alvos, e os instantes de cada amostra."""
-        from eyegaze.calibration import CalibrationData
-        grid = build_grid(1920, 1080, 4, 4, 0.05)
-        seq = []
-        for j, t in enumerate(grid):
-            if checks and j % every == 0:
-                seq.append(("chk", (960.0, 540.0)))
-            seq.append(("alvo", t))
-        if checks:
-            seq.append(("chk", (960.0, 540.0)))
-        data, t_now = CalibrationData(), 0.0
-        for j, (kind, t) in enumerate(seq):
-            F, Rw, T = [], [], []
-            for _ in range(n):
-                drift = drift_cm * j / (len(seq) - 1)
-                g = self.geom.gaze_vector(*t, EYE_POS)
-                o = make_observation(head_pos_cm=EYE_POS, with_transform=True, gaze_vec=g,
-                                     rng=self.rng, pupil_drift=drift, **self.user)
-                s = self.est.estimate(o)
-                F.append(s.features()); Rw.append(s.raw); T.append(t_now)
-                t_now += 1 / 30
-            t_now += 1.0
-            if kind == "alvo":
-                data.grid.append((t, np.array(F), np.array(Rw)))
-                data.grid_times.append(np.array(T))
-            else:
-                data.checks.append((t, np.array(F), np.array(Rw), np.array(T)))
-        return data
-
-    def mean_error(self, model, head=(0, 0, 0), pos=EYE_POS, mouth=0.0, drift=0.0):
+    def mean_error(self, model, head=(0, 0, 0), pos=EYE_POS, drift=0.0):
         errs = []
         for tx, ty in [(480, 270), (1440, 270), (960, 540), (480, 810), (1440, 810),
                        (300, 540), (1600, 600)]:
             g = self.geom.gaze_vector(tx, ty, pos)
             o = make_observation(head=head, head_pos_cm=pos, with_transform=True, gaze_vec=g,
-                                 noise_px=self.noise, rng=self.rng, mouth_open=mouth,
+                                 noise_px=self.noise, rng=self.rng,
                                  pupil_drift=drift, **self.user)
             r = self.est.estimate(o).raw
             errs.append(math.hypot(*(model.predict(r) - [tx, ty])))
@@ -289,7 +251,7 @@ def _fit(data, width_cm=53.0, **kw):
     return fit_from_samples(data, SCREEN, width_cm, 3.5, **kw)
 
 
-# ------------------------------------------- etapas 2-3: globo, feixes, intersecção
+# ------------------------------------- etapas 2-4: globo, feixes, monitor virtual
 def test_eyeball_fit_recovers_physical_eye():
     """Num olho físico, o ajuste encontra o raio real do globo (1,2 cm =
     0,4 x 3 cm de largura do olho) nos dois eixos, e o feixe sai do centro
@@ -305,18 +267,35 @@ def test_eyeball_fit_recovers_physical_eye():
         assert np.dot(v, d) > 0                                # centro ATRÁS da pupila
 
 
-def test_beams_intersect_at_the_fixated_target():
-    """Os dois feixes se cruzam (quase) no alvo da tela; o vetor do olhar até a
-    intersecção, projetado no monitor virtual, cai no alvo."""
+def test_each_beam_hits_the_fixated_target():
+    """O feixe de cada olho, projetado no monitor virtual, cai no alvo; o ponto
+    combinado (média ponderada dos olhos) também."""
     user = SimUser(2, **PHYS)
     model, _, _ = _fit(user.calibration_data())
-    est = GazeEstimator(GazeConfig(), model.eyeball)
     for tx, ty in [(300, 200), (1500, 900), (960, 540)]:
-        g = est.estimate(user.observation(tx, ty)).gaze
-        T = model.screen.px_to_cm([(tx, ty)])[0]
-        assert g.vergence is not None and np.linalg.norm(g.vergence - T) < 4.0, g.vergence
-        hit = model.screen.project(g.origin, g.direction)[0]
-        assert np.hypot(*(hit - [tx, ty])) < 40
+        _, r = user.sample(tx, ty)
+        per_eye = model.virtual_px_per_eye(r)[0]
+        for k in range(2):
+            assert np.hypot(*(per_eye[k] - [tx, ty])) < 40, (k, per_eye[k])
+        assert np.hypot(*(model.virtual_px(r)[0] - [tx, ty])) < 40
+
+
+def test_eye_weights_follow_each_eye_error():
+    """O olho que erra mais pesa menos no ponto da tela."""
+    user = SimUser(3, **PHYS)
+    data = user.calibration_data(head_stage=False)
+    # Ruído só no olho esquerdo (pupila MediaPipe, colunas 21:24).
+    rng = np.random.default_rng(0)
+    for i, (t, f, r) in enumerate(data.grid):
+        r = r.copy()
+        r[:, 21:23] += rng.normal(0, 0.03, (len(r), 2))
+        data.grid[i] = (t, f, r)
+    model, _, stats = _fit(data)
+    w = model.eyeball.eye_weights
+    assert w[0] > 1.5 * w[1], w
+    assert stats["globo"]["direito"]["peso"] == pytest.approx(w[0])
+    equal, _, _ = _fit(data, weight_eyes=False)
+    assert np.allclose(equal.eyeball.eye_weights, 0.5)
 
 
 def test_one_closed_eye_uses_the_other_beam():
@@ -325,8 +304,9 @@ def test_one_closed_eye_uses_the_other_beam():
     _, r = user.sample(700, 400)
     r_one = r.copy()
     r_one[31] = 0.0                                  # olho esquerdo fechado
-    o, d, X, _, _ = model.eyeball.gaze(r_one)
-    assert np.all(np.isnan(X)) and np.all(np.isfinite(d))
+    o, d, _ = model.eyeball.gaze(r_one)
+    assert np.all(np.isfinite(d))
+    assert np.all(np.isnan(model.virtual_px_per_eye(r_one)[0, 1]))
     assert np.hypot(*(model.predict(r_one) - [700, 400])) < 60
 
 
@@ -360,7 +340,6 @@ def test_head_rotation_and_translation_are_compensated():
     nas sessões reais. Com a cabeça parada o erro é bem menor."""
     user = SimUser(6)
     model, _, stats = _fit(user.calibration_data())
-    assert stats["usa_etapa_cabeca"]
     for head, pos in [((12, 0, 0), EYE_POS), ((-12, 0, 0), EYE_POS),
                       ((0, 9, 0), EYE_POS), ((0, -9, 0), EYE_POS),
                       ((8, -6, 4), (-4.0, 13.0, 55.0)), ((0, 0, 0), (6.0, 10.0, 68.0))]:
@@ -378,7 +357,7 @@ def test_head_invariance_with_landmark_noise():
 def test_without_head_stage_still_works():
     user = SimUser(8)
     model, _, stats = _fit(user.calibration_data(head_stage=False))
-    assert not stats["usa_etapa_cabeca"]
+    assert "erro_cabeca_px" not in stats
     assert user.mean_error(model) < 35
     assert user.mean_error(model, (10, 0, 0)) < 80   # a geometria compensa a cabeça
 
@@ -393,40 +372,32 @@ def test_correction_absorbs_unknown_screen_width():
     assert user.mean_error(model) < 45
 
 
-def test_drift_checks_correct_pupil_drift():
-    """A pupila deriva ao longo da grade (sem o olho girar). Com as checagens
-    do centro, a deriva é medida, descontada e o modelo fica ajustado ao
-    estado do FIM da calibração; sem elas, o modelo mistura os estados."""
+def test_head_stage_is_test_only():
+    """A etapa da cabeça não entra no ajuste: com ou sem ela, o modelo é o
+    mesmo; ela só mede o erro com a cabeça em poses novas."""
     user = SimUser(21)
-    drift = 0.04                                  # cm (~1/3 do raio efetivo vertical)
-    with_chk, _, st = _fit(user.drifting_calibration(drift, checks=True))
-    no_chk, _, _ = _fit(user.drifting_calibration(drift, checks=False))
-    assert st["deriva_corrigida"] and st["deriva_centro_px"] > 40
-    e_with = user.mean_error(with_chk, drift=drift)
-    e_without = user.mean_error(no_chk, drift=drift)
-    assert e_with < 0.6 * e_without, (e_with, e_without)
-    # Sem deriva, as checagens não atrapalham.
-    clean, _, st0 = _fit(user.drifting_calibration(0.0, checks=True))
-    assert st0["deriva_centro_px"] < 25
-    assert user.mean_error(clean) < 35
-
-
-def test_drift_data_roundtrip(tmp_path):
-    data = SimUser(22).drifting_calibration(0.02, n=4)
-    data.save(tmp_path / "d.npz")
-    loaded = CalibrationData.load(tmp_path / "d.npz")
-    assert len(loaded.checks) == 5 and len(loaded.grid_times) == 16
-    assert np.allclose(loaded.checks[2][3], data.checks[2][3])
+    data = user.calibration_data()
+    with_h, _, st = _fit(data)
+    without, _, _ = _fit(CalibrationData(grid=data.grid))
+    assert np.allclose(with_h.coef, without.coef) and np.allclose(with_h.eyeball.c,
+                                                                 without.eyeball.c)
+    assert st["erro_cabeca_px"] > 0 and st["n_cabeca_usadas"] > 0
+    assert set(st["erro_cabeca_por_direcao_px"]) <= {"direita", "esquerda", "cima", "baixo"}
 
 
 def test_cv_report():
     user = SimUser(10)
     _, _, stats = _fit(user.calibration_data())
     assert len(stats["erro_loo_por_alvo_px"]) == 16
-    assert "erro_cv_cabeca_px" in stats and stats["correcao"] in (
+    assert "erro_cabeca_px" in stats and stats["correcao"] in (
         "nenhuma", "deslocamento", "afim", "quadratica")
     assert {c["correcao"] for c in stats["candidatos"]} >= {"nenhuma", "afim", "quadratica"}
-    assert stats["feixes_convergem_frac"] > 0.9
+
+
+def test_fixed_correction_skips_selection():
+    _, _, stats = _fit(SimUser(10).calibration_data(), correction=("afim", 1e-2))
+    assert stats["correcao"] == "afim" and stats["ridge_alpha"] == pytest.approx(1e-2)
+    assert {c["correcao"] for c in stats["candidatos"]} == {"nenhuma", "afim"}
 
 
 def test_few_targets_use_simpler_corrections():
@@ -475,31 +446,6 @@ def test_landmarks_saved_and_recomputed(tmp_path):
     assert loaded.has_landmarks
     again = recompute(loaded)
     assert np.allclose(again.grid[0][2], data.grid[0][2], atol=1e-4)
-
-
-def test_mouth_stage_cancels_mouth_artifact():
-    """Abrir a boca fazia o olhar descer: o MediaPipe deforma a malha inteira.
-    A etapa da boca (olhar fixo, boca abrindo e fechando) ensina quanto
-    descontar."""
-    user = SimUser(14, **dict(COMPRESSED, mouth_coupling=0.6))
-    with_m, _, stats = _fit(user.calibration_data(mouth_stage=True))
-    without, _, _ = _fit(user.calibration_data())
-    assert "boca_px_por_unidade" in stats
-    e_without = user.mean_error(without, mouth=0.12)
-    e_with = user.mean_error(with_m, mouth=0.12)
-    assert e_without > 80
-    assert e_with < 0.5 * e_without, (e_with, e_without)
-    assert abs(user.mean_error(with_m) - user.mean_error(without)) < 15
-
-
-def test_mouth_correction_needs_mouth_variation():
-    user = SimUser(15)
-    data = user.calibration_data()
-    data.mouth_target = (960, 540)
-    data.mouth_raw = np.array([user.sample(960, 540)[1] for _ in range(30)])
-    data.mouth_features = np.zeros((30, 2))
-    model, _, _ = _fit(data)
-    assert not np.any(model.mouth_coef)
 
 
 def test_calibration_save_load(tmp_path):

@@ -69,29 +69,44 @@ def recompute(data: CalibrationData) -> CalibrationData:
             grid_times.append(times(data.grid_times[j], len(obs), idx))
     if grid_times and all(g is not None for g in grid_times):
         out.grid_times = grid_times
-    for (t, _, _, tt), obs in zip(data.checks, data.check_obs):
-        if obs:
-            f, r, o, idx = run(obs)
-            ct = times(tt, len(obs), idx)
-            if ct is not None and len(r):
-                out.checks.append((t, f, r, ct))
-                out.check_obs.append(o)
     if data.head_obs:
         out.head_target = data.head_target
         out.head_features, out.head_raw, out.head_obs, _ = run(data.head_obs)
-    if data.mouth_obs:
-        out.mouth_target = data.mouth_target
-        out.mouth_features, out.mouth_raw, out.mouth_obs, _ = run(data.mouth_obs)
     out.feature_version = FEATURE_VERSION
     return out
 
 
-def load(path: Path) -> CalibrationData | None:
-    """Carrega e, se houver landmarks, recalcula. None se não der para usar."""
+CACHE_DIR = ROOT / "results" / ".cache"
+
+
+def _source_digest() -> str:
+    """Impressão digital do código que gera as medidas: muda o código, o
+    cache é refeito."""
+    import hashlib
+    h = hashlib.sha1()
+    for name in ("gaze.py", "head_pose.py", "geometry.py", "landmarks.py", "config.py"):
+        h.update((ROOT / "eyegaze" / name).read_bytes())
+    return h.hexdigest()[:12]
+
+
+def load(path: Path, cache: bool = True) -> CalibrationData | None:
+    """Carrega e, se houver landmarks, recalcula com o estimador atual. None
+    se não der para usar. As medidas recalculadas ficam em cache
+    (results/.cache), invalidado quando o código do estimador muda."""
+    path = Path(path)
+    cached = CACHE_DIR / f"{path.stem}_{_source_digest()}.npz"
+    if cache and cached.exists():
+        return CalibrationData.load(cached)
     data = CalibrationData.load(path)
-    if data.has_landmarks:
-        return recompute(data)
-    return None if data.stale else data
+    if not data.has_landmarks:
+        return None if data.stale else data
+    out = recompute(data)
+    if cache:
+        try:
+            out.save(cached)
+        except OSError:
+            pass
+    return out
 
 
 def validation_error(model, valid: CalibrationData, mad: float = 3.5):
@@ -143,7 +158,7 @@ def main(argv=None) -> int:
     variants = [
         ("padrão", dict(), data),
         ("só monitor virtual (sem correção)", dict(corrections=()), data),
-        ("sem etapa da cabeça", dict(), CalibrationData(grid=data.grid, grid_obs=data.grid_obs)),
+        ("olhos com peso igual", dict(weight_eyes=False), data),
     ]
     print(f"\n{'variante':36s} {'pupila':>10s} {'correção':>12s} {'ajuste':>7s} {'LOO':>6s} "
           f"{'cabeça':>7s} {'validação':>14s}  (erro médio, px)")
@@ -151,7 +166,7 @@ def main(argv=None) -> int:
         model, results, stats = fit_from_samples(d, screen, width_cm, args.mad, **kw)
         fit_err = np.mean([r.error_px for r in results])
         loo = stats.get("erro_loo_medio_px", float("nan"))
-        head = stats.get("erro_cv_cabeca_px", float("nan"))
+        head = stats.get("erro_cabeca_px", float("nan"))
         va, vo, _ = validation_error(model, valid, args.mad) if valid else (np.nan, np.nan, [])
         print(f"{name:36s} {stats['fonte_pupila']:>10s} {stats['correcao']:>12s} {fit_err:7.0f} "
               f"{loo:6.0f} {head:7.0f} {va:7.0f} ({vo:4.0f})")
@@ -161,10 +176,7 @@ def main(argv=None) -> int:
     for eye, g in stats["globo"].items():
         print(f"  olho {eye:8s}: raio {g['raio_cm']:.2f} cm, pupila em repouso "
               f"{np.round(g['repouso_pupila_cm'], 3)}, ganho da pupila (x, y) "
-              f"{np.round(g['ganho_pupila'], 2)}")
-    if "interseccao_dist_tela_cm" in stats:
-        print(f"Intersecção dos feixes na grade: z mediano {stats['interseccao_dist_tela_cm']:+.1f} cm "
-              f"(convergem em {100 * stats['feixes_convergem_frac']:.0f}% das amostras)")
+              f"{np.round(g['ganho_pupila'], 2)}, peso no ponto da tela {g['peso']:.2f}")
     if valid:
         print("\nValidação por alvo (padrão):")
         for t, pred, e in validation_error(model, valid, args.mad)[2]:

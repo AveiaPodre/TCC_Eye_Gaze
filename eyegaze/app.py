@@ -126,6 +126,11 @@ class EyeGazeApp:
         # Aviso de postura fora da calibração.
         self.posture_off = False
         self._posture_off_since: float | None = None
+        # Correção contínua por alvos conhecidos (confirm_target e cliques
+        # depois do ajuste fino pela cabeça): quantas correções foram feitas
+        # e se o modelo mudou desde que foi salvo.
+        self.online_corrections = 0
+        self._model_dirty = False
 
     # ------------------------------------------------------------ helpers
     def toast(self, message: str, seconds: float = 1.6):
@@ -176,7 +181,22 @@ class EyeGazeApp:
         step = self.model.correct_with_known_target(np.array(self.recent_raw), target,
                                                     a.gain, a.max_step_px)
         self.recent_raw.clear()
+        self.online_corrections += 1
+        self._model_dirty = True
         return step
+
+    def _learn_from_fine_click(self):
+        """Clique depois do ajuste fino pela cabeça: o ponto final do cursor é
+        o alvo, e o ajuste feito com a cabeça é o erro do olhar ali. Corrige o
+        offset (como confirm_target) e zera o ajuste fino."""
+        a = self.cfg.adapt
+        if not (a.learn_from_fine_clicks and self.fine_enabled and self.calibrated
+                and self.screen_point is not None):
+            return
+        if float(np.linalg.norm(self.fine.offset)) < a.fine_min_px:
+            return
+        if self.confirm_target(self.screen_point.copy()) is not None:
+            self.fine.reset()
 
     # --------------------------------------------------------- pipeline
     def process_frame(self, frame: np.ndarray, timestamp_ms: int, now: float):
@@ -237,6 +257,7 @@ class EyeGazeApp:
                 self._last_mouse = self.screen_point.copy()
             if self.dwell_enabled and self.dwell.update(self.screen_point, now):
                 self.mouse.click()
+                self._learn_from_fine_click()
                 self.toast("Clique (dwell)", 0.8)
         else:
             self.dwell.reset()
@@ -281,6 +302,7 @@ class EyeGazeApp:
             self.estimator.eyeball = self.model.eyeball
             self.stabilizer.reset()
             self.model.save(self.cfg.calibration.save_path)
+            self.online_corrections, self._model_dirty = 0, False
             self.toast("Calibracao salva")
             if self.cfg.validation.after_calibration:
                 self.start_validation("imediata")
@@ -288,9 +310,11 @@ class EyeGazeApp:
         elif isinstance(proc, RecenterProcedure) and proc.succeeded:
             # A postura nova passa a ser a referência do aviso.
             self.model.save(self.cfg.calibration.save_path)
+            self._model_dirty = False
             self.toast("Recentralizado")
         elif isinstance(proc, ValidationProcedure) and proc.applied_offset is not None:
             self.model.save(self.cfg.calibration.save_path)
+            self._model_dirty = False
         elif isinstance(proc, RecenterProcedure) and proc.collecting_done:
             self.toast("Desvio grande demais: recalibre (ESPACO)", 4.0)
         self.posture_off, self._posture_off_since = False, None
@@ -387,7 +411,11 @@ class EyeGazeApp:
             img = cv2.flip(img, 1)
 
         face_ok = self.obs is not None
-        lines = [(f"FPS {self.fps:4.1f}", GRAY),
+        cam_fps = getattr(self.source, "measured_fps", None)
+        fps_txt = f"FPS {self.fps:4.1f}" + (f" (camera {cam_fps:4.1f})" if cam_fps else "")
+        low_fps = cam_fps is not None and cam_fps < 25
+        lines = [(fps_txt + ("  BAIXO: luz/exposicao?" if low_fps else ""),
+                  YELLOW if low_fps else GRAY),
                  ("Rosto: detectado" if face_ok else "Rosto: NAO detectado",
                   GREEN if face_ok else RED)]
         if self.sample is not None and self.sample.blink:
@@ -410,16 +438,18 @@ class EyeGazeApp:
             lines.append(("Ajuste fino pela cabeca: OFF (A)", GRAY))
         if self.posture_off:
             lines.append(("Postura fora da calibracao: R para recentralizar", YELLOW))
+        if self.online_corrections:
+            ox, oy = self.model.offset
+            lines.append((f"Correcao continua: {self.online_corrections} alvo(s), "
+                          f"desvio ({ox:+.0f}, {oy:+.0f}) px", GRAY))
         gaze = self.sample.gaze if self.sample is not None else None
         if self.show_gaze and gaze is not None:
             yaw, pitch = direction_to_angles(gaze.direction)
             tag = "globo calibrado" if self.calibrated else "globo anatomico, sem calibracao"
             lines.append((f"Olhar yaw {yaw:+5.1f}  pitch {pitch:+5.1f} graus ({tag})", YELLOW))
-            if gaze.vergence is not None:
-                lines.append((f"Interseccao dos feixes a {gaze.vergence[2]:+.0f} cm do plano "
-                              "da tela", GRAY))
-            else:
-                lines.append(("Feixes nao convergem: usando a bissetriz", GRAY))
+            if gaze.weights is not None and self.calibrated:
+                lines.append((f"Peso dos olhos: direito {gaze.weights[0]:.2f}  "
+                              f"esquerdo {gaze.weights[1]:.2f}", GRAY))
         if self.sample is not None and (self.show_head_pose or self.calibrated):
             hy, hp, hr = self.sample.head.euler_deg
             if self.calibrated:
@@ -539,6 +569,9 @@ class EyeGazeApp:
             while self.step():
                 pass
         finally:
+            if self.calibrated and self._model_dirty:
+                # Guarda a correção contínua aprendida durante o uso.
+                self.model.save(self.cfg.calibration.save_path)
             self.source.release()
             self.tracker.close()
             if self.recorder is not None:

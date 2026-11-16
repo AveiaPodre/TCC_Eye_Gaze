@@ -32,6 +32,17 @@ class CameraConfig:
     # Espelha apenas a IMAGEM EXIBIDA (efeito "espelho"). O processamento é
     # sempre feito sobre o frame original, então isso não afeta o olhar.
     mirror_display: bool = True
+    # Captura. "auto" usa o backend padrão do OpenCV; no Windows, "dshow" e
+    # "msmf" diferem em fps, formatos e controles de exposição.
+    backend: str = "auto"
+    # MJPG: em 1080p, muitas webcams só chegam a 30 fps nesse formato (em
+    # YUY2 caem para 5-15 fps).
+    mjpg: bool = True
+    # Exposição fixa (valor do driver; None = automática). Com pouca luz, a
+    # exposição automática alonga o tempo de cada quadro: o fps cai e a íris
+    # borra nas sacadas.
+    exposure: float | None = None
+    autofocus: bool = True
 
 
 @dataclass
@@ -70,8 +81,6 @@ class GazeConfig:
     # escala dela não é coerente com o campo de visão suposto), e o rosto
     # inteiro em cm ficava a 56% do tamanho real.
     outer_canthi_cm: float = 9.0
-    # "pinhole" (acima) ou "mediapipe" (translação da matriz do modelo).
-    depth_source: str = "pinhole"
     # Razão raio do globo / largura do olho (cantos): ~12 mm / ~30 mm.
     eyeball_radius_ratio: float = 0.40
 
@@ -115,9 +124,12 @@ class StabilizerConfig:
 
 @dataclass
 class CalibrationConfig:
-    # 4x4: o eixo vertical tem o sinal mais fraco e precisa de mais linhas
-    # de alvos do que o 3x3 oferecia (~35 s no total).
-    grid_cols: int = 4
+    # 3 colunas x 4 linhas (12 alvos, ~25-30 s). Nas 40 sessões gravadas
+    # (grade 4x4), tirar uma COLUNA deu a mesma validação que os 16 alvos
+    # (148 px; 79-80 sem o desvio constante); tirar uma LINHA piorou ~5%
+    # (155-157 px): o eixo vertical tem o sinal mais fraco e precisa das 4
+    # linhas (docs/metodologia.md, seção 5.4).
+    grid_cols: int = 3
     grid_rows: int = 4
     # Distância dos alvos à borda (fração da tela). Era 0,08: a última linha
     # ficava a 92% da altura, e abaixo dela (barra de tarefas) o modelo
@@ -143,20 +155,13 @@ class CalibrationConfig:
     # na validação cruzada passa de ``retry_ratio`` x a mediana (e de
     # ``retry_min_frac`` da largura da tela) são coletados de novo, uma vez
     # (piscada longa, distração, olhar fora do alvo).
-    # Controle de deriva: um ponto de checagem no CENTRO no início e a cada
-    # ``drift_check_every`` alvos da grade. Como a pessoa olha sempre para o
-    # mesmo ponto conhecido, a mudança da pupila entre as checagens é deriva
-    # (cansaço, olho ressecando, postura escorregando); a calibração a
-    # desconta e fica ajustada ao estado do fim (calibration.correct_drift).
-    drift_checks: bool = True
-    drift_check_every: int = 4
-    # Ao abrir o app com uma calibração salva, recentraliza (1 ponto) antes
-    # de usar: reancora o desvio da nova sessão.
-    recenter_on_start: bool = True
     retry_bad_targets: bool = True
     retry_max_targets: int = 3
     retry_ratio: float = 2.5
     retry_min_frac: float = 0.08
+    # Ao abrir o app com uma calibração salva, recentraliza (1 ponto) antes
+    # de usar: reancora o desvio da nova sessão.
+    recenter_on_start: bool = True
     # Grau máximo da correção monitor virtual -> real (calibration.py):
     # 1 = até afim; 2 = também quadrática. A validação cruzada escolhe.
     polynomial_degree: int = 2
@@ -166,42 +171,37 @@ class CalibrationConfig:
     # (tools/reavaliar.py).
     results_dir: Path = PROJECT_ROOT / "results"
 
-    # Etapa de movimento da cabeça (após os alvos): o usuário mantém o
-    # olhar no alvo central e gira a cabeça seguindo as setas. É o que
-    # permite separar movimento de olho de movimento de cabeça.
-    head_stage: bool = True
+    # Calibração manual (tecla C): cada alvo só avança quando o usuário,
+    # olhando para ele, aperta ESPAÇO/ENTER (útil quando um operador conduz
+    # a calibração).
+    manual: bool = False
+
+    # Recentralização (R): desvios maiores que esta fração da tela (em cada
+    # eixo) não são aplicados; a mensagem pede para recalibrar.
+    recenter_max_frac: float = 0.25
+    # Alvos da recentralização (frações da tela). O desvio é a MÉDIA dos
+    # erros nesses alvos: com 1 ponto a correção piorava o erro nas
+    # validações gravadas (138 -> 147 px); com 3, 96 px; com 5, 91 px.
+    recenter_points: tuple = ((0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7))
+
+    # Etapa da cabeça (modo pesquisa; ``--pesquisa`` ou ``--gravar``): depois
+    # dos alvos, o olhar fica no centro e a pessoa gira a cabeça seguindo as
+    # setas. As amostras NÃO entram no ajuste: medem o erro com a cabeça em
+    # poses novas. Treinar com elas melhorava a validação em só ~3 px, e a
+    # etapa é inadequada para quem não consegue mover a cabeça.
+    head_stage: bool = False
     # Quanto girar em cada direção (yaw, pitch em graus, em relação à pose
     # da grade). A seta enche conforme a cabeça gira e fica verde ao chegar
     # a ``head_reach_frac`` do alvo; depois de ``head_hold_s`` ali, passa
     # para a próxima direção. Quem não alcança segue após o tempo limite.
-    # Nos dados reais, sem guia, as pessoas giravam até 30-40°, faixa em
-    # que os landmarks do olho não são confiáveis.
     head_target_deg: tuple = (10.0, 8.0)
     head_reach_frac: float = 0.8
     head_hold_s: float = 0.6
     head_step_timeout_s: float = 4.0
     head_center_s: float = 1.0        # etapa final com a cabeça de volta ao centro
     head_motion_settle_s: float = 0.8
-    # Faixa aproveitada no ajuste (amostras além dela são descartadas).
+    # Faixa usada no teste (amostras além dela são descartadas).
     head_max_deg: tuple = (15.0, 12.0)
-    head_motion_weight: float = 1.0   # peso da etapa, em "número de alvos"
-
-    # Etapa da boca (depois da etapa da cabeça): olhar fixo no centro e a boca
-    # abrindo e fechando. Ensina quanto a abertura da boca desloca a
-    # estimativa (o MediaPipe deforma a malha inteira) para descontá-la.
-    mouth_stage: bool = True
-    mouth_stage_s: float = 4.0       # duração mínima
-    mouth_timeout_s: float = 7.0     # segue mesmo se a boca não abrir
-    mouth_min_open: float = 0.08     # abertura pedida (lábios / largura entre olhos)
-
-    # Calibração manual (tecla C): cada alvo só avança quando o usuário,
-    # olhando para ele, aperta ESPAÇO/ENTER. As etapas da cabeça e da boca
-    # continuam automáticas.
-    manual: bool = False
-
-    # Recentralização (R): desvios maiores que esta fração da tela (em cada
-    # eixo) não são aplicados; a mensagem pede para recalibrar.
-    recenter_max_frac: float = 0.25
 
     # Largura física da tela (cm): tamanho do MONITOR VIRTUAL onde o olhar é
     # projetado (geometry.VirtualScreen). Preenchida por --screen-width-cm ou
@@ -215,9 +215,10 @@ class CalibrationConfig:
 @dataclass
 class ValidationConfig:
     # Validação IMEDIATA, logo depois da calibração (mede o erro do modelo,
-    # sem tempo para a postura mudar). A tecla T faz o RETESTE, mais tarde:
-    # o primeiro ponto (centro) mede a deriva desde a calibração e reancora.
-    after_calibration: bool = True
+    # sem tempo para a postura mudar); ligada no modo pesquisa. A tecla T faz
+    # o RETESTE, mais tarde: o primeiro ponto (centro) mede a deriva desde a
+    # calibração e reancora.
+    after_calibration: bool = False
     # Alvos de validação (frações da tela), diferentes dos de calibração.
     # O PRIMEIRO precisa ser o centro (ponto de reancoragem do reteste).
     points: tuple = (
@@ -258,12 +259,21 @@ class PostureConfig:
 
 @dataclass
 class AdaptConfig:
-    # Correção contínua por alvos conhecidos (ex.: tecla do teclado virtual
-    # selecionada): o offset anda ``gain`` do caminho até o erro medido,
-    # limitado a ``max_step_px`` por correção.
+    # Correção contínua por alvos conhecidos: o offset anda ``gain`` do
+    # caminho até o erro medido, limitado a ``max_step_px`` por correção.
+    # Nas validações gravadas, com os alvos chegando um a um, esse passo
+    # levou o erro de 138 para 101 px (94 px depois de 7 alvos); usar só o
+    # último alvo dava 116 px.
     gain: float = 0.3
     max_step_px: float = 80.0
     window_frames: int = 15        # amostras recentes usadas (~0,5 s)
+    # Fontes de alvos conhecidos durante o uso. Num clique pelo olhar, o
+    # clique cai onde o cursor (a própria estimativa) está e não ensina nada;
+    # mas, com o ajuste fino pela cabeça (tecla A), o cursor foi corrigido
+    # pela cabeça antes do clique: o ponto final é o alvo, e a correção feita
+    # é o erro do olhar naquele momento.
+    learn_from_fine_clicks: bool = True
+    fine_min_px: float = 15.0      # ajuste menor que isto não conta (balanço da cabeça)
 
 
 @dataclass

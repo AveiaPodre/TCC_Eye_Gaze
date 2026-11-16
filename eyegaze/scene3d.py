@@ -245,28 +245,25 @@ def render_scene(view: OrbitView, screen: VirtualScreen, sample: GazeSample | No
                 if gaze.open[k]:
                     pj.circle_3d(img, gaze.corrected[k], 0.15, C_CORRECTED, 1)
                 if gaze.open[k]:
+                    # Etapa 4: cada feixe até o monitor virtual (ponto do olho).
                     hit = screen.hit(c, d)[0]
-                    end = hit if np.all(np.isfinite(hit)) else c + 80.0 * d
-                    pj.line(img, c, end, C_BEAM, 1)
-            if gaze.vergence is not None:
-                pj.line(img, gaze.origin, gaze.vergence, C_VERGENCE, 1)
-                pj.marker(img, gaze.vergence, C_VERGENCE, cv2.MARKER_DIAMOND, 10)
-                lines.append((f"interseccao dos feixes: z = {gaze.vergence[2]:+.1f} cm "
-                              f"(distancia entre feixes {gaze.vergence_gap_cm:.2f} cm)",
-                              C_VERGENCE))
-            else:
-                lines.append(("feixes nao convergem a frente: bissetriz", C_VERGENCE))
-            # Etapa 4: vetor do olhar até o monitor virtual.
-            hit = screen.hit(gaze.origin, gaze.direction)[0]
-            if np.all(np.isfinite(hit)):
-                pj.line(img, gaze.origin, hit, C_VIRTUAL, 2)
-                pj.marker(img, hit, C_VIRTUAL)
-            else:
-                pj.line(img, gaze.origin, gaze.origin + 80.0 * gaze.direction, C_VIRTUAL, 2)
+                    if np.all(np.isfinite(hit)):
+                        pj.line(img, c, hit, C_BEAM, 1)
+                        pj.marker(img, hit, C_VERGENCE, cv2.MARKER_DIAMOND, 8)
+                    else:
+                        pj.line(img, c, c + 80.0 * d, C_BEAM, 1)
+            if gaze.weights is not None:
+                lines.append((f"peso dos olhos: direito {gaze.weights[0]:.2f}  "
+                              f"esquerdo {gaze.weights[1]:.2f}", C_VERGENCE))
             yaw, pitch = direction_to_angles(gaze.direction)
             lines.append((f"vetor do olhar: yaw {yaw:+.1f}  pitch {pitch:+.1f} graus", C_VIRTUAL))
         if virtual_point is not None and np.all(np.isfinite(virtual_point)):
-            pj.circle_3d(img, to_cm(virtual_point), 0.8, C_VIRTUAL, 1)
+            # Ponto do monitor virtual: média ponderada dos pontos dos olhos.
+            v = to_cm(virtual_point)
+            if gaze is not None:
+                pj.line(img, gaze.origin, v, C_VIRTUAL, 2)
+            pj.marker(img, v, C_VIRTUAL)
+            pj.circle_3d(img, v, 0.8, C_VIRTUAL, 1)
         # Etapa 5: cursor no monitor real (correção + estabilizador).
         if cursor is not None and gaze is not None:
             c = to_cm(cursor)
@@ -282,8 +279,8 @@ def render_scene(view: OrbitView, screen: VirtualScreen, sample: GazeSample | No
     legend = [("globo (0,4 x largura do olho); ponto = pupila medida", C_EYE),
               ("laranja: pupila corrigida pelo ganho da calibracao", C_CORRECTED),
               ("azul claro: feixe centro -> pupila de cada olho", C_BEAM),
-              ("branco: interseccao dos feixes", C_VERGENCE),
-              ("magenta: vetor do olhar -> monitor virtual", C_VIRTUAL),
+              ("branco: ponto de cada olho no monitor virtual", C_VERGENCE),
+              ("magenta: ponto do olhar no monitor virtual (media ponderada)", C_VIRTUAL),
               ("amarelo: cursor no monitor real" + ("" if calibrated else " (sem calibracao)"),
                C_CURSOR)]
     for i, (s, color) in enumerate(lines + legend):

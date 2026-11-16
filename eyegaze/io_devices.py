@@ -21,20 +21,40 @@ class FrameSource:
     câmera: grave uma sessão e rode o pipeline sobre ela.
     """
 
+    BACKENDS = {"auto": cv2.CAP_ANY, "dshow": cv2.CAP_DSHOW, "msmf": cv2.CAP_MSMF}
+
     def __init__(self, camera_index: int = 0, video_path: str | None = None,
-                 width: int = 1280, height: int = 720, fps: int = 30):
+                 width: int = 1280, height: int = 720, fps: int = 30,
+                 backend: str = "auto", mjpg: bool = True, exposure: float | None = None,
+                 autofocus: bool = True):
         self.is_file = video_path is not None
-        self.cap = cv2.VideoCapture(video_path if self.is_file else camera_index)
+        if self.is_file:
+            self.cap = cv2.VideoCapture(video_path)
+        else:
+            self.cap = cv2.VideoCapture(camera_index, self.BACKENDS.get(backend, cv2.CAP_ANY))
         if not self.cap.isOpened():
             what = video_path if self.is_file else f"câmera {camera_index}"
             raise RuntimeError(f"Não foi possível abrir {what}. "
-                               "Tente outro índice com --camera N.")
+                               "Tente outro índice com --camera N ou outro --backend.")
         if not self.is_file:
+            if mjpg:
+                # O formato precisa vir ANTES da resolução: alguns drivers só
+                # oferecem resoluções altas a 30 fps em MJPG.
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             self.cap.set(cv2.CAP_PROP_FPS, fps)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # ignorado por alguns drivers
+            if exposure is not None:
+                # 0.25 = exposição manual no DirectShow; o MSMF usa 0/1. Cada
+                # driver aceita ou ignora; o valor lido é mostrado no início.
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, float(exposure))
+            if not autofocus:
+                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
         self._t0 = time.monotonic()
+        # Fps REAL (medido pela thread de leitura), não o pedido ao driver.
+        self._grab_times: list[float] = []
         # Webcam: uma thread lê a câmera sem parar e guarda só o quadro mais
         # recente. Com leitura síncrona, quando o processamento de um quadro
         # passava de ~33 ms (calibração/validação, gravação), o driver
@@ -56,7 +76,11 @@ class FrameSource:
                 self._failed = True
                 self._new.set()
                 return
-            self._latest = (frame, int((time.monotonic() - self._t0) * 1000))
+            now = time.monotonic()
+            self._latest = (frame, int((now - self._t0) * 1000))
+            self._grab_times.append(now)
+            if len(self._grab_times) > 90:
+                del self._grab_times[:-90]
             self._new.set()
 
     def read(self) -> tuple[np.ndarray | None, int]:
@@ -77,6 +101,22 @@ class FrameSource:
         return (int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
                 int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 
+    @property
+    def measured_fps(self) -> float | None:
+        """Fps real da câmera nos últimos ~3 s (None se ainda não deu para medir)."""
+        t = list(self._grab_times)
+        if len(t) < 10:
+            return None
+        return (len(t) - 1) / max(t[-1] - t[0], 1e-6)
+
+    def describe(self) -> str:
+        """Formato, fps pedido ao driver e exposição, para o log de início."""
+        cc = int(self.cap.get(cv2.CAP_PROP_FOURCC))
+        fourcc = "".join(chr((cc >> 8 * i) & 0xFF) for i in range(4)).strip("\x00") or "?"
+        return (f"formato {fourcc}, fps do driver {self.cap.get(cv2.CAP_PROP_FPS):.0f}, "
+                f"exposição {self.cap.get(cv2.CAP_PROP_EXPOSURE):.1f}, "
+                f"backend {self.cap.getBackendName()}")
+
     def release(self):
         self._stop = True
         if self._thread is not None:
@@ -94,7 +134,7 @@ class SessionRecorder:
 
     def __init__(self, base_path: Path, fps: float, frame_size: tuple[int, int],
                  screen_size: tuple[int, int], seed: int,
-                 screen_width_cm: float | None = None):
+                 screen_width_cm: float | None = None, protocol: dict | None = None):
         self.base = Path(base_path)
         self.base.parent.mkdir(parents=True, exist_ok=True)
         self.video_path = self.base.with_suffix(".avi")
@@ -105,6 +145,7 @@ class SessionRecorder:
             raise RuntimeError(f"Não foi possível gravar {self.video_path}")
         self.meta = {"versao": 1, "tela": list(screen_size), "camera": list(frame_size),
                      "fps": fps, "semente": int(seed), "tela_cm": screen_width_cm,
+                     "protocolo": protocol,
                      "timestamps_ms": [], "teclas": []}
 
     @property
@@ -159,6 +200,11 @@ class ReplaySource:
     def screen_width_cm(self) -> float | None:
         """Largura física da tela gravada (None em gravações antigas)."""
         return self.meta.get("tela_cm")
+
+    @property
+    def protocol(self) -> dict | None:
+        """Protocolo da calibração gravado (None em gravações antigas)."""
+        return self.meta.get("protocolo")
 
     @property
     def resolution(self) -> tuple[int, int]:

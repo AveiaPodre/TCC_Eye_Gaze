@@ -44,8 +44,22 @@ def parse_args(argv=None):
                         "define a escala do rosto em cm")
     p.add_argument("--distance-cm", type=float, default=None,
                    help="distância olho-tela (para erro em graus na validação)")
+    p.add_argument("--backend", choices=("auto", "dshow", "msmf"), default="auto",
+                   help="backend de captura no Windows (padrão: o do OpenCV)")
+    p.add_argument("--sem-mjpg", action="store_true",
+                   help="não pede MJPG à câmera (por padrão pede: em 1080p muitas webcams "
+                        "só chegam a 30 fps em MJPG)")
+    p.add_argument("--exposicao", type=float, default=None,
+                   help="exposição fixa (valor do driver, ex.: -6 no DirectShow); evita "
+                        "que a exposição automática derrube o fps com pouca luz")
+    p.add_argument("--sem-autofoco", action="store_true",
+                   help="desliga o foco automático (evita a nitidez do olho oscilar)")
+    p.add_argument("--pesquisa", action="store_true",
+                   help="modo pesquisa: etapa da cabeça (teste) e validação imediata após "
+                        "cada calibração. Ligado automaticamente com --gravar")
     p.add_argument("--gravar", action="store_true",
-                   help="grava o vídeo da câmera e as teclas em results/sessao_*.avi/.json")
+                   help="grava o vídeo da câmera e as teclas em results/sessao_*.avi/.json "
+                        "(implica --pesquisa)")
     p.add_argument("--reproduzir", type=str, default=None,
                    help="reproduz uma sessão gravada (results/sessao_*.json) com o código "
                         "atual; os resultados vão para results/reproducoes/")
@@ -61,8 +75,31 @@ def _set_screen_width(cfg: AppConfig, width_cm: float | None):
     cfg.validation.screen_width_cm = width_cm
 
 
+def _research_mode(cfg: AppConfig):
+    """Modo pesquisa: mede mais (cabeça em poses novas, validação imediata)
+    à custa de uma calibração mais longa."""
+    cfg.calibration.head_stage = True
+    cfg.validation.after_calibration = True
+
+
+def protocol_of(cfg: AppConfig) -> dict:
+    """Protocolo da calibração, gravado com a sessão para a reprodução."""
+    c = cfg.calibration
+    return {"grade": [c.grid_cols, c.grid_rows], "etapa_cabeca": c.head_stage,
+            "validacao_imediata": cfg.validation.after_calibration}
+
+
 def _replay(args, cfg: AppConfig) -> int:
     source = ReplaySource(Path(args.reproduzir))
+    proto = source.protocol
+    if proto is None:
+        print("[Reprodução] Sessão gravada antes do protocolo atual (grade 4x4 com checagens "
+              "do centro e etapa da boca): a calibração reproduzida NÃO acompanha os alvos "
+              "do vídeo. Para comparar variantes, use tools/benchmark.py.")
+    else:
+        cfg.calibration.grid_cols, cfg.calibration.grid_rows = proto["grade"]
+        cfg.calibration.head_stage = bool(proto["etapa_cabeca"])
+        cfg.validation.after_calibration = bool(proto["validacao_imediata"])
     name = Path(args.reproduzir).stem
     out = cfg.calibration.results_dir / "reproducoes" / name
     # Resultados separados das sessões reais, e sem tocar na calibração salva.
@@ -96,6 +133,12 @@ def main(argv=None) -> int:
     cfg.validation.viewing_distance_cm = args.distance_cm
     if args.camera_fov:
         cfg.camera.hfov_deg = args.camera_fov
+    cfg.camera.backend = args.backend
+    cfg.camera.mjpg = not args.sem_mjpg
+    cfg.camera.exposure = args.exposicao
+    cfg.camera.autofocus = not args.sem_autofoco
+    if args.pesquisa or args.gravar:
+        _research_mode(cfg)
 
     if args.reproduzir:
         return _replay(args, cfg)
@@ -122,8 +165,12 @@ def main(argv=None) -> int:
         cfg.calibration.save_path.unlink()
 
     source = FrameSource(cfg.camera.index, args.video, cfg.camera.width,
-                         cfg.camera.height, cfg.camera.fps)
-    print(f"[Câmera] {source.resolution[0]}x{source.resolution[1]}")
+                         cfg.camera.height, cfg.camera.fps, backend=cfg.camera.backend,
+                         mjpg=cfg.camera.mjpg, exposure=cfg.camera.exposure,
+                         autofocus=cfg.camera.autofocus)
+    print(f"[Câmera] {source.resolution[0]}x{source.resolution[1]} ({source.describe()})")
+    if args.pesquisa or args.gravar:
+        print("[Modo pesquisa] Etapa da cabeça e validação imediata ligadas.")
 
     recorder = None
     if args.gravar:
@@ -133,7 +180,7 @@ def main(argv=None) -> int:
         stamp = time.strftime("%Y%m%d_%H%M%S")
         recorder = SessionRecorder(cfg.calibration.results_dir / f"sessao_{stamp}",
                                    cfg.camera.fps, source.resolution, screen_size, seed,
-                                   screen_width_cm=width_cm)
+                                   screen_width_cm=width_cm, protocol=protocol_of(cfg))
         print(f"[Gravação] Gravando em {recorder.video_path}")
 
     tracker = FaceTracker(cfg.tracker)

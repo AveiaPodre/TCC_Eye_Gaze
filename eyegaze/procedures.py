@@ -19,12 +19,12 @@ usados para rejeitar outliers, detectar a fixação e no CSV, e o vetor bruto
 ``raw`` (âncoras e pupilas em cm, pose da cabeça), entrada da calibração
 (ver gaze.py e calibration.py).
 
-A calibração percorre os alvos em ordem aleatória e tem uma etapa extra no
-fim: o alvo fica no centro e uma seta pede que a pessoa gire a cabeça
-(direita, esquerda, cima, baixo) sem tirar o olho do alvo. A seta enche
-conforme a cabeça gira e fica verde ao chegar ao ângulo pedido; girar
-demais deixa a seta vermelha. Depois do ajuste, alvos com erro muito alto
-são coletados de novo, uma vez.
+A calibração percorre os alvos em ordem aleatória. Depois do ajuste, alvos
+com erro muito alto são coletados de novo, uma vez. No modo pesquisa há uma
+etapa extra no fim (``CalibrationConfig.head_stage``): o alvo fica no centro
+e uma seta pede que a pessoa gire a cabeça (direita, esquerda, cima, baixo)
+sem tirar o olho do alvo. Essas amostras NÃO entram no ajuste: medem o erro
+com a cabeça em poses novas.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ import numpy as np
 from .calibration import (CalibrationData, CalibrationModel, PointResult, build_grid,
                           fit_from_samples, head_angles, outlier_mask)
 from .config import CalibrationConfig, ValidationConfig
-from .gaze import MOUTH_COL, RAW_FACE, GazeSample
+from .gaze import RAW_FACE, RAW_SIZE, GazeSample
 
 BG = (40, 40, 40)
 WHITE = (240, 240, 240)
@@ -79,6 +79,9 @@ class TargetProcedure:
         # Landmarks e instante (s, relógio do app) de cada amostra.
         self.observations: list[list] = [[] for _ in self.targets]
         self.times: list[list[float]] = [[] for _ in self.targets]
+        # Quadros sem amostra válida (rosto perdido, piscada) durante a coleta
+        # de cada alvo: perda de dados.
+        self.invalid: list[int] = [0 for _ in self.targets]
         # Ordem de visita (índices em ``targets``) e posição atual nela.
         self.order: list[int] = list(range(len(self.targets))) if order is None else list(order)
         self.pos = 0
@@ -190,6 +193,8 @@ class TargetProcedure:
                 self.samples[self.index].append((sample.features(), sample.raw))
                 self.observations[self.index].append(sample.obs)
                 self.times[self.index].append(now)
+            else:
+                self.invalid[self.index] += 1
             enough = len(self.samples[self.index]) >= self.min_samples
             if now - self._collect_start >= self.collect_s and enough:
                 self.pos += 1
@@ -385,29 +390,14 @@ class CalibrationProcedure(TargetProcedure):
 
     def __init__(self, screen_size, cfg: CalibrationConfig):
         targets = build_grid(*screen_size, cfg.grid_cols, cfg.grid_rows, cfg.margin_ratio)
-        n_grid = len(targets)
-        order = list(range(n_grid))
+        order = list(range(len(targets)))
         if cfg.shuffle_targets:
             np.random.default_rng(cfg.random_seed).shuffle(order)
-        if getattr(cfg, "drift_checks", False):
-            # Checagens do centro: no início e a cada ``drift_check_every``
-            # alvos (cada uma com índice próprio, depois dos alvos da grade).
-            center = (screen_size[0] / 2, screen_size[1] / 2)
-            every = max(1, int(cfg.drift_check_every))
-            new_order = []
-            for j, idx in enumerate([None] + order):
-                if idx is not None:
-                    new_order.append(idx)
-                if idx is None or (j % every == 0):
-                    targets.append(center)
-                    new_order.append(len(targets) - 1)
-            order = new_order
         super().__init__(targets, screen_size, cfg.settle_s, cfg.collect_s,
                          cfg.min_samples_per_point, settle_max_s=cfg.settle_max_s,
                          fixation_window=cfg.fixation_window,
                          fixation_max_deg=cfg.fixation_max_deg, order=order)
         self.cfg = cfg
-        self.n_grid = n_grid       # índices >= n_grid são checagens do centro
         self.manual = bool(getattr(cfg, "manual", False))
         self.model: CalibrationModel | None = None
         self.raw_path: Path | None = None
@@ -423,14 +413,6 @@ class CalibrationProcedure(TargetProcedure):
         self.head_delta: np.ndarray | None = None     # desvio atual em relação a ela
         self.head_samples: list[tuple[np.ndarray, np.ndarray]] = []
         self.head_observations: list = []
-        # Etapa da boca (olhar fixo no centro, boca abrindo e fechando).
-        self.mouth_start: float | None = None
-        self._mouth_done = False
-        self.mouth_samples: list[tuple[np.ndarray, np.ndarray]] = []
-        self.mouth_observations: list = []
-        self.mouth_now = 0.0     # abertura atual (para a barra na tela)
-        self.mouth_max = 0.0
-        self._mouth_base: float | None = None
         # Repetição de alvos ruins.
         self.retried_targets: list[int] = []
         self._now = 0.0
@@ -459,41 +441,8 @@ class CalibrationProcedure(TargetProcedure):
                     for r in [self.arrays(i)[1]] if len(r)]
             self.head_base = (np.median(head_angles(np.vstack(grid)), axis=0)
                               if grid else np.zeros(2))
-        elif getattr(self.cfg, "mouth_stage", False) and self.mouth_start is None:
-            self.mouth_start = now
-            grid = [np.atleast_2d(r) for i in range(len(self.targets))
-                    for r in [self.arrays(i)[1]] if len(r)]
-            self._mouth_base = (float(np.median(np.vstack(grid)[:, MOUTH_COL]))
-                                if grid else 0.0)
         else:
             super().targets_done(now)
-
-    # ------------------------------------------------- etapa da boca
-    @property
-    def in_mouth_stage(self) -> bool:
-        return (self.mouth_start is not None and not self._mouth_done
-                and not self.collecting_done and not self.computing)
-
-    def _update_mouth(self, sample, now: float):
-        """Olhar fixo no centro enquanto a boca abre e fecha: ensina à
-        calibração quanto a abertura da boca desloca a estimativa (artefato
-        do MediaPipe; ver calibration.fit_mouth_correction)."""
-        el = now - self.mouth_start
-        valid = sample is not None and sample.valid
-        if valid:
-            self._last_valid = now
-            self.mouth_now = float(sample.raw[MOUTH_COL])
-        if el < self.cfg.head_motion_settle_s:
-            return
-        if valid:
-            self.mouth_samples.append((sample.features(), sample.raw))
-            self.mouth_observations.append(sample.obs)
-            self.mouth_max = max(self.mouth_max, self.mouth_now - (self._mouth_base or 0.0))
-        opened = self.mouth_max >= self.cfg.mouth_min_open
-        if ((el >= self.cfg.mouth_stage_s and opened) or el >= self.cfg.mouth_timeout_s) \
-                and len(self.mouth_samples) >= self.min_samples:
-            self._mouth_done = True
-            self.targets_done(now)
 
     def _update_head(self, sample, now: float):
         el = now - self.head_start
@@ -515,7 +464,7 @@ class CalibrationProcedure(TargetProcedure):
             # Etapa final: cabeça de volta ao centro.
             if step_el >= self.cfg.head_center_s and len(self.head_samples) >= self.min_samples:
                 self._head_done = True
-                self.targets_done(now)   # etapa da boca, se houver
+                self.targets_done(now)
             return
         reached = (self.head_delta is not None and
                    head_progress(self.head_delta, direction, self.cfg.head_target_deg)
@@ -534,8 +483,6 @@ class CalibrationProcedure(TargetProcedure):
             return
         if self.in_head_stage:
             self._update_head(sample, now)
-        elif self.in_mouth_stage:
-            self._update_mouth(sample, now)
         else:
             super().update(sample, now)
 
@@ -544,14 +491,9 @@ class CalibrationProcedure(TargetProcedure):
         return (self.screen_w / 2, self.screen_h / 2)
 
     def current_target(self) -> tuple[float, float]:
-        return (self.head_target if self.in_head_stage or self.in_mouth_stage
-                else super().current_target())
+        return self.head_target if self.in_head_stage else super().current_target()
 
     def status_line(self) -> str:
-        if not self.collecting_done and self.index >= self.n_grid and not self.in_head_stage \
-                and not self.in_mouth_stage:
-            return (f"Calibracao: ponto de referencia no centro ({self.pos + 1}/{len(self.order)})"
-                    "  -  ESC cancela")
         if self.retrying:
             return (f"Calibracao: repetindo alvos com erro alto ({self.pos + 1}/{len(self.order)})"
                     "  -  ESC cancela")
@@ -559,8 +501,6 @@ class CalibrationProcedure(TargetProcedure):
 
     def render(self, now: float) -> np.ndarray:
         self._now = now
-        if not self.computing and self.in_mouth_stage:
-            return self._render_mouth(now)
         if self.computing or not self.in_head_stage:
             return super().render(now)
         canvas = self._blank()
@@ -580,34 +520,6 @@ class CalibrationProcedure(TargetProcedure):
             else:
                 self._centered(canvas, "Volte a cabeca ao CENTRO", 90)
         self._centered(canvas, "Se nao puder mover a cabeca, apenas continue olhando o ponto",
-                       self.screen_h - 75)
-        if now - self._last_valid > 1.0:
-            self._centered(canvas, "Rosto/olhos nao detectados - posicione-se em frente a camera",
-                           135, WARN)
-        return canvas
-
-    def _render_mouth(self, now: float) -> np.ndarray:
-        canvas = self._blank()
-        cx, cy = (int(v) for v in self.head_target)
-        cv2.circle(canvas, (cx, cy), 12, COLLECT, -1, cv2.LINE_AA)
-        cv2.circle(canvas, (cx, cy), 3, (0, 0, 0), -1, cv2.LINE_AA)
-        self._centered(canvas, "Mantenha o OLHAR no ponto verde", 45)
-        if now - self.mouth_start < self.cfg.head_motion_settle_s:
-            self._centered(canvas, "Prepare-se...", 90)
-        else:
-            self._centered(canvas, "ABRA e FECHE a boca devagar, algumas vezes", 90)
-        # Barra com a abertura atual da boca; a marca é o mínimo pedido.
-        bw, bh = 300, 18
-        x0, y0 = cx - bw // 2, cy + 80
-        cv2.rectangle(canvas, (x0, y0), (x0 + bw, y0 + bh), GRAY, 1)
-        full = 2.0 * self.cfg.mouth_min_open
-        k = float(np.clip((self.mouth_now - (self._mouth_base or 0.0)) / full, 0, 1))
-        color = COLLECT if self.mouth_max >= self.cfg.mouth_min_open else TARGET
-        if k > 0:
-            cv2.rectangle(canvas, (x0, y0), (x0 + int(bw * k), y0 + bh), color, -1)
-        xm = x0 + bw // 2
-        cv2.line(canvas, (xm, y0 - 4), (xm, y0 + bh + 4), WHITE, 2)
-        self._centered(canvas, "Se nao puder abrir a boca, apenas continue olhando o ponto",
                        self.screen_h - 75)
         if now - self._last_valid > 1.0:
             self._centered(canvas, "Rosto/olhos nao detectados - posicione-se em frente a camera",
@@ -641,20 +553,10 @@ class CalibrationProcedure(TargetProcedure):
         data = CalibrationData()
         for i, t in enumerate(self.targets):
             feats, raws = self.arrays(i)
-            times = np.asarray(self.times[i], dtype=float)
-            if i < self.n_grid:
-                data.grid.append((t, feats, raws))
-                data.grid_obs.append(self.observations[i])
-                data.grid_times.append(times)
-            elif len(raws):
-                data.checks.append((t, feats, raws, times))
-                data.check_obs.append(self.observations[i])
+            data.grid.append((t, feats, raws))
+            data.grid_obs.append(self.observations[i])
+            data.grid_times.append(np.asarray(self.times[i], dtype=float))
         data.head_obs = self.head_observations
-        if self.mouth_samples:
-            data.mouth_target = self.head_target
-            data.mouth_features = np.array([f for f, _ in self.mouth_samples])
-            data.mouth_raw = np.array([r for _, r in self.mouth_samples])
-            data.mouth_obs = self.mouth_observations
         if self.head_samples:
             data.head_target = self.head_target
             data.head_features = np.array([f for f, _ in self.head_samples])
@@ -665,7 +567,6 @@ class CalibrationProcedure(TargetProcedure):
         return fit_from_samples(
             data, (self.screen_w, self.screen_h), self.cfg.screen_width_cm,
             self.cfg.outlier_mad_threshold,
-            head_weight_points=self.cfg.head_motion_weight,
             head_max_deg=self.cfg.head_max_deg,
             max_degree=self.cfg.polynomial_degree,
             assumed_width_cm=self.cfg.assumed_screen_width_cm,
@@ -730,28 +631,14 @@ class CalibrationProcedure(TargetProcedure):
                 self.message_lines.append(
                     "So o monitor virtual (sem correcao): "
                     f"{st['erro_loo_monitor_virtual_px']:.0f} px")
-            if "erro_cv_cabeca_px" in st:
-                self.message_lines.append(
-                    f"Erro estimado com a cabeca em poses novas: {st['erro_cv_cabeca_px']:.0f} px")
             self.message_lines.append(f"Qualidade: {label} - {advice}")
-        if "n_cabeca_total" in st:
+        if "erro_cabeca_px" in st:
             self.message_lines.append(
-                f"Etapa da cabeca: {st['n_cabeca_usadas']} de {st['n_cabeca_total']} amostras "
-                "dentro da faixa util")
-        if "boca_px_por_unidade" in st:
-            shift = 0.1 * float(np.hypot(*st["boca_px_por_unidade"]))
-            self.message_lines.append(
-                f"Etapa da boca: abrir a boca deslocava ~{shift:.0f} px; agora e descontado")
-        elif self.mouth_samples:
-            self.message_lines.append("Etapa da boca: a boca nao abriu o suficiente; sem correcao")
-        if "deriva_centro_px" in st:
-            self.message_lines.append(
-                f"Deriva durante a calibracao: o centro variou ate {st['deriva_centro_px']:.0f} px"
-                + ("; descontada" if st.get("deriva_corrigida") else ""))
+                f"Teste com a cabeca em poses novas: {st['erro_cabeca_px']:.0f} px "
+                f"({st['n_cabeca_usadas']} de {st['n_cabeca_total']} amostras)")
         if self.retried_targets:
             self.message_lines.append(f"{len(self.retried_targets)} alvo(s) repetido(s)")
-        self.message_lines.append("Branco = alvo, ponto colorido = estimativa. "
-                                  "Em seguida: validacao imediata.")
+        self.message_lines.append("Branco = alvo, ponto colorido = estimativa.")
         print(f"[Calibração] Concluída. Erro médio de ajuste {errs.mean():.1f} px, "
               f"máx {errs.max():.1f} px. Estatísticas: "
               f"{ {k: v for k, v in st.items() if k not in ('candidatos', 'erro_loo_por_alvo_px', 'erro_loo_alvos')} }")
@@ -773,16 +660,24 @@ class ValidationProcedure(TargetProcedure):
 
     Dois tipos:
 
-    * ``"imediata"``: roda sozinha logo depois da calibração. Mede o erro do
-      MODELO, sem tempo para a postura mudar.
-    * ``"reteste"`` (tecla T, mais tarde): mede também a DERIVA desde a
-      calibração. O primeiro alvo é o centro: o deslocamento medido nele é a
-      deriva, e o erro nos outros alvos é reportado bruto e depois de
-      reancorar por ele. No fim, a reancoragem é aplicada ao modelo (como a
-      recentralização), se não for grande demais.
+    * ``"imediata"`` (modo pesquisa): roda sozinha logo depois da
+      calibração. Mede o erro do MODELO. É a única medida do desvio
+      constante que aparece no uso: nas 15 sessões gravadas até 16/11, o erro
+      em pontos novos da calibração (LOO) quase não previa o erro da
+      validação (correlação 0,09), dominado por um desvio médio de ~106 px.
+    * ``"reteste"`` (tecla T, mais tarde): mede o erro depois de um tempo de
+      uso e corrige o desvio pela MÉDIA dos erros de todos os alvos (aplicada
+      ao modelo, se não for grande demais).
+
+    Além do erro bruto, reporta o erro "recentralizado": cada alvo corrigido
+    pela média dos erros dos OUTROS alvos (validação cruzada). É o erro que
+    sobra depois de uma recentralização com vários pontos. Reancorar por um
+    ponto só (o centro, como até 16/11) piorava o erro em média (103 -> 134
+    px nas validações gravadas); com 3 pontos ou mais, melhora (138 -> 96).
 
     O erro sai em px e em graus (com a distância do rosto medida pelo próprio
-    pipeline, se ``--distance-cm`` não for dado) e por região da tela.
+    pipeline, se ``--distance-cm`` não for dado) e por região da tela, com a
+    precisão (RMS amostra a amostra e desvio-padrão) e a perda de dados.
     """
 
     title = "Validacao"
@@ -819,7 +714,7 @@ class ValidationProcedure(TargetProcedure):
 
     def on_complete(self):
         rows, preds_all, n_ok = [], [], []
-        precisions = []
+        precisions, s2s = [], []
         raw_data = CalibrationData()
         faces = []
         for i, target in enumerate(self.targets):
@@ -841,6 +736,9 @@ class ValidationProcedure(TargetProcedure):
             preds_all.append(np.median(preds, axis=0))
             n_ok.append(len(s))
             precisions.append(float(np.sqrt(np.mean(np.sum((preds - preds.mean(0)) ** 2, 1)))))
+            if len(preds) >= 3:
+                # RMS amostra a amostra (RMS-S2S): tremor quadro a quadro.
+                s2s.append(float(np.sqrt(np.mean(np.sum(np.diff(preds, axis=0) ** 2, 1)))))
             for p, f in zip(preds, s):
                 rows.append([i, target[0], target[1], p[0], p[1], f[0], f[1],
                              float(np.hypot(p[0] - target[0], p[1] - target[1]))])
@@ -855,15 +753,22 @@ class ValidationProcedure(TargetProcedure):
         distance = self.cfg.viewing_distance_cm
         if not distance and faces:
             distance = float(np.median(np.vstack(faces)[:, 2]))
-        # Reancoragem pelo primeiro alvo (centro): deriva desde a calibração.
-        anchor = -err[0] if np.all(np.isfinite(err[0])) else np.zeros(2)
-        others = np.arange(1, len(T))
         acc = float(np.nanmean(dist_err))
-        acc_others = float(np.nanmean(dist_err[others])) if len(others) else acc
-        acc_anchor = (float(np.nanmean(np.hypot(*(err[others] + anchor).T)))
-                      if len(others) else acc)
+        # Desvio médio (constante) dos alvos e o erro sem ele (ótimo, dentro
+        # da amostra) e recentralizado por validação cruzada (cada alvo
+        # corrigido pela média dos OUTROS).
+        ok = np.all(np.isfinite(err), axis=1)
         offset = np.nanmean(err, axis=0)
         acc_recentered = float(np.nanmean(np.hypot(*(err - offset).T)))
+        loo = []
+        for i in np.flatnonzero(ok):
+            others = ok.copy()
+            others[i] = False
+            if others.sum() >= 2:
+                loo.append(float(np.hypot(*(err[i] - err[others].mean(axis=0)))))
+        acc_loo = float(np.mean(loo)) if loo else acc
+        n_valid, n_invalid = int(sum(n_ok)), int(sum(self.invalid))
+        data_loss = n_invalid / max(n_valid + n_invalid, 1)
         prec = float(np.nanmean(precisions))
         regions: dict = {}
         for t, e in zip(self.targets, dist_err):
@@ -889,32 +794,31 @@ class ValidationProcedure(TargetProcedure):
             "acuracia_mediana_px": float(np.nanmedian(dist_err)),
             "precisao_rms_media_px": prec,
             "precisao_rms_media_graus": deg(prec),
-            # Deriva desde a calibração (medida no centro, primeiro alvo) e o
-            # erro nos demais alvos depois de reancorar por ela.
-            "deriva_centro_px": (-anchor).tolist(),
-            "deriva_centro_graus": deg(float(np.hypot(*anchor))),
-            "acuracia_outros_px": acc_others,
-            "acuracia_reancorada_px": acc_anchor,
-            "acuracia_reancorada_graus": deg(acc_anchor),
-            # Desvio médio (constante) e a acurácia sem ele.
+            "precisao_rms_s2s_px": float(np.mean(s2s)) if s2s else None,
+            "perda_de_dados": data_loss,
+            # Desvio médio (constante), a acurácia sem ele e a acurácia
+            # recentralizada por validação cruzada.
             "deslocamento_medio_px": offset.tolist(),
+            "deslocamento_medio_graus": deg(float(np.hypot(*offset))),
             "acuracia_sem_deslocamento_px": acc_recentered,
+            "acuracia_recentralizada_px": acc_loo,
+            "acuracia_recentralizada_graus": deg(acc_loo),
             "por_regiao_px": by_region,
             "calibracao": {k: v for k, v in self.model.info.items()
-                           if k not in ("candidatos", "erro_loo_por_alvo_px", "erro_loo_alvos",
-                                        "checagens_centro_px")},
+                           if k not in ("candidatos", "erro_loo_por_alvo_px", "erro_loo_alvos")},
             "por_alvo": [{"alvo": r.target, "estimativa": r.prediction, "regiao":
                           self._region(r.target), "erro_px": r.error_px, "n": r.n_samples}
                          for r in self.results],
         }
 
-        # Reteste: aplica a reancoragem ao modelo (como a recentralização).
-        if (self.kind == "reteste" and np.all(np.isfinite(anchor)) and np.any(anchor)
-                and abs(anchor[0]) <= self.max_frac * self.screen_w
-                and abs(anchor[1]) <= self.max_frac * self.screen_h):
-            self.model.offset = self.model.offset + anchor
-            self.applied_offset = anchor
-            self.summary["reancoragem_aplicada_px"] = anchor.tolist()
+        # Reteste: corrige o desvio médio (recentralização com todos os alvos).
+        shift = -offset
+        if (self.kind == "reteste" and ok.sum() >= 3 and np.all(np.isfinite(shift))
+                and abs(shift[0]) <= self.max_frac * self.screen_w
+                and abs(shift[1]) <= self.max_frac * self.screen_h):
+            self.model.offset = self.model.offset + shift
+            self.applied_offset = shift
+            self.summary["recentralizacao_aplicada_px"] = shift.tolist()
 
         self.cfg.results_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -935,22 +839,21 @@ class ValidationProcedure(TargetProcedure):
         reg = "  ".join(f"{k} {v:.0f}" for k, v in sorted(by_region.items()))
         self.message_lines = [f"{self.title} concluida"
                               + (f" ({minutes:.0f} min apos calibrar)" if minutes else ""),
-                              f"Erro medio: {acc:.0f} px{fmt_deg(acc)}   precisao RMS {prec:.0f} px",
-                              f"Por regiao (px): {reg}"]
+                              f"Erro medio: {acc:.0f} px{fmt_deg(acc)}   precisao RMS {prec:.0f} px"
+                              f"   perda de dados {100 * data_loss:.0f}%",
+                              f"Por regiao (px): {reg}",
+                              f"Desvio constante: ({offset[0]:+.0f}, {offset[1]:+.0f}) px; "
+                              f"recentralizado (validacao cruzada): {acc_loo:.0f} px"
+                              f"{fmt_deg(acc_loo)}"]
         if self.kind == "reteste":
-            self.message_lines += [
-                f"Deriva desde a calibracao (centro): {np.hypot(*anchor):.0f} px{fmt_deg(np.hypot(*anchor))}",
-                f"Erro nos outros alvos: {acc_others:.0f} px; reancorado pelo centro: {acc_anchor:.0f} px",
-                ("Reancoragem aplicada ao cursor" if self.applied_offset is not None
-                 else "Deriva grande demais para reancorar: recalibre (ESPACO)")]
-        else:
             self.message_lines.append(
-                f"Desvio constante: ({offset[0]:+.0f}, {offset[1]:+.0f}) px;"
-                f" sem ele, {acc_recentered:.0f} px")
+                "Desvio corrigido no cursor" if self.applied_offset is not None
+                else "Desvio grande demais para corrigir: recalibre (ESPACO)")
         self.message_lines.append(f"Salvo em results/{self.csv_path.name}")
         print(f"[{self.title}] erro {acc:.1f} px{fmt_deg(acc)}, precisão RMS {prec:.1f} px, "
-              f"deriva no centro {np.hypot(*anchor):.1f} px, reancorado {acc_anchor:.1f} px, "
-              f"por região {by_region}. Resultados em {self.csv_path}")
+              f"desvio ({offset[0]:+.1f}, {offset[1]:+.1f}) px, recentralizado {acc_loo:.1f} px, "
+              f"perda {100 * data_loss:.0f}%, por região {by_region}. "
+              f"Resultados em {self.csv_path}")
 
     def render_result(self, canvas):
         _draw_point_results(canvas, self.results, tol_px=0.05 * self.screen_w)
@@ -958,31 +861,48 @@ class ValidationProcedure(TargetProcedure):
 
 
 class RecenterProcedure(TargetProcedure):
-    """Correção rápida de deslocamento (1 ponto) sem refazer a calibração.
+    """Correção rápida do desvio constante com poucos pontos (4), sem refazer
+    a calibração.
 
     O pipeline geométrico já compensa rotação e translação da cabeça, mas
-    aproximações (posição 3D do rosto estimada pelo MediaPipe, cansaço,
-    óculos que escorregam) deixam um deslocamento residual, que é corrigido
-    somando um offset ao pixel do monitor real. Nos dados reais, esse desvio constante era
-    a maior parte do erro depois de uma mudança de postura.
+    pequenas mudanças de postura deixam um desvio constante que domina o
+    erro no uso (validações gravadas: 138 px brutos, ~80 sem o desvio). Ele é
+    corrigido somando um offset ao pixel do monitor real, estimado pela
+    MÉDIA dos erros em vários alvos: com 1 ponto (o centro, até 16/11) a
+    correção piorava o erro em média (138 -> 147 px); com 3 pontos, 96 px;
+    com 5, 91 px.
     """
 
     title = "Recentralizar"
     result_timeout_s = 1.5
 
     def __init__(self, screen_size, model: CalibrationModel, cfg: CalibrationConfig):
-        center = (screen_size[0] / 2, screen_size[1] / 2)
-        super().__init__([center], screen_size, cfg.settle_s, cfg.collect_s,
-                         cfg.min_samples_per_point, **_gating(cfg))
+        targets = [(fx * screen_size[0], fy * screen_size[1]) for fx, fy in cfg.recenter_points]
+        order = list(range(len(targets)))
+        np.random.default_rng(cfg.random_seed).shuffle(order)
+        super().__init__(targets, screen_size, cfg.settle_s, cfg.collect_s,
+                         cfg.min_samples_per_point, order=order, **_gating(cfg))
         self.model = model
         self.mad = cfg.outlier_mad_threshold
         self.max_frac = cfg.recenter_max_frac
 
+    def status_line(self) -> str:
+        return (f"Recentralizar: olhe para o ponto ({self.pos + 1}/{len(self.order)})"
+                "  -  ESC cancela")
+
     def on_complete(self):
-        feats, raws = self.arrays(0)
-        raws = raws[outlier_mask(feats, self.mad)]
-        pred = np.nanmedian(self.model.predict(raws), axis=0)
-        delta = np.array(self.targets[0]) - pred
+        deltas, raws_all = [], []
+        for i, target in enumerate(self.targets):
+            feats, raws = self.arrays(i)
+            if len(raws) < 3:
+                continue
+            raws = raws[outlier_mask(feats, self.mad)]
+            pred = np.nanmedian(self.model.predict(raws), axis=0)
+            if np.all(np.isfinite(pred)):
+                deltas.append(np.array(target) - pred)
+                raws_all.append(raws)
+        delta = np.mean(deltas, axis=0) if len(deltas) >= 2 else np.full(2, np.nan)
+        raws = np.vstack(raws_all) if raws_all else np.zeros((0, RAW_SIZE))
         if (not np.all(np.isfinite(delta)) or abs(delta[0]) > self.max_frac * self.screen_w
                 or abs(delta[1]) > self.max_frac * self.screen_h):
             # Desvio grande demais para ser corrigido por um deslocamento:
@@ -1005,5 +925,7 @@ class RecenterProcedure(TargetProcedure):
         self.model.head_ref = np.median(head_angles(raws), axis=0)
         self.model.pos_ref = np.median(raws[:, RAW_FACE], axis=0)
         self.succeeded = True
-        self.message_lines = [f"Recentralizado: deslocamento ({delta[0]:+.0f}, {delta[1]:+.0f}) px"]
+        spread = float(np.mean([np.hypot(*(d - delta)) for d in deltas]))
+        self.message_lines = [f"Recentralizado: deslocamento ({delta[0]:+.0f}, {delta[1]:+.0f}) px"
+                              f" (dispersao entre os pontos {spread:.0f} px)"]
         print(f"[Recentralizar] Offset ajustado em ({delta[0]:+.1f}, {delta[1]:+.1f}) px.")
