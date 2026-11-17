@@ -171,6 +171,12 @@ class GazeFollower:
             # Na acomodação, desliza um pouco mais depressa (0,5 por quadro).
             a = max(self.alpha, 0.5) if self._age <= self.settle_frames else self.alpha
             self.cursor = self.cursor + a * e
+            # Para assim que o passo deixa o cursor perto do destino. Com
+            # alpha 0,7 isso costuma acontecer no 1º passo: amortece o
+            # movimento (na bancada, exigir que o deslizamento durasse até a
+            # mediana se renovar seguia mais, 64% contra 53% dos degraus de
+            # 40 px, mas deixava o cursor parado em só 65% dos quadros de
+            # olho fixo, contra 87%, e o erro subia de 25 para 29 px).
             if (self._age > self.settle_frames
                     and dist * (1.0 - self.alpha) < self.stop_k * self.noise_px):
                 self.moving = False
@@ -212,6 +218,11 @@ class HeadFineTuner:
         self.offset = np.zeros(2)
         self._filter.reset()
 
+    @property
+    def adjusting(self) -> bool:
+        """A cabeça está deslocando o cursor (passou da zona morta)."""
+        return bool(np.any(self.offset != 0.0))
+
     def __call__(self, cursor: np.ndarray, fixation_id: int, head_yaw_pitch, t: float,
                  settling: bool = False) -> np.ndarray:
         """Cursor ajustado. head_yaw_pitch: (yaw, pitch) em graus (yaw > 0 =
@@ -238,3 +249,12 @@ class HeadFineTuner:
             off *= self.max_px / n
         self.offset = off
         return np.asarray(cursor, dtype=np.float64) + off
+
+
+def make_stabilizer(st, screen_width: int) -> GazeFollower:
+    """Estabilizador do cursor a partir da configuração (config.StabilizerConfig)."""
+    return GazeFollower(
+        saccade_px=st.saccade_ratio * screen_width, confirm_frames=st.confirm_frames,
+        median_frames=st.median_frames, start_k=st.start_k, stop_k=st.stop_k,
+        alpha=st.alpha, noise_k=st.noise_k, noise_floor_px=st.noise_floor_px,
+        settle_frames=st.settle_frames)

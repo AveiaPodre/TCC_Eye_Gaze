@@ -103,6 +103,17 @@ def draw_head_pose(img, sample: GazeSample):
 
 
 # ------------------------------------------------------------------- HUD
+def shade(img, x0, y0, x1, y1, color, alpha: float):
+    """Escurece um retângulo (fundo semitransparente) só na região dele:
+    misturar a imagem inteira custava ~1 ms por painel em 720p."""
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = max(x0, 0), max(y0, 0), min(x1 + 1, w), min(y1 + 1, h)
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = img[y0:y1, x0:x1]
+    cv2.addWeighted(np.full_like(roi, color), alpha, roi, 1.0 - alpha, 0, roi)
+
+
 def draw_minimap(img, screen_size, point, raw_point, trail, targets, dwell_progress,
                  calibrated: bool):
     sw, sh = screen_size
@@ -111,9 +122,7 @@ def draw_minimap(img, screen_size, point, raw_point, trail, targets, dwell_progr
     mh = int(mw * sh / sw)
     x0, y0 = w - mw - 12, h - mh - 12
 
-    overlay = img.copy()
-    cv2.rectangle(overlay, (x0, y0), (x0 + mw, y0 + mh), (30, 30, 30), -1)
-    cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
+    shade(img, x0, y0, x0 + mw, y0 + mh, (30, 30, 30), 0.7)
     cv2.rectangle(img, (x0, y0), (x0 + mw, y0 + mh), (200, 200, 200), 1)
 
     def to_map(p):
@@ -149,7 +158,7 @@ HELP_LINES = [
     "T  reteste (mede e corrige desvio)",
     "R  recentralizar (4 pontos)",
     "K  teste da cabeca",
-    "Barra no topo: controle pelo olhar",
+    "Barra na esquerda: controle pelo olhar",
     "M  liga/desliga mouse",
     "D  liga/desliga dwell-click",
     "A  ajuste fino pela cabeca",
@@ -165,9 +174,7 @@ def draw_help(img):
     h, w = img.shape[:2]
     bw, bh = 280, 22 * len(HELP_LINES) + 14
     x0, y0 = 10, h - bh - 10
-    overlay = img.copy()
-    cv2.rectangle(overlay, (x0, y0), (x0 + bw, y0 + bh), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.65, img, 0.35, 0, img)
+    shade(img, x0, y0, x0 + bw, y0 + bh, (20, 20, 20), 0.65)
     for i, s in enumerate(HELP_LINES):
         text(img, s, (x0 + 10, y0 + 24 + 22 * i), 0.5)
 

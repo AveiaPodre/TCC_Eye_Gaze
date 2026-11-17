@@ -125,10 +125,6 @@ class GazeSample:
     obs: FaceObservation | None = None  # landmarks de origem (reanálise offline)
 
     @property
-    def direction_cam(self) -> np.ndarray | None:
-        return None if self.gaze is None else self.gaze.direction
-
-    @property
     def valid(self) -> bool:
         return self.gaze is not None and not self.blink
 

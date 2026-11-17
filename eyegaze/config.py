@@ -52,7 +52,9 @@ class TrackerConfig:
     min_face_presence_confidence: float = 0.5
     min_tracking_confidence: float = 0.5
     # Refina o centro da íris nos pixels da imagem (iris_refine.py). A
-    # calibração usa essa fonte só se ela tiver erro menor que a do MediaPipe.
+    # calibração usa a MÉDIA das duas fontes (MediaPipe e refinada): no
+    # benchmark (44 validações), 110 px, contra 136 só com o MediaPipe e 115
+    # só com a refinada.
     refine_iris: bool = True
 
 
@@ -81,8 +83,6 @@ class GazeConfig:
     # escala dela não é coerente com o campo de visão suposto), e o rosto
     # inteiro em cm ficava a 56% do tamanho real.
     outer_canthi_cm: float = 9.0
-    # Razão raio do globo / largura do olho (cantos): ~12 mm / ~30 mm.
-    eyeball_radius_ratio: float = 0.40
 
     # Detecção de piscada pelo EAR (eye aspect ratio = altura/largura do
     # olho). O limiar é RELATIVO ao EAR típico do usuário com o olho aberto
@@ -100,15 +100,17 @@ class StabilizerConfig:
     saccade_ratio: float = 0.07   # salto mínimo (fração da largura da tela) p/ sacada
     confirm_frames: int = 2       # amostras seguidas fora da fixação p/ confirmar salto
     noise_k: float = 3.0          # limiar de sacada = max(base, k * ruído medido)
-    median_frames: int = 7        # destino = mediana das últimas N amostras
+    median_frames: int = 5        # destino = mediana das últimas N amostras
     # Histerese: parado, o cursor só anda quando o destino se afasta mais que
     # start_k x ruído; desliza (alpha por quadro) até ficar a menos de
-    # stop_k x ruído e para. Escolhidos numa varredura com as validações
-    # gravadas (metodologia, seção 4.0): cursor parado em 86% dos quadros com
-    # o olho fixo, seguindo 58% dos movimentos sutis de 70 px.
-    start_k: float = 4.0
+    # stop_k x ruído e para. Escolhidos na bancada com o ruído real das
+    # validações gravadas (tools/bancada_cursor.py, 428 fixações; metodologia,
+    # seção 4.0.1): segue 53%/58%/76% dos movimentos sutis de 40/70/100 px em
+    # até 0,5 s (antes 33%/43%/62% com start_k 4, alpha 0,4, mediana 7), com
+    # o cursor parado em 87% dos quadros de olho fixo (antes 85%).
+    start_k: float = 2.5
     stop_k: float = 1.0
-    alpha: float = 0.4
+    alpha: float = 0.7
     noise_floor_px: float = 15.0
     settle_frames: int = 8        # quadros de acomodação depois de uma sacada
 
@@ -150,9 +152,14 @@ class CalibrationConfig:
     retry_max_targets: int = 3
     retry_ratio: float = 2.5
     retry_min_frac: float = 0.08
-    # Ao abrir o app com uma calibração salva, recentraliza (1 ponto) antes
+    # Ao abrir o app com uma calibração salva, recentraliza (4 pontos) antes
     # de usar: reancora o desvio da nova sessão.
     recenter_on_start: bool = True
+    # Conferência logo depois de calibrar (4 pontos, ~9 s): mede e corrige o
+    # desvio constante que aparece nos primeiros segundos (encolhido pela
+    # incerteza; procedures.shrink_offset). Nas 48 validações gravadas, o erro
+    # nos alvos seguintes caiu de 105 para 84 px (metodologia, seção 7.1).
+    check_after_calibration: bool = True
     # Grau máximo da correção monitor virtual -> real (calibration.py):
     # 1 = até afim; 2 = também quadrática. A validação cruzada escolhe.
     polynomial_degree: int = 2
@@ -190,11 +197,30 @@ class CalibrationConfig:
     # a grade.
     refine_points: tuple = ((0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7))
 
-    # Etapa da cabeça (modo pesquisa; ``--pesquisa`` ou ``--gravar``): depois
-    # dos alvos, o olhar fica no centro e a pessoa gira a cabeça seguindo as
-    # setas. As amostras NÃO entram no ajuste: medem o erro com a cabeça em
-    # poses novas. Treinar com elas melhorava a validação em só ~3 px, e a
-    # etapa é inadequada para quem não consegue mover a cabeça.
+    # Calibração por perseguição (Pfeuffer et al., 2013; --perseguicao): um
+    # ponto percorre a tela e a pessoa o segue com os olhos; cada quadro vira
+    # uma amostra com o seu alvo. "nenhuma" (padrão até haver dados que
+    # mostrem ganho), "soma" (grade -> perseguição pelo perímetro -> etapa 2)
+    # ou "alternativa" (perseguição pelo perímetro e pelas linhas do meio +
+    # os 5 ``pursuit_points`` fixos, no lugar da grade).
+    pursuit: str = "nenhuma"
+    pursuit_points: tuple = ((0.5, 0.5), (0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7))
+    pursuit_speed_px_s: float = 420.0   # ~7 graus/s a 60 cm: o olho acompanha sem sacadas
+    pursuit_hold_s: float = 1.0         # parado no início (o olho chega)
+    pursuit_skip_s: float = 0.4         # descarta o começo do movimento
+    pursuit_corner_skip_s: float = 0.25  # e o trecho logo depois de cada canto
+    pursuit_delay_s: float = 0.1        # atraso do olho em relação ao ponto
+    pursuit_jump_deg: float = 2.0       # salto entre quadros = sacada (descarta)
+    # Peso TOTAL da perseguição no ajuste, em "alvos fixos" (cada um pesa 1).
+    pursuit_weight: float = 6.0
+
+    # Teste da cabeça (tecla K, ou depois da validação imediata com
+    # ``--cabeca``): o olhar fica no centro e a pessoa gira a cabeça seguindo
+    # as setas. As amostras NÃO entram no ajuste: medem o erro com a cabeça
+    # em poses novas. Saiu do modo pesquisa em 17/11: alongava a sessão em
+    # ~10 s, o efeito passageiro dos giros contaminava o que vinha depois, a
+    # etapa é inadequada para quem não move a cabeça, e treinar com ela
+    # melhorava a validação em só ~3 px.
     head_stage: bool = False
     # Quanto girar em cada direção (yaw, pitch em graus, em relação à pose
     # da grade). A seta enche conforme a cabeça gira e fica verde ao chegar
@@ -220,10 +246,10 @@ class CalibrationConfig:
 
 @dataclass
 class ValidationConfig:
-    # Validação IMEDIATA, logo depois da calibração (mede o erro do modelo,
-    # sem tempo para a postura mudar); ligada no modo pesquisa. A tecla T faz
-    # o RETESTE, mais tarde: o primeiro ponto (centro) mede a deriva desde a
-    # calibração e reancora.
+    # Validação IMEDIATA, depois da calibração e da conferência (mede o erro
+    # no começo do uso); ligada no modo pesquisa. A tecla T faz o RETESTE,
+    # mais tarde: mede o erro e corrige o desvio médio dos alvos (encolhido
+    # pela incerteza, procedures.shrink_offset).
     after_calibration: bool = False
     # Alvos de validação (frações da tela), diferentes dos de calibração
     # (inclusive os da etapa 2, em 30/70%); visitados em ordem aleatória
@@ -238,6 +264,10 @@ class ValidationConfig:
     )
     settle_s: float = 0.9
     collect_s: float = 1.2
+    # Revalidação periódica: a cada N minutos de uso, os mesmos alvos da
+    # validação medem a deriva e corrigem o desvio constante (0 = desligada;
+    # --revalidar-min; 10 no modo pesquisa).
+    revalidate_every_min: float = 0.0
     results_dir: Path = PROJECT_ROOT / "results"
     # Opcional: dimensões físicas para converter erro de px para graus de
     # ângulo visual. Deixe em None se não souber.
@@ -301,16 +331,18 @@ class FineConfig:
     # limitava o ajuste a ~140 px, menos que o erro do olhar (na sessão de
     # 16/11, ajustes de até 183 px); 10° cobre o ajuste máximo (max_px).
     reset_deg: float = 10.0
-    # No modo A, o olhar só "teleporta" o cursor: cursor = âncora + ajuste
-    # da cabeça, e a âncora só muda numa nova fixação a mais de
-    # ``warp_frac`` da largura da tela do CURSOR (a pessoa olhou para outro
-    # lugar). Mudanças menores da estimativa do olhar são ignoradas. Na
-    # sessão de 16/11 12:49, 96% do movimento do cursor no modo A vinha do
-    # ponto do olhar: mexer a cabeça com os olhos parados movia a estimativa
-    # ~28 px/grau na vertical e ~25 px/grau na HORIZONTAL ao inclinar a
-    # cabeça (por isso o cursor "andava para o lado"); e olhar para o
-    # cursor durante o ajuste (salto de 100-200 px) zerava o ajuste.
-    warp_frac: float = 0.2
+    # Modo de precisão: cursor = âncora + ajuste da cabeça. Sem ajuste da
+    # cabeça em curso, a âncora acompanha o olhar (cursor igual ao modo
+    # normal). Com ajuste em curso, o olhar só move a âncora quando está a
+    # mais de ``warp_frac`` da largura da tela do CURSOR: na hora, numa nova
+    # fixação; ou depois de ``warp_hold_s`` longe, na mesma fixação.
+    # Até 17/11 o olhar só movia a âncora em saltos > 20% (384 px): na
+    # sessão de 17/11 15:45, ele ficou 13 vezes >= 0,5 s a 150-360 px do
+    # cursor sem que o cursor se movesse (nenhuma vez fora do modo de
+    # precisão); agora, 1 vez (162 px). 10% (192 px) fica acima do erro do
+    # olhar (mediana 48 px, 90% abaixo de 158 px no modo normal).
+    warp_frac: float = 0.1
+    warp_hold_s: float = 0.3
 
 
 @dataclass
@@ -341,6 +373,9 @@ class BarConfig:
 
 @dataclass
 class DisplayConfig:
+    # Com o mouse sendo controlado (e nenhum procedimento), a janela da
+    # câmera é redesenhada a cada N quadros (10 fps): libera ~6 ms por quadro.
+    preview_every_in_use: int = 3
     show_landmarks: bool = False
     show_gaze: bool = True
     show_head_pose: bool = False

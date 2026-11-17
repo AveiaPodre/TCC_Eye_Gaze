@@ -199,6 +199,51 @@ novas (45 calibrações, 15 com validação): LOO 119 px, validação 137 px
 - [ ] Sessão de uso real só pelo olhar (barra + clique + precisão) para
       confirmar os ~30 fps e medir a taxa de acerto.
 
+## Fase 6g: métricas por olho, revalidação e perseguição (17/11)
+
+- [x] Métricas por olho na validação (acurácia, precisão, disponibilidade
+      de cada olho), no json e na tela de resultado.
+- [x] Revalidação periódica (`--revalidar-min`; 10 min no modo pesquisa):
+      mede a deriva ao longo da sessão e corrige o desvio.
+- [x] Calibração por perseguição (`--perseguicao soma|alternativa`),
+      desligada por padrão; simulação: 22 -> 20 px (soma), 14 px
+      (alternativa).
+- [ ] Gravar sessões com `--gravar --perseguicao soma` e
+      `--gravar --perseguicao alternativa` e comparar a validação com a
+      calibração atual; adotar como padrão só se o erro cair.
+- [ ] Analisar `por_olho` nas sessões: se um olho erra sistematicamente
+      mais, rever os pesos dos olhos.
+- [ ] Usar as revalidações periódicas para medir a deriva por minuto.
+
+## Fase 6h: análise das sessões de 17/11 (15:00)
+
+- [x] Perseguição nas sessões reais: sem ganho ("soma" piorava um pouco;
+      "alternativa" não supera a grade). Fica opcional e desligada.
+- [x] Causa do desvio constante: o ganho vertical da calibração é 4-6 × o
+      geométrico (íris do MediaPipe), e um viés lento de 0,5° vira 100-250
+      px. Pálpebras não acrescentam informação ao modelo atual.
+- [x] Conferência de 4 pontos depois de toda calibração, com o desvio
+      encolhido pela incerteza (105 -> 84 px nas 48 validações).
+- [x] Estabilizador: movimentos sutis seguidos 33/43/62% -> 53/58/76%
+      (40/70/100 px), parado 87% (`tools/bancada_cursor.py`).
+- [x] Desempenho: gravação numa thread, painéis do HUD só na região deles,
+      prévia da câmera a 10 fps com o mouse em uso; tempo por quadro e
+      estado gravados com a sessão.
+- [x] Teste da cabeça fora do protocolo (tecla K ou `--cabeca`).
+- [ ] Gravar uma sessão de USO (barra, clique, precisão) e conferir
+      `proc_ms` e o fps com tudo ligado.
+- [ ] Viés vertical lento: testar o modo IMAGE do MediaPipe só para a
+      íris ou um filtro de deriva com os cliques confirmados.
+
+## Fase 6i: cursor parado no modo de precisão e limpeza (17/11, noite)
+
+- [x] Cursor "parado" ao olhar para outro lugar: só acontecia no modo de
+      precisão (13 eventos na sessão das 15:45, nenhum no modo normal).
+      O olhar agora manda enquanto a cabeça não ajusta: 13 -> 1 evento.
+- [x] Revisão do projeto: código morto removido (atalhos antigos do app,
+      funções só usadas em testes, campo de configuração sem uso),
+      comentários desatualizados corrigidos.
+
 ## Fase 7: uso real e documentação
 
 - [ ] Indicador do dwell sobre a área de trabalho.

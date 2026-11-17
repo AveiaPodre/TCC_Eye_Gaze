@@ -43,6 +43,8 @@ class CursorControl:
         # olhar, FineConfig.warp_frac) e a fixação que a criou.
         self.anchor: np.ndarray | None = None
         self.anchor_fid: int | None = None
+        self._far_since: float | None = None   # olhar longe do cursor desde...
+        self.warps = 0                         # quantas vezes o olhar levou o cursor
         self.dwell = DwellClick(cfg.dwell.dwell_time_s, cfg.dwell.tolerance_px,
                                 cfg.dwell.cooldown_s)
         self.dwell_enabled = cfg.dwell.enabled_at_start
@@ -98,21 +100,45 @@ class CursorControl:
 
     # ----------------------------------------------------- modo de precisão
     def apply_fine(self, stab: np.ndarray, sample, stabilizer, now: float) -> np.ndarray:
-        """Cursor = âncora + ajuste pela cabeça. O olhar só "teleporta" a
-        âncora: numa nova fixação a mais de ``FineConfig.warp_frac`` da
-        largura da tela do cursor atual. Mexer a cabeça com os olhos parados
-        mexe a estimativa do olhar (~25-28 px/grau) e olhar para o cursor
-        durante o ajuste é um salto de 100-200 px; nenhum dos dois move o
-        cursor."""
+        """Cursor = âncora + ajuste pela cabeça (como no MAGIC pointing: o
+        olhar leva o cursor à região, a cabeça faz o ajuste fino).
+
+        Sem ajuste da cabeça em curso, a âncora acompanha o olhar
+        estabilizado (o cursor anda como no modo normal). Com ajuste em
+        curso, o olhar move a âncora ("teleporta" o cursor) quando está a mais de
+        ``FineConfig.warp_frac`` da largura da tela do cursor:
+        * numa nova fixação (sacada), na hora;
+        * na mesma fixação, se ficar longe por ``warp_hold_s`` (o olhar foi
+          para outro lugar sem uma sacada nítida).
+        Mexer a cabeça com os olhos parados move a estimativa do olhar mais
+        ou menos junto com o ajuste (~25 px/grau), então a distância ao
+        CURSOR (âncora + ajuste) quase não muda; olhar para o próprio cursor
+        fica dentro do erro do olhar (mediana ~50 px, 90% abaixo de ~160
+        px na sessão de 17/11) e não move nada."""
         fc = self.cfg.fine
         hy, hp, _ = sample.head.euler_deg
         fid = stabilizer.fixation_id
+        stab = np.asarray(stab, float)
         if self.anchor is None:
-            self.anchor, self.anchor_fid = np.asarray(stab, float).copy(), fid
-        elif fid != self.anchor_fid:
-            cursor = self.anchor + self.fine.offset
-            if np.linalg.norm(stab - cursor) > fc.warp_frac * self.screen_size[0]:
-                self.anchor, self.anchor_fid = np.asarray(stab, float).copy(), fid
+            self._warp(stab, fid)
+        elif not self.fine.adjusting:
+            # Cabeça sem ajuste em curso: o cursor segue o olhar exatamente
+            # como no modo normal. O olhar só "congela" quando a cabeça
+            # começa a ajustar (passa da zona morta).
+            self.anchor, self.anchor_fid, self._far_since = stab.copy(), fid, None
+        else:
+            far = (np.linalg.norm(stab - (self.anchor + self.fine.offset))
+                   > fc.warp_frac * self.screen_size[0])
+            if not far:
+                self._far_since = None
+            elif fid != self.anchor_fid:
+                self._warp(stab, fid)
+            else:
+                if self._far_since is None:
+                    self._far_since = now
+                if now - self._far_since >= fc.warp_hold_s:
+                    self._warp(stab, fid)
+                    self.fine.reset()      # nova referência da cabeça
         if fid == self.anchor_fid:
             # Na fixação que criou a âncora: ela acompanha a acomodação do
             # estabilizador, e a referência da cabeça também.
@@ -123,6 +149,11 @@ class CursorControl:
             settling = False
         return self.fine(self.anchor, self.anchor_fid, (hy, hp), now, settling=settling)
 
+    def _warp(self, point, fid):
+        self.anchor, self.anchor_fid = point.copy(), fid
+        self._far_since = None
+        self.warps += 1
+
     def release_fine(self, keep_cursor_at=None):
         """Zera o ajuste. keep_cursor_at: a âncora vai para esse ponto (o
         cursor não se move e a cabeça vira a nova referência)."""
@@ -130,6 +161,7 @@ class CursorControl:
             self.anchor = np.asarray(keep_cursor_at, float).copy()
         else:
             self.anchor = self.anchor_fid = None
+        self._far_since = None
         self.fine.reset()
 
     # ----------------------------------------------------- correção contínua

@@ -19,14 +19,22 @@ usados para rejeitar outliers, detectar a fixação e no CSV, e o vetor bruto
 ``raw`` (âncoras e pupilas em cm, pose da cabeça), entrada da calibração
 (ver gaze.py e calibration.py).
 
+Calibração por perseguição (opcional, ``CalibrationConfig.pursuit``): um
+ponto percorre a tela devagar e a pessoa o segue com os olhos (Pfeuffer et
+al., 2013). Cada quadro vira uma amostra com o seu próprio alvo (a posição do
+ponto ~0,1 s antes, o atraso do olho), cobrindo a tela de forma contínua em
+~13-21 s. "soma": grade -> perseguição -> etapa 2; "alternativa":
+perseguição + 5 alvos fixos (no lugar da grade).
+
 A calibração percorre os alvos em ordem aleatória. Depois do ajuste, alvos
-com erro muito alto são coletados de novo, uma vez. No modo pesquisa, depois
-da validação imediata, vem o teste da cabeça (``HeadStageProcedure``): o
-alvo fica no centro e uma seta pede que a pessoa gire a cabeça (direita,
-esquerda, cima, baixo) sem tirar o olho do alvo. Essas amostras não entram
-no ajuste: medem o erro com a cabeça em poses novas. A etapa vinha logo
-depois da grade, e o efeito passageiro dela contaminava a validação
-(docs/metodologia.md, seção 5.11).
+com erro muito alto são coletados de novo, uma vez. Em seguida, o app roda
+a conferência (``RecenterProcedure``, 4 pontos), que corrige o desvio
+constante do começo do uso.
+
+O teste da cabeça (``HeadStageProcedure``, tecla K ou ``--cabeca``) mede o
+erro com a cabeça em poses novas: o alvo fica no centro e uma seta pede que
+a pessoa gire a cabeça sem tirar o olho do alvo. As amostras não entram no
+ajuste.
 """
 
 from __future__ import annotations
@@ -355,6 +363,28 @@ def _draw_point_results(canvas, results: list[PointResult], tol_px: float):
         _text(canvas, f"{pr.error_px:.0f}px", (t[0] + 18, t[1] - 18), 0.6)
 
 
+def shrink_offset(errors: np.ndarray, c: float = 4.0) -> tuple[np.ndarray, float]:
+    """Desvio constante a corrigir a partir dos erros (n, 2) em n alvos:
+    a MÉDIA, encolhida pela incerteza dela (James-Stein):
+    f = |m|² / (|m|² + c·se²), com se² = soma das variâncias / n.
+
+    Nas 48 validações gravadas (os 4 primeiros alvos estimam o desvio, os 5
+    seguintes medem o erro), corrigir pela média inteira levava o erro de 105
+    a 90 px, mas piorava 31% das sessões; com o fator adaptativo (c = 4), 84
+    px, piorando 19%. Desvios grandes e coerentes (f ~ 1) continuam
+    corrigidos quase por inteiro; um fator fixo de 0,5 deixava metade deles
+    (123 contra 91 px com um desvio artificial de 180 px). Devolve (desvio
+    encolhido, f)."""
+    E = np.asarray(errors, dtype=float)
+    m = E.mean(axis=0)
+    if len(E) < 2:
+        return m, 1.0
+    se2 = float(np.sum(np.var(E, axis=0, ddof=1))) / len(E)
+    mm = float(np.dot(m, m))
+    f = mm / (mm + c * se2) if mm + c * se2 > 0 else 0.0
+    return f * m, f
+
+
 def quality_label(error_px: float, screen_w: int, good_frac: float = 0.047) -> tuple[str, str]:
     """Classificação do erro estimado em pontos novos (fração da largura da tela).
     ``good_frac``: limite de "boa" (CalibrationConfig.redo_loo_frac)."""
@@ -388,11 +418,39 @@ def head_progress(delta: np.ndarray, direction: tuple[int, int],
     return 0.0
 
 
+def pursuit_path(screen_size, mode: str, margin: float) -> np.ndarray:
+    """Vértices (n, 2) do caminho do ponto na perseguição. "soma": o
+    perímetro (as bordas, onde o erro é maior); "alternativa": o perímetro e
+    as linhas do meio (horizontal e vertical), que cobrem o interior."""
+    w, h = screen_size
+    x0, x1, y0, y1 = margin * w, (1 - margin) * w, margin * h, (1 - margin) * h
+    pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+    if mode == "alternativa":
+        pts += [(x0, h / 2), (x1, h / 2), (w / 2, y1), (w / 2, y0)]
+    return np.array(pts, dtype=float)
+
+
+def _along(path: np.ndarray, cum: np.ndarray, dist: float) -> tuple[np.ndarray, int]:
+    """Ponto a ``dist`` px do início do caminho e o índice do segmento."""
+    dist = float(np.clip(dist, 0.0, cum[-1]))
+    seg = int(min(np.searchsorted(cum, dist, side="right") - 1, len(path) - 2))
+    a, b = path[seg], path[seg + 1]
+    length = max(cum[seg + 1] - cum[seg], 1e-9)
+    return a + (b - a) * ((dist - cum[seg]) / length), seg
+
+
 class CalibrationProcedure(TargetProcedure):
     title = "Calibracao"
 
     def __init__(self, screen_size, cfg: CalibrationConfig):
-        targets = build_grid(*screen_size, cfg.grid_cols, cfg.grid_rows, cfg.margin_ratio)
+        mode = getattr(cfg, "pursuit", "nenhuma")
+        if mode == "alternativa":
+            # Perseguição no lugar da grade, mais poucos alvos fixos (o
+            # critério de aceitação e a repetição de alvos usam só eles).
+            targets = [(fx * screen_size[0], fy * screen_size[1])
+                       for fx, fy in cfg.pursuit_points]
+        else:
+            targets = build_grid(*screen_size, cfg.grid_cols, cfg.grid_rows, cfg.margin_ratio)
         rng = np.random.default_rng(cfg.random_seed)
         order = list(range(len(targets)))
         if cfg.shuffle_targets:
@@ -400,8 +458,8 @@ class CalibrationProcedure(TargetProcedure):
         # Etapa 2 (refinamento): alvos internos depois da grade, também em
         # ordem aleatória; o ajuste usa todos os pontos juntos.
         self.n_grid = len(targets)
-        refine = [(fx * screen_size[0], fy * screen_size[1])
-                  for fx, fy in getattr(cfg, "refine_points", ())]
+        refine = [] if mode == "alternativa" else [
+            (fx * screen_size[0], fy * screen_size[1]) for fx, fy in getattr(cfg, "refine_points", ())]
         stage2 = list(range(len(targets), len(targets) + len(refine)))
         if cfg.shuffle_targets:
             rng.shuffle(stage2)
@@ -419,6 +477,121 @@ class CalibrationProcedure(TargetProcedure):
         self.stats: dict = {}
         # Repetição de alvos ruins.
         self.retried_targets: list[int] = []
+        # Perseguição: roda quando ``pos`` chega a ``pursuit_at`` (depois da
+        # grade em "soma"; antes dos alvos fixos em "alternativa").
+        self.pursuit_mode = mode
+        self.pursuit_done = mode not in ("soma", "alternativa")
+        self.pursuit_at = 0 if mode == "alternativa" else self.n_grid
+        self.pursuit_path = (None if self.pursuit_done
+                             else pursuit_path(screen_size, mode, cfg.margin_ratio))
+        self._p_cum = (None if self.pursuit_path is None else np.concatenate(
+            [[0.0], np.cumsum(np.hypot(*np.diff(self.pursuit_path, axis=0).T))]))
+        self._p_start: float | None = None
+        self._p_pos: np.ndarray | None = None
+        self._p_last_feat: np.ndarray | None = None
+        self.p_targets, self.p_feats, self.p_raw, self.p_obs, self.p_times = [], [], [], [], []
+        self.p_invalid = 0
+
+    # ------------------------------------------------------- perseguição
+    @property
+    def pursuing(self) -> bool:
+        """A perseguição é a etapa atual."""
+        return (not self.pursuit_done and not self.computing and not self.collecting_done
+                and self.pos >= self.pursuit_at)
+
+    @property
+    def pursuit_duration_s(self) -> float:
+        if self._p_cum is None:
+            return 0.0
+        return self.cfg.pursuit_hold_s + self._p_cum[-1] / self.cfg.pursuit_speed_px_s
+
+    def update(self, sample: GazeSample | None, now: float):
+        if self.pursuing:
+            self._pursuit_update(sample, now)
+            return
+        super().update(sample, now)
+
+    def targets_done(self, now: float):
+        if not self.pursuit_done:
+            return          # a perseguição ainda vem; o ajuste roda depois dela
+        super().targets_done(now)
+
+    def _pursuit_update(self, sample: GazeSample | None, now: float):
+        c = self.cfg
+        if self._p_start is None:
+            self._p_start = now
+            self._last_valid = now
+        valid = sample is not None and sample.valid
+        if valid:
+            self._last_valid = now
+        speed = c.pursuit_speed_px_s
+        t = now - self._p_start - c.pursuit_hold_s     # tempo em movimento
+        if t < 0:
+            self._p_pos = self.pursuit_path[0].copy()  # parado no início (o olho chega)
+            return
+        if t * speed >= self._p_cum[-1]:
+            self.pursuit_done = True
+            self._p_pos = None
+            self._start_phase(now)
+            if self.pos >= len(self.order):
+                self.computing = True
+            return
+        self._p_pos, seg = _along(self.pursuit_path, self._p_cum, t * speed)
+        if not valid:
+            self.p_invalid += 1
+            self._p_last_feat = None
+            return
+        f = sample.features()
+        jump = (self._p_last_feat is not None
+                and float(np.hypot(*(f - self._p_last_feat))) > c.pursuit_jump_deg)
+        self._p_last_feat = f
+        # Descarta o começo do movimento (o olho ainda acelera), o trecho
+        # logo depois de cada canto (o olho corta caminho e corrige com uma
+        # sacada) e saltos entre quadros (sacadas, olhar perdido).
+        since_corner = t - self._p_cum[seg] / speed
+        td = t - c.pursuit_delay_s
+        if (t < c.pursuit_skip_s or td < 0 or jump
+                or (seg > 0 and since_corner < c.pursuit_corner_skip_s)):
+            return
+        # O olho segue o ponto com um pequeno atraso: o alvo da amostra é a
+        # posição do ponto ``pursuit_delay_s`` antes.
+        target, _ = _along(self.pursuit_path, self._p_cum, td * speed)
+        self.p_targets.append(target)
+        self.p_feats.append(f)
+        self.p_raw.append(sample.raw)
+        self.p_obs.append(sample.obs)
+        self.p_times.append(now)
+
+    def current_target(self) -> tuple[float, float]:
+        if self.pursuing:
+            p = self.pursuit_path[0] if self._p_pos is None else self._p_pos
+            return float(p[0]), float(p[1])
+        return super().current_target()
+
+    @property
+    def awaiting_confirmation(self) -> bool:
+        return super().awaiting_confirmation and not self.pursuing
+
+    def render(self, now: float) -> np.ndarray:
+        if not self.pursuing:
+            return super().render(now)
+        canvas = self._blank()
+        tx, ty = (int(round(v)) for v in self.current_target())
+        el = 0.0 if self._p_start is None else now - self._p_start
+        if el < self.cfg.pursuit_hold_s:
+            k = min(1.0, el / max(self.cfg.pursuit_hold_s, 1e-6))
+            cv2.circle(canvas, (tx, ty), int(40 - 26 * k), TARGET, 3, cv2.LINE_AA)
+            cv2.circle(canvas, (tx, ty), 4, WHITE, -1, cv2.LINE_AA)
+        else:
+            cv2.circle(canvas, (tx, ty), 11, COLLECT, -1, cv2.LINE_AA)
+            cv2.circle(canvas, (tx, ty), 3, (0, 0, 0), -1, cv2.LINE_AA)
+        y0 = int(0.3 * self.screen_h)
+        self._centered(canvas, self.status_line(), y0)
+        self._centered(canvas, "Siga o ponto so com os olhos, sem mexer a cabeca", y0 + 40)
+        if now - self._last_valid > 1.0:
+            self._centered(canvas, "Rosto/olhos nao detectados - posicione-se em frente a camera",
+                           y0 + 80, WARN)
+        return canvas
 
     @property
     def redo_recommended(self) -> bool:
@@ -434,6 +607,8 @@ class CalibrationProcedure(TargetProcedure):
 
     def status_line(self) -> str:
         n = len(self.order)
+        if self.pursuing:
+            return "Calibracao: siga o ponto com os olhos  -  ESC cancela"
         if self.retrying:
             return f"Calibracao: repetindo alvos com erro alto ({self.pos + 1}/{n})  -  ESC cancela"
         if self.index >= self.n_grid:
@@ -449,6 +624,12 @@ class CalibrationProcedure(TargetProcedure):
             data.grid.append((t, feats, raws))
             data.grid_obs.append(self.observations[i])
             data.grid_times.append(np.asarray(self.times[i], dtype=float))
+        if self.p_raw:
+            data.pursuit_targets = np.array(self.p_targets, dtype=float)
+            data.pursuit_features = np.array(self.p_feats, dtype=float).reshape(-1, 2)
+            data.pursuit_raw = np.array(self.p_raw, dtype=float)
+            data.pursuit_times = np.array(self.p_times, dtype=float)
+            data.pursuit_obs = list(self.p_obs)
         return data
 
     def _fit(self, data: CalibrationData):
@@ -458,6 +639,7 @@ class CalibrationProcedure(TargetProcedure):
             head_max_deg=self.cfg.head_max_deg,
             max_degree=self.cfg.polynomial_degree,
             assumed_width_cm=self.cfg.assumed_screen_width_cm,
+            pursuit_weight=getattr(self.cfg, "pursuit_weight", 6.0),
         )
 
     def bad_targets(self, stats: dict) -> list[int]:
@@ -525,6 +707,13 @@ class CalibrationProcedure(TargetProcedure):
             self.message_lines.append(
                 f"Teste com a cabeca em poses novas: {st['erro_cabeca_px']:.0f} px "
                 f"({st['n_cabeca_usadas']} de {st['n_cabeca_total']} amostras)")
+        if "n_perseguicao" in st:
+            self.message_lines.append(
+                f"Perseguicao: {st['n_perseguicao']} amostras, erro de ajuste "
+                f"{st['erro_ajuste_perseguicao_px']:.0f} px")
+        elif self.pursuit_mode in ("soma", "alternativa"):
+            self.message_lines.append(
+                f"Perseguicao: so {len(self.p_raw)} amostras validas, nao usada no ajuste")
         if self.retried_targets:
             self.message_lines.append(f"{len(self.retried_targets)} alvo(s) repetido(s)")
         self.message_lines.append("Branco = alvo, ponto colorido = estimativa.")
@@ -545,7 +734,7 @@ class CalibrationProcedure(TargetProcedure):
 
 
 class HeadStageProcedure(TargetProcedure):
-    """Teste da cabeça (modo pesquisa): olhar fixo no centro, cabeça girando
+    """Teste da cabeça (tecla K ou ``--cabeca``): olhar fixo no centro, cabeça girando
     para a direita, a esquerda, para cima e para baixo, seguindo setas.
 
     As amostras NÃO entram no ajuste: medem o erro com a cabeça em poses
@@ -732,6 +921,15 @@ class ValidationProcedure(TargetProcedure):
     * ``"reteste"`` (tecla T, mais tarde): mede o erro depois de um tempo de
       uso e corrige o desvio pela MÉDIA dos erros de todos os alvos (aplicada
       ao modelo, se não for grande demais).
+    * ``"periodica"``: igual ao reteste, mas iniciada sozinha a cada
+      ``ValidationConfig.revalidate_every_min`` minutos de uso (deriva ao
+      longo da sessão, como a "drift check" do EyeLink).
+
+    Métricas por olho (``por_olho``): a acurácia, a precisão e a
+    disponibilidade (fração dos quadros com o olho aberto e o feixe
+    atingindo a tela) de cada olho sozinho, além da binocular, como no
+    relatório do Tobii Pro. Mostra se um olho é o problema (pálpebra,
+    reflexo, iluminação de um lado).
 
     Além do erro bruto, reporta o erro "recentralizado": cada alvo corrigido
     pela média dos erros dos OUTROS alvos (validação cruzada). É o erro que
@@ -760,7 +958,8 @@ class ValidationProcedure(TargetProcedure):
                          calib_cfg.min_samples_per_point, order=order, **_gating(calib_cfg))
         self.cfg = cfg
         self.kind = kind
-        self.title = "Validacao imediata" if kind == "imediata" else "Reteste"
+        self.title = {"imediata": "Validacao imediata",
+                      "periodica": "Revalidacao periodica"}.get(kind, "Reteste")
         self.mad = calib_cfg.outlier_mad_threshold
         self.max_frac = calib_cfg.recenter_max_frac
         self.model = model
@@ -783,9 +982,39 @@ class ValidationProcedure(TargetProcedure):
         d = max(abs(fx), abs(fy))
         return "centro" if d < 0.1 else ("intermediaria" if d <= 0.25 else "borda")
 
+    def _eye_metrics(self, per_eye: list, n_frames: int, deg) -> dict:
+        """Acurácia, precisão e disponibilidade de cada olho sozinho.
+        per_eye: por alvo, (n, 2 olhos, 2) previsões de TODAS as amostras
+        válidas do alvo (NaN com o olho fechado); n_frames: quadros da coleta
+        (válidos + perdidos)."""
+        out = {}
+        for k, name in enumerate(("direito", "esquerdo")):
+            errs, precs, s2s, n_fin = [], [], [], 0
+            for t, P in zip(self.targets, per_eye):
+                p = P[:, k]
+                p = p[np.all(np.isfinite(p), axis=1)]
+                n_fin += len(p)
+                if len(p) < 3:
+                    continue
+                errs.append(float(np.hypot(*(np.median(p, axis=0) - np.asarray(t)))))
+                precs.append(float(np.sqrt(np.mean(np.sum((p - p.mean(0)) ** 2, 1)))))
+                s2s.append(float(np.sqrt(np.mean(np.sum(np.diff(p, axis=0) ** 2, 1)))))
+            acc = float(np.mean(errs)) if errs else None
+            prec = float(np.mean(precs)) if precs else None
+            out[name] = {
+                "acuracia_media_px": acc,
+                "acuracia_media_graus": deg(acc) if acc is not None else None,
+                "precisao_rms_media_px": prec,
+                "precisao_rms_s2s_px": float(np.mean(s2s)) if s2s else None,
+                "disponibilidade": n_fin / max(n_frames, 1),
+                "n_alvos": len(errs),
+            }
+        return out
+
     def on_complete(self):
         rows, preds_all, n_ok = [], [], []
         precisions, s2s = [], []
+        per_eye, n_frames = [], 0
         raw_data = CalibrationData()
         faces = []
         for i, target in enumerate(self.targets):
@@ -793,8 +1022,10 @@ class ValidationProcedure(TargetProcedure):
             raw_data.grid.append((target, feats, raws))
             raw_data.grid_obs.append(self.observations[i])
             raw_data.grid_times.append(np.asarray(self.times[i], dtype=float))
+            n_frames += len(raws) + self.invalid[i]
             if len(raws):
                 keep = outlier_mask(feats, self.mad)
+                per_eye.append(self.model.predict_per_eye(raws)[keep])
                 s, raws = feats[keep], raws[keep]
                 faces.append(raws[:, RAW_FACE])
                 preds = self.model.predict(raws)
@@ -802,6 +1033,7 @@ class ValidationProcedure(TargetProcedure):
                 preds, s = preds[fin], s[fin]
             else:
                 preds, s = np.zeros((0, 2)), np.zeros((0, 2))
+                per_eye.append(np.zeros((0, 2, 2)))
             if not len(preds):
                 preds = np.full((1, 2), np.nan)
             preds_all.append(np.median(preds, axis=0))
@@ -875,6 +1107,7 @@ class ValidationProcedure(TargetProcedure):
             "acuracia_recentralizada_px": acc_loo,
             "acuracia_recentralizada_graus": deg(acc_loo),
             "por_regiao_px": by_region,
+            "por_olho": self._eye_metrics(per_eye, n_frames, deg),
             "calibracao": {k: v for k, v in self.model.info.items()
                            if k not in ("candidatos", "erro_loo_por_alvo_px", "erro_loo_alvos")},
             "por_alvo": [{"alvo": r.target, "estimativa": r.prediction, "regiao":
@@ -883,14 +1116,17 @@ class ValidationProcedure(TargetProcedure):
                          for i, r in enumerate(self.results)],
         }
 
-        # Reteste: corrige o desvio médio (recentralização com todos os alvos).
-        shift = -offset
-        if (self.kind == "reteste" and ok.sum() >= 3 and np.all(np.isfinite(shift))
+        # Reteste: corrige o desvio médio (recentralização com todos os
+        # alvos), encolhido pela incerteza (shrink_offset).
+        shrunk, factor = shrink_offset(err[ok]) if ok.sum() >= 2 else (offset, 1.0)
+        shift = -shrunk
+        if (self.kind in ("reteste", "periodica") and ok.sum() >= 3 and np.all(np.isfinite(shift))
                 and abs(shift[0]) <= self.max_frac * self.screen_w
                 and abs(shift[1]) <= self.max_frac * self.screen_h):
             self.model.offset = self.model.offset + shift
             self.applied_offset = shift
             self.summary["recentralizacao_aplicada_px"] = shift.tolist()
+            self.summary["recentralizacao_fator"] = factor
 
         self.cfg.results_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -917,7 +1153,12 @@ class ValidationProcedure(TargetProcedure):
                               f"Desvio constante: ({offset[0]:+.0f}, {offset[1]:+.0f}) px; "
                               f"recentralizado (validacao cruzada): {acc_loo:.0f} px"
                               f"{fmt_deg(acc_loo)}"]
-        if self.kind == "reteste":
+        eyes = self.summary["por_olho"]
+        self.message_lines.append("Por olho: " + "   ".join(
+            f"{n} " + (f"{e['acuracia_media_px']:.0f} px" if e["acuracia_media_px"] is not None
+                       else "-") + f" (disponivel {100 * e['disponibilidade']:.0f}%)"
+            for n, e in eyes.items()))
+        if self.kind in ("reteste", "periodica"):
             self.message_lines.append(
                 "Desvio corrigido no cursor" if self.applied_offset is not None
                 else "Desvio grande demais para corrigir: recalibre (ESPACO)")
@@ -948,7 +1189,8 @@ class RecenterProcedure(TargetProcedure):
     title = "Recentralizar"
     result_timeout_s = 1.5
 
-    def __init__(self, screen_size, model: CalibrationModel, cfg: CalibrationConfig):
+    def __init__(self, screen_size, model: CalibrationModel, cfg: CalibrationConfig,
+                 kind: str = "manual"):
         targets = [(fx * screen_size[0], fy * screen_size[1]) for fx, fy in cfg.recenter_points]
         order = list(range(len(targets)))
         np.random.default_rng(cfg.random_seed).shuffle(order)
@@ -957,10 +1199,17 @@ class RecenterProcedure(TargetProcedure):
         self.model = model
         self.mad = cfg.outlier_mad_threshold
         self.max_frac = cfg.recenter_max_frac
+        # "manual" (R, barra), "inicio" (ao abrir com calibração salva) ou
+        # "pos_calibracao" (conferência logo depois de calibrar).
+        self.kind = kind
+        self.applied: np.ndarray | None = None
+        self.factor = 1.0
+        if kind == "pos_calibracao":
+            self.title = "Conferencia"
 
     def status_line(self) -> str:
-        return (f"Recentralizar: olhe para o ponto ({self.pos + 1}/{len(self.order)})"
-                "  -  ESC cancela")
+        what = "Conferindo a calibracao" if self.kind == "pos_calibracao" else "Recentralizar"
+        return f"{what}: olhe para o ponto ({self.pos + 1}/{len(self.order)})  -  ESC cancela"
 
     def on_complete(self):
         deltas, raws_all = [], []
@@ -973,10 +1222,14 @@ class RecenterProcedure(TargetProcedure):
             if np.all(np.isfinite(pred)):
                 deltas.append(np.array(target) - pred)
                 raws_all.append(raws)
-        delta = np.mean(deltas, axis=0) if len(deltas) >= 2 else np.full(2, np.nan)
+        mean = np.mean(deltas, axis=0) if len(deltas) >= 2 else np.full(2, np.nan)
+        delta = mean
+        if len(deltas) >= 2:
+            # Desvio encolhido pela incerteza da média (shrink_offset).
+            delta, self.factor = shrink_offset(np.asarray(deltas))
         raws = np.vstack(raws_all) if raws_all else np.zeros((0, RAW_SIZE))
-        if (not np.all(np.isfinite(delta)) or abs(delta[0]) > self.max_frac * self.screen_w
-                or abs(delta[1]) > self.max_frac * self.screen_h):
+        if (not np.all(np.isfinite(mean)) or abs(mean[0]) > self.max_frac * self.screen_w
+                or abs(mean[1]) > self.max_frac * self.screen_h):
             # Desvio grande demais para ser corrigido por um deslocamento:
             # a postura mudou muito ou o rosto foi mal detectado. Aplicar
             # mesmo assim deslocava o cursor inteiro (caso real: -964 px no
@@ -985,19 +1238,22 @@ class RecenterProcedure(TargetProcedure):
             self.succeeded = False
             self.result_timeout_s = 6.0   # tempo para ler o aviso
             self.message_lines = [
-                f"Desvio muito grande ({delta[0]:+.0f}, {delta[1]:+.0f}) px: NAO aplicado",
+                f"Desvio muito grande ({mean[0]:+.0f}, {mean[1]:+.0f}) px: NAO aplicado",
                 "A postura mudou demais ou o rosto nao foi bem detectado.",
                 "Volte a postura da calibracao ou recalibre (ESPACO)."]
-            print(f"[Recentralizar] Desvio de ({delta[0]:+.1f}, {delta[1]:+.1f}) px rejeitado "
+            print(f"[Recentralizar] Desvio de ({mean[0]:+.1f}, {mean[1]:+.1f}) px rejeitado "
                   f"(limite {self.max_frac:.0%} da tela).")
             return
         self.model.offset = self.model.offset + delta
+        self.applied = delta
+        self.model.info[f"recentralizacao_{self.kind}_px"] = [float(v) for v in delta]
         # O offset agora vale para a postura atual: ela vira a referência do
         # aviso de postura (calibration.CalibrationModel.posture_deviation).
         self.model.head_ref = np.median(head_angles(raws), axis=0)
         self.model.pos_ref = np.median(raws[:, RAW_FACE], axis=0)
         self.succeeded = True
-        spread = float(np.mean([np.hypot(*(d - delta)) for d in deltas]))
+        spread = float(np.mean([np.hypot(*(d - mean)) for d in deltas]))
         self.message_lines = [f"Recentralizado: deslocamento ({delta[0]:+.0f}, {delta[1]:+.0f}) px"
                               f" (dispersao entre os pontos {spread:.0f} px)"]
-        print(f"[Recentralizar] Offset ajustado em ({delta[0]:+.1f}, {delta[1]:+.1f}) px.")
+        print(f"[Recentralizar] Offset ajustado em ({delta[0]:+.1f}, {delta[1]:+.1f}) px "
+              f"(média ({mean[0]:+.1f}, {mean[1]:+.1f}), fator {self.factor:.2f}).")

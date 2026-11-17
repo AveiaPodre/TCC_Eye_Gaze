@@ -122,6 +122,7 @@ def make_app(tmp_path):
     cfg.calibration.results_dir = tmp_path / "results"
     cfg.calibration.random_seed = 0   # ordem dos alvos reproduzível nos testes
     cfg.validation.after_calibration = False   # testes específicos ligam
+    cfg.calibration.check_after_calibration = False   # idem (conferência de 4 pontos)
     cfg.validation.screen_width_cm = 53.0
     cfg.calibration.screen_width_cm = 53.0     # monitor do usuário simulado
     from synthetic import SYNTH_HFOV_DEG
@@ -255,7 +256,7 @@ def test_end_to_end(tmp_path):
     app.handle_key(ord("m"))
     assert mouse.enabled
     app.handle_key(ord("d"))
-    assert app.dwell_enabled
+    assert app.control.dwell_enabled
     settle(app, 60)  # 2 s olhando para o mesmo lugar
     assert len(mouse.moves) >= 1
     assert mouse.clicks >= 1
@@ -380,7 +381,7 @@ def test_head_fine_adjustment_moves_cursor_from_gaze_point(tmp_path):
     tracker.head = (0, 0, 0)
     settle(app, 60)
     app.handle_key(ord("a"))
-    assert app.fine_enabled
+    assert app.control.fine_enabled
     settle(app, 30)
     base = app.screen_point.copy()
     tracker.head = (2.0, 0, 0)          # cabeça 2° para a direita
@@ -395,9 +396,9 @@ def test_head_fine_adjustment_moves_cursor_from_gaze_point(tmp_path):
     tracker.look_at = (300, 900)
     settle(app, 45)
     assert err(app, (300, 900)) < 80
-    assert np.linalg.norm(app.fine.offset) < 1
+    assert np.linalg.norm(app.control.fine.offset) < 1
     app.handle_key(ord("a"))
-    assert not app.fine_enabled
+    assert not app.control.fine_enabled
 
 
 def test_fine_adjustment_survives_looking_at_the_cursor(tmp_path):
@@ -413,16 +414,33 @@ def test_fine_adjustment_survives_looking_at_the_cursor(tmp_path):
     settle(app, 60)
     tracker.head = (3.0, 0, 0)               # ajuste de ~65 px para a direita
     settle(app, 30)
-    adj, cur = app.fine.offset.copy(), app.screen_point.copy()
-    assert np.linalg.norm(adj) > 40 and app._fine_anchor is not None
+    adj, cur = app.control.fine.offset.copy(), app.screen_point.copy()
+    assert np.linalg.norm(adj) > 40 and app.control.anchor is not None
     tracker.look_at = (1050, 520)            # olha para o cursor (salto de ~150 px)
     settle(app, 30)
     assert np.linalg.norm(app.screen_point - cur) < 15, (cur, app.screen_point)
-    assert np.linalg.norm(app.fine.offset - adj) < 15
+    assert np.linalg.norm(app.control.fine.offset - adj) < 15
     tracker.look_at = (300, 900)             # vai para outro lugar
     settle(app, 45)
     assert err(app, (300, 900)) < 100
-    assert app._fine_anchor is None or np.linalg.norm(app._fine_anchor - cur) > 300
+    assert app.control.anchor is None or np.linalg.norm(app.control.anchor - cur) > 300
+
+
+def test_fine_mode_follows_gaze_when_head_is_still(tmp_path):
+    """Modo de precisão sem ajuste da cabeça: o cursor segue o olhar como no
+    modo normal. Até 17/11, um olhar a 150-360 px do cursor não o movia (só
+    saltos > 20% da tela), e o cursor "ficava parado" no uso real."""
+    app, tracker, _ = make_app(tmp_path)
+    app.handle_key(ord(" "))
+    run_procedure(app)
+    app.handle_key(13)
+    app.handle_key(ord("a"))
+    tracker.look_at, tracker.head = (900, 500), (0, 0, 0)
+    settle(app, 45)
+    for target in ((1150, 500), (1150, 750), (950, 700)):   # 200-250 px por vez
+        tracker.look_at = target
+        settle(app, 30)
+        assert err(app, target) < 70, (target, app.screen_point)
 
 
 def test_fine_mode_cursor_follows_only_the_head(tmp_path):
@@ -435,16 +453,16 @@ def test_fine_mode_cursor_follows_only_the_head(tmp_path):
     app.handle_key(ord("a"))
     tracker.look_at, tracker.head = (900, 500), (0, 0, 0)
     settle(app, 60)
-    anchor = app._fine_anchor.copy()
+    anchor = app.control.anchor.copy()
     path = [(4.0 * np.sin(k / 15), -3.0 * np.sin(k / 23), 0.0) for k in range(120)]
     offsets = []
     for head in path:
         tracker.head = head
         app.step()
-        assert np.allclose(app._fine_anchor, anchor)
-        expected = np.clip(anchor + app.fine.offset, 0, np.array(SCREEN) - 1)
+        assert np.allclose(app.control.anchor, anchor)
+        expected = np.clip(anchor + app.control.fine.offset, 0, np.array(SCREEN) - 1)
         assert np.linalg.norm(app.screen_point - expected) < 1e-6
-        offsets.append(np.abs(app.fine.offset).max())
+        offsets.append(np.abs(app.control.fine.offset).max())
     assert max(offsets) > 50                 # a cabeça de fato moveu o cursor (~90 px)
 
 
@@ -487,9 +505,9 @@ def test_gaze_bar_toggles_functions_without_keyboard(tmp_path):
     app.handle_key(ord(" "))
     run_procedure(app)
     app.handle_key(13)
-    assert mouse.enabled and not app.dwell_enabled
+    assert mouse.enabled and not app.control.dwell_enabled
     _look_at_button(app, tracker, "clique")
-    assert app.dwell_enabled and mouse.clicks == 0
+    assert app.control.dwell_enabled and mouse.clicks == 0
     tracker.look_at = (900.0, 600.0)             # longe da barra: o clique funciona
     for _ in range(90):
         app.step()
@@ -498,9 +516,9 @@ def test_gaze_bar_toggles_functions_without_keyboard(tmp_path):
     assert mouse.clicks >= 1
     clicks = mouse.clicks
     _look_at_button(app, tracker, "precisao")
-    assert app.fine_enabled and mouse.clicks == clicks
+    assert app.control.fine_enabled and mouse.clicks == clicks
     _look_at_button(app, tracker, "precisao")
-    assert not app.fine_enabled
+    assert not app.control.fine_enabled
     _look_at_button(app, tracker, "mouse")
     assert not mouse.enabled                     # pausado...
     _look_at_button(app, tracker, "mouse")
@@ -613,18 +631,18 @@ def test_fine_adjusted_click_teaches_the_offset(tmp_path):
     # A pessoa nota o cursor deslocado e o corrige com a cabeça.
     tracker.head = (-3.0, 0.0, 0.0)
     settle(app, 20)
-    fine = app.fine.offset.copy()
+    fine = app.control.fine.offset.copy()
     assert np.linalg.norm(fine) > app.cfg.adapt.fine_min_px
     app.handle_key(ord("d"))                 # liga o dwell: o clique vem em ~1 s
     for _ in range(60):
         app.step()
         if mouse.clicks:
             break
-    assert mouse.clicks >= 1 and app.online_corrections == 1
+    assert mouse.clicks >= 1 and app.control.online_corrections == 1
     step = app.model.offset - before
     # O offset andou na direção do ajuste feito com a cabeça.
     assert np.dot(step, fine) > 0 and np.linalg.norm(step) <= app.cfg.adapt.max_step_px + 1e-6
-    assert np.linalg.norm(app.fine.offset) < 1e-6   # o ajuste fino recomeça
+    assert np.linalg.norm(app.control.fine.offset) < 1e-6   # o ajuste fino recomeça
 
 
 def test_saved_calibration_recenters_on_start(tmp_path):

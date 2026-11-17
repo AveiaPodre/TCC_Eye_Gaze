@@ -72,6 +72,12 @@ def recompute(data: CalibrationData) -> CalibrationData:
     if data.head_obs:
         out.head_target = data.head_target
         out.head_features, out.head_raw, out.head_obs, _ = run(data.head_obs)
+    if data.pursuit_obs and data.pursuit_targets is not None \
+            and len(data.pursuit_obs) == len(data.pursuit_targets):
+        # Perseguição: cada amostra com o seu alvo (posição do ponto).
+        out.pursuit_features, out.pursuit_raw, out.pursuit_obs, idx = run(data.pursuit_obs)
+        out.pursuit_targets = np.atleast_2d(data.pursuit_targets)[idx]
+        out.pursuit_times = np.asarray(data.pursuit_times, dtype=float)[idx]
     out.feature_version = FEATURE_VERSION
     return out
 

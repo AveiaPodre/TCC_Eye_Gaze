@@ -89,30 +89,6 @@ def ray_plane(origin, direction, point, normal):
     return o + t[..., None] * d, t
 
 
-def closest_point_between_rays(o1, d1, o2, d2):
-    """Ponto mais próximo entre duas retas (o + s·d), vetorizado.
-
-    Duas retas no espaço quase nunca se cruzam exatamente; a "interseção" é o
-    ponto médio do segmento perpendicular comum. Devolve (ponto, s, t,
-    distância entre as retas); s e t são NaN se as retas são paralelas.
-    """
-    o1, d1, o2, d2 = (np.asarray(v, dtype=np.float64) for v in (o1, d1, o2, d2))
-    w0 = o1 - o2
-    a = np.sum(d1 * d1, -1)
-    b = np.sum(d1 * d2, -1)
-    c = np.sum(d2 * d2, -1)
-    d = np.sum(d1 * w0, -1)
-    e = np.sum(d2 * w0, -1)
-    den = a * c - b * b
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ok = den > 1e-12 * a * c
-        s = np.where(ok, (b * e - c * d) / den, np.nan)
-        t = np.where(ok, (a * e - b * d) / den, np.nan)
-    p1 = o1 + s[..., None] * d1
-    p2 = o2 + t[..., None] * d2
-    return 0.5 * (p1 + p2), s, t, np.linalg.norm(p1 - p2, axis=-1)
-
-
 # ---------------------------------------------------------- monitor virtual
 @dataclass
 class VirtualScreen:
@@ -125,10 +101,6 @@ class VirtualScreen:
     @property
     def px_per_cm(self) -> float:
         return self.size_px[0] / self.width_cm
-
-    @property
-    def height_cm(self) -> float:
-        return self.size_px[1] / self.px_per_cm
 
     def px_to_cm(self, Y) -> np.ndarray:
         """Pixels da tela (n, 2) -> pontos 3D (n, 3) no plano z = 0."""

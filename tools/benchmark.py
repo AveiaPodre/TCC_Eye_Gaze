@@ -54,6 +54,11 @@ VARIANTS: list[tuple[str, dict]] = [
     ("pupila só MediaPipe", dict(pupil_source="mediapipe")),
     ("pupila só refinada", dict(pupil_source="refinada")),
     ("olhos com peso igual", dict(weight_eyes=False)),
+    # Sessões com perseguição (--perseguicao): sem ela e com outros pesos.
+    # Nas demais sessões, iguais ao padrão.
+    ("sem perseguição", dict(pursuit_weight=0.0)),
+    ("perseguição peso 3", dict(pursuit_weight=3.0)),
+    ("perseguição peso 12", dict(pursuit_weight=12.0)),
 ]
 WIDTH_CM: float | None = None
 

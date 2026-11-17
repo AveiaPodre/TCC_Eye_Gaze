@@ -6,12 +6,12 @@ import numpy as np
 import pytest
 
 from eyegaze.calibration import (CalibrationData, CalibrationModel, build_grid,
-                                 correction_basis, fit_from_samples, reject_outliers)
+                                 correction_basis, fit_from_samples, outlier_mask)
 from eyegaze.config import GazeConfig
-from eyegaze.eyeball import RADIUS_CM, EyeballModel
+from eyegaze.eyeball import RADIUS_CM
 from eyegaze.filters import GazeFollower, OneEuroFilter
 from eyegaze.gaze import RAW_SIZE, GazeEstimator, direction_to_angles
-from eyegaze.geometry import VirtualScreen, closest_point_between_rays
+from eyegaze.geometry import VirtualScreen
 from eyegaze.head_pose import estimate_head_pose
 from eyegaze.landmarks import LEFT_EYE, RIGHT_EYE
 
@@ -57,20 +57,6 @@ def test_incoherent_matrix_falls_back_to_landmarks():
     bad[:3, :3] = np.diag([-1.0, 1.0, -1.0])  # x espelhado (convenção errada)
     _, used = estimate_head_pose(make_points(), bad)
     assert used.startswith("landmarks")
-
-
-def test_closest_point_between_rays():
-    """Etapa 3: retas que se cruzam -> o ponto de cruzamento; retas reversas
-    -> o meio do segmento perpendicular comum; paralelas -> NaN."""
-    T = np.array([5.0, 12.0, 0.0])
-    o1, o2 = np.array([-3.0, 10.0, 60.0]), np.array([3.0, 10.0, 60.0])
-    X, s, t, gap = closest_point_between_rays(o1, T - o1, o2, T - o2)
-    assert np.allclose(X, T) and gap < 1e-9 and s == pytest.approx(1.0)
-    X, _, _, gap = closest_point_between_rays(np.zeros(3), np.array([1.0, 0, 0]),
-                                              np.array([0, 0, 2.0]), np.array([0, 1.0, 0]))
-    assert np.allclose(X, [0, 0, 1.0]) and gap == pytest.approx(2.0)
-    X, s, _, _ = closest_point_between_rays(o1, np.array([0, 0, -1.0]), o2, np.array([0, 0, -1.0]))
-    assert np.isnan(s)
 
 
 def test_virtual_screen_orientation_and_roundtrip():
@@ -464,8 +450,9 @@ def test_reject_outliers_removes_spike():
     rng = np.random.default_rng(4)
     s = rng.normal(0, 0.2, (30, 2))
     s[5] = [8, -8]
-    assert len(reject_outliers(s, 3.5)) < 30
-    assert not np.any(np.all(reject_outliers(s, 3.5) == [8, -8], axis=1))
+    kept = s[outlier_mask(s, 3.5)]
+    assert len(kept) < 30
+    assert not np.any(np.all(kept == [8, -8], axis=1))
 
 
 # ------------------------------------------------------------------- filtro

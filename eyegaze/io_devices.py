@@ -6,6 +6,7 @@ tamanho da tela e controle do mouse.
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 from pathlib import Path
@@ -146,7 +147,23 @@ class SessionRecorder:
         self.meta = {"versao": 1, "tela": list(screen_size), "camera": list(frame_size),
                      "fps": fps, "semente": int(seed), "tela_cm": screen_width_cm,
                      "protocolo": protocol,
-                     "timestamps_ms": [], "teclas": []}
+                     "timestamps_ms": [], "teclas": [],
+                     # Por quadro: tempo de processamento (ms) e estado do uso
+                     # (bits: mouse, clique, precisão, procedimento).
+                     "proc_ms": [], "estado": []}
+        # A compressão MJPG (~3,5 ms por quadro em 720p) roda numa thread:
+        # no laço principal, ela empurrava o tempo por quadro para perto dos
+        # 33 ms entre quadros da câmera.
+        self._queue: queue.Queue = queue.Queue(maxsize=120)
+        self._thread = threading.Thread(target=self._write_loop, daemon=True)
+        self._thread.start()
+
+    def _write_loop(self):
+        while True:
+            frame = self._queue.get()
+            if frame is None:
+                break
+            self._writer.write(frame)
 
     @property
     def frame_index(self) -> int:
@@ -154,13 +171,19 @@ class SessionRecorder:
         return len(self.meta["timestamps_ms"]) - 1
 
     def write(self, frame: np.ndarray, timestamp_ms: int):
-        self._writer.write(frame)
+        self._queue.put(frame)       # bloqueia só se a thread atrasar 4 s
         self.meta["timestamps_ms"].append(int(timestamp_ms))
+
+    def log_frame(self, proc_ms: float, state: int):
+        self.meta["proc_ms"].append(round(float(proc_ms), 1))
+        self.meta["estado"].append(int(state))
 
     def log_key(self, key: int):
         self.meta["teclas"].append([self.frame_index, int(key)])
 
     def close(self):
+        self._queue.put(None)
+        self._thread.join()
         self._writer.release()
         self.meta_path.write_text(json.dumps(self.meta), encoding="utf-8")
         print(f"[Gravação] {len(self.meta['timestamps_ms'])} quadros em {self.video_path}")

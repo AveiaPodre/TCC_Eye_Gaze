@@ -32,7 +32,7 @@ A escolha do tipo de correção e da força do ridge é por validação cruzada:
 cada alvo fica fora do ajuste por vez (o globo E a correção são reajustados
 sem ele), e o erro nesse alvo estima o erro em pontos novos.
 
-A etapa da cabeça (opcional, modo pesquisa) NÃO entra no ajuste: é usada só
+O teste da cabeça (opcional, tecla K ou --cabeca) NÃO entra no ajuste: é usado só
 como TESTE (cabeça em poses novas). Nas sessões gravadas, treinar com ela
 melhorava a validação em ~3 px, e ela é inadequada para quem não consegue
 mover a cabeça.
@@ -129,10 +129,6 @@ def outlier_mask(samples: np.ndarray, threshold: float) -> np.ndarray:
     if keep.sum() < max(3, len(samples) // 3):
         return np.ones(len(samples), bool)  # rejeição agressiva demais
     return keep
-
-
-def reject_outliers(samples: np.ndarray, threshold: float) -> np.ndarray:
-    return np.atleast_2d(samples)[outlier_mask(samples, threshold)]
 
 
 def build_grid(screen_w: int, screen_h: int, cols: int, rows: int,
@@ -241,6 +237,19 @@ class CalibrationModel:
                                self.screen_size) + self.offset
         return out[0] if raw.ndim == 1 else out
 
+    def predict_per_eye(self, raw) -> np.ndarray:
+        """(n, 2 olhos, 2) pixel do monitor real previsto por CADA olho sozinho
+        (feixe do olho no monitor virtual + a mesma correção e o mesmo offset).
+        NaN com o olho fechado. Usado nas métricas por olho da validação."""
+        per_eye = self.virtual_px_per_eye(np.atleast_2d(raw))
+        out = np.full(per_eye.shape, np.nan)
+        for k in range(2):
+            ok = np.all(np.isfinite(per_eye[:, k]), axis=1)
+            if ok.any():
+                out[ok, k] = apply_correction(per_eye[ok, k], self.coef, self.correction,
+                                              self.screen_size) + self.offset
+        return out
+
     # -------------------------------------------------------------- postura
     def posture_deviation(self, raw: np.ndarray) -> dict:
         """Quanto a postura atual se afasta da calibração: ``ang`` (yaw, pitch:
@@ -266,10 +275,6 @@ class CalibrationModel:
             step *= max_step_px / norm
         self.offset = self.offset + step
         return step
-
-    @property
-    def cv_score(self) -> float:
-        return float(self.info.get("erro_loo_medio_px", np.inf))
 
     # ----------------------------------------------------------------- I/O
     def to_dict(self) -> dict:
@@ -347,6 +352,14 @@ class CalibrationData:
     head_obs: list = field(default_factory=list)
     # Instante (s) de cada amostra da grade (mesma ordem de ``grid``).
     grid_times: list = field(default_factory=list)
+    # Calibração por perseguição (procedures.CalibrationProcedure): um alvo em
+    # movimento; cada amostra tem o SEU alvo (posição do ponto naquele
+    # instante). Arrays (n, 2), (n, 2), (n, RAW_SIZE) e (n,).
+    pursuit_targets: np.ndarray | None = None
+    pursuit_features: np.ndarray | None = None
+    pursuit_raw: np.ndarray | None = None
+    pursuit_times: np.ndarray | None = None
+    pursuit_obs: list = field(default_factory=list)
     # Versão do layout das medidas gravadas (``raw``). Diferente da atual:
     # só serve depois de recalcular a partir dos landmarks.
     feature_version: int = FEATURE_VERSION
@@ -373,6 +386,12 @@ class CalibrationData:
             arrays["head_feats"] = np.atleast_2d(self.head_features)
             arrays["head_raw"] = np.atleast_2d(self.head_raw)
             _pack_obs(arrays, "obs_head", self.head_obs)
+        if self.pursuit_raw is not None and len(self.pursuit_raw):
+            arrays["pursuit_targets"] = np.atleast_2d(self.pursuit_targets)
+            arrays["pursuit_feats"] = np.atleast_2d(self.pursuit_features)
+            arrays["pursuit_raw"] = np.atleast_2d(self.pursuit_raw)
+            arrays["pursuit_t"] = np.asarray(self.pursuit_times, dtype=float)
+            _pack_obs(arrays, "obs_pursuit", self.pursuit_obs)
         np.savez_compressed(path, **arrays)
 
     @classmethod
@@ -394,6 +413,10 @@ class CalibrationData:
             data.head_target = tuple(z["head_target"])
             data.head_features, data.head_raw = z["head_feats"], z["head_raw"]
             data.head_obs = _unpack_obs(z, "obs_head")
+        if "pursuit_raw" in z:
+            data.pursuit_targets, data.pursuit_features = z["pursuit_targets"], z["pursuit_feats"]
+            data.pursuit_raw, data.pursuit_times = z["pursuit_raw"], z["pursuit_t"]
+            data.pursuit_obs = _unpack_obs(z, "obs_pursuit")
         return data
 
     @property
@@ -449,6 +472,7 @@ def fit_from_samples(
     pupil_source: str | None = None,
     correction: tuple[str, float] | None = None,
     weight_eyes: bool = True,
+    pursuit_weight: float = 6.0,
 ) -> tuple[CalibrationModel, list[PointResult], dict]:
     """Ajusta o pipeline. Devolve (modelo, resultados por alvo, estatísticas).
 
@@ -460,6 +484,9 @@ def fit_from_samples(
     pupil_source: fonte da pupila (padrão: média do MediaPipe com a refinada,
     se houver; nas sessões gravadas, errou menos que cada uma sozinha).
     weight_eyes: peso de cada olho pelo seu erro (False: pesos iguais).
+    pursuit_weight: peso TOTAL das amostras da perseguição, em "número de
+    alvos fixos" (cada alvo fixo pesa 1). Elas entram sempre no treino; a
+    validação cruzada continua deixando de fora só os alvos fixos.
     """
     if data.stale:
         raise ValueError("Medidas gravadas com outra versão do estimador; recalcule "
@@ -479,13 +506,25 @@ def fit_from_samples(
     Y_all = np.vstack([np.tile(t, (len(r), 1)) for _, t, r in cleaned])
     w_all = np.concatenate([np.full(len(r), 1.0 / len(r)) for _, _, r in cleaned])  # alvo pesa 1
     g_all = np.concatenate([np.full(len(r), i) for i, _, r in cleaned])
+    # Perseguição: cada amostra com o seu alvo; sempre no treino (grupo -1).
+    n_pursuit = 0
+    pr = None if data.pursuit_raw is None else np.atleast_2d(data.pursuit_raw)
+    if pr is not None and len(pr) >= 20 and pr.shape[1] == RAW_SIZE and pursuit_weight > 0:
+        n_pursuit = len(pr)
+        raw_all = np.vstack([raw_all, pr])
+        Y_all = np.vstack([Y_all, np.atleast_2d(data.pursuit_targets)])
+        w_all = np.concatenate([w_all, np.full(n_pursuit, pursuit_weight / n_pursuit)])
+        g_all = np.concatenate([g_all, np.full(n_pursuit, -1)])
     T_all = screen.px_to_cm(Y_all)
     src = pupil_source or ("media" if has_refined_pupil(raw_all) else "mediapipe")
 
     if correction is not None:
         cands = [("nenhuma", 0.0), (correction[0], float(correction[1]))]
     else:
-        cands = _candidates(len(cleaned), max_degree)
+        # A perseguição cobre a tela de forma contínua: conta como alvos
+        # (pursuit_weight) para liberar correções com mais termos.
+        cands = _candidates(len(cleaned) + (int(pursuit_weight) if n_pursuit else 0),
+                            max_degree)
         if corrections is not None:
             cands = [c for c in cands if c[0] in corrections or c[0] == "nenhuma"]
 
@@ -494,7 +533,7 @@ def fit_from_samples(
     scores: dict = {}
     if len(cleaned) >= 5:
         preds = {c: {} for c in cands}
-        for g in np.unique(g_all):
+        for g in np.unique(g_all[g_all >= 0]):
             tr, te = g_all != g, g_all == g
             eb = EyeballModel.fit(raw_all[tr], T_all[tr], w_all[tr], src,
                                   weight_eyes=weight_eyes)
@@ -540,7 +579,13 @@ def fit_from_samples(
                          "peso": float(eyeball.eye_weights[k])}
                   for k, name in enumerate(EYE_NAMES)},
         "erro_angular_ajuste_graus": eyeball.info.get("erro_angular_ajuste_graus"),
+        "n_alvos_fixos": len(cleaned),
     }
+    if n_pursuit:
+        pe = np.hypot(*(model.predict(pr) - np.atleast_2d(data.pursuit_targets)).T)
+        info["n_perseguicao"] = n_pursuit
+        info["perseguicao_peso"] = float(pursuit_weight)
+        info["erro_ajuste_perseguicao_px"] = float(np.nanmedian(pe))
     if scores:
         errs, ids = scores[best]
         info["erro_loo_medio_px"] = float(np.nanmean(errs))
@@ -552,11 +597,13 @@ def fit_from_samples(
                               for c, v in scores.items()]
     model.info = info
 
-    # Postura de referência (aviso de postura fora da calibração).
-    angles = head_angles(raw_all)
+    # Postura de referência (aviso de postura fora da calibração), só dos
+    # alvos fixos.
+    fixed = g_all >= 0
+    angles = head_angles(raw_all[fixed])
     model.head_ref = np.median(angles, axis=0)
     model.head_span = np.percentile(np.abs(angles - model.head_ref), 95, axis=0)
-    model.pos_ref = np.median(raw_all[:, RAW_FACE], axis=0)
+    model.pos_ref = np.median(raw_all[fixed][:, RAW_FACE], axis=0)
 
     results = []
     for _, target, r in cleaned:
@@ -566,7 +613,8 @@ def fit_from_samples(
     stats = dict(model.info)
     if data.head_raw is not None and len(np.atleast_2d(data.head_raw)) >= MIN_HEAD_TEST \
             and np.atleast_2d(data.head_raw).shape[1] == RAW_SIZE:
-        head = head_test_error(model, data.head_raw, data.head_target, raw_all, head_max_deg)
+        head = head_test_error(model, data.head_raw, data.head_target, raw_all[g_all >= 0],
+                               head_max_deg)
         model.info.update(head)
         stats.update(head)
     return model, results, stats

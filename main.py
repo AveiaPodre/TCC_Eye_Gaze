@@ -56,8 +56,17 @@ def parse_args(argv=None):
     p.add_argument("--sem-autofoco", action="store_true",
                    help="desliga o foco automático (evita a nitidez do olho oscilar)")
     p.add_argument("--pesquisa", action="store_true",
-                   help="modo pesquisa: etapa da cabeça (teste) e validação imediata após "
+                   help="modo pesquisa: validação imediata e revalidação periódica após "
                         "cada calibração. Ligado automaticamente com --gravar")
+    p.add_argument("--cabeca", action="store_true",
+                   help="modo pesquisa: teste da cabeça depois da validação imediata "
+                        "(fora do protocolo padrão desde 17/11)")
+    p.add_argument("--perseguicao", choices=("soma", "alternativa"), default=None,
+                   help="calibração por perseguição (seguir um ponto em movimento): 'soma' = "
+                        "grade + perseguição + etapa 2; 'alternativa' = perseguição + 5 pontos")
+    p.add_argument("--revalidar-min", type=float, default=None,
+                   help="revalidação periódica a cada N minutos de uso (0 desliga; "
+                        "padrão 10 no modo pesquisa, desligada fora dele)")
     p.add_argument("--gravar", action="store_true",
                    help="grava o vídeo da câmera e as teclas em results/sessao_*.avi/.json "
                         "(implica --pesquisa)")
@@ -77,17 +86,20 @@ def _set_screen_width(cfg: AppConfig, width_cm: float | None):
 
 
 def _research_mode(cfg: AppConfig):
-    """Modo pesquisa: mede mais (cabeça em poses novas, validação imediata)
-    à custa de uma calibração mais longa."""
-    cfg.calibration.head_stage = True
+    """Modo pesquisa: mede mais (validação imediata depois de cada
+    calibração e revalidação a cada 10 min de uso)."""
     cfg.validation.after_calibration = True
+    cfg.validation.revalidate_every_min = 10.0
 
 
 def protocol_of(cfg: AppConfig) -> dict:
     """Protocolo da calibração, gravado com a sessão para a reprodução."""
     c = cfg.calibration
     return {"grade": [c.grid_cols, c.grid_rows], "etapa_cabeca": c.head_stage,
-            "validacao_imediata": cfg.validation.after_calibration}
+            "validacao_imediata": cfg.validation.after_calibration,
+            "perseguicao": c.pursuit,
+            "revalidar_min": cfg.validation.revalidate_every_min,
+            "conferencia": c.check_after_calibration}
 
 
 def _replay(args, cfg: AppConfig) -> int:
@@ -101,6 +113,9 @@ def _replay(args, cfg: AppConfig) -> int:
         cfg.calibration.grid_cols, cfg.calibration.grid_rows = proto["grade"]
         cfg.calibration.head_stage = bool(proto["etapa_cabeca"])
         cfg.validation.after_calibration = bool(proto["validacao_imediata"])
+        cfg.calibration.pursuit = proto.get("perseguicao", "nenhuma")
+        cfg.validation.revalidate_every_min = float(proto.get("revalidar_min", 0.0))
+        cfg.calibration.check_after_calibration = bool(proto.get("conferencia", False))
     name = Path(args.reproduzir).stem
     out = cfg.calibration.results_dir / "reproducoes" / name
     # Resultados separados das sessões reais, e sem tocar na calibração salva.
@@ -140,6 +155,12 @@ def main(argv=None) -> int:
     cfg.camera.autofocus = not args.sem_autofoco
     if args.pesquisa or args.gravar:
         _research_mode(cfg)
+    if args.cabeca:
+        cfg.calibration.head_stage = True
+    if args.perseguicao:
+        cfg.calibration.pursuit = args.perseguicao
+    if args.revalidar_min is not None:
+        cfg.validation.revalidate_every_min = max(args.revalidar_min, 0.0)
 
     if args.reproduzir:
         return _replay(args, cfg)
@@ -171,7 +192,12 @@ def main(argv=None) -> int:
                          autofocus=cfg.camera.autofocus)
     print(f"[Câmera] {source.resolution[0]}x{source.resolution[1]} ({source.describe()})")
     if args.pesquisa or args.gravar:
-        print("[Modo pesquisa] Etapa da cabeça e validação imediata ligadas.")
+        print("[Modo pesquisa] Validação imediata ligada"
+              + (" e teste da cabeça." if cfg.calibration.head_stage else "."))
+    if cfg.calibration.pursuit != "nenhuma":
+        print(f"[Calibração] Perseguição: {cfg.calibration.pursuit}")
+    if cfg.validation.revalidate_every_min:
+        print(f"[Validação] Revalidação a cada {cfg.validation.revalidate_every_min:g} min")
 
     recorder = None
     if args.gravar:

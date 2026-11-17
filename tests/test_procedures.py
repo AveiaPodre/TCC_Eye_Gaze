@@ -241,7 +241,7 @@ def test_model_reports_head_cv_and_candidates():
     assert stats["erro_cabeca_px"] > 0
     assert {c["correcao"] for c in stats["candidatos"]} == {
         "nenhuma", "deslocamento", "afim", "quadratica"}
-    assert stats["erro_loo_medio_px"] == model.cv_score
+    assert stats["erro_loo_medio_px"] == model.info["erro_loo_medio_px"]
     assert stats["erro_loo_medio_px"] == min(c["erro_loo_px"] for c in stats["candidatos"])
 
 
@@ -345,7 +345,7 @@ def test_known_target_correction_reduces_drift(tmp_path):
     tracker.look_at = key
 
     def error_vec():   # erro médio dos quadros recentes (um quadro só é ruidoso)
-        return np.median(app.model.predict(np.array(app.recent_raw)), 0) - key
+        return np.median(app.model.predict(np.array(app.control.recent_raw)), 0) - key
 
     settle(app, 20)
     base = error_vec()

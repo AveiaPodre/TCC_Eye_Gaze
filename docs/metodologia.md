@@ -404,6 +404,30 @@ perseguição suave), seguindo 58% dos movimentos de 70 px (62%).
 
 As seções 4.1 e 4.2 descrevem a versão com trava, mantidas como histórico.
 
+### 4.0.1 Ajuste de 17/11: movimentos sutis (`tools/bancada_cursor.py`)
+
+Queixa no uso: o cursor "anda em blocos" e não acompanha ajustes pequenos.
+A bancada (agora em `tools/bancada_cursor.py`) usa o ruído REAL de 428
+fixações das validações gravadas (ponto bruto no monitor, quadro a
+quadro), encadeia fixações com degraus de 40 a 400 px e mede a fração
+seguida em até 0,5 s, a latência, o cursor parado com o olho fixo, o
+tremor e o erro.
+
+| Estabilizador | segue 40/70/100 px | latência | parado | tremor | erro |
+|---|---|---|---|---|---|
+| até 17/11 (liga a 4 × ruído, alpha 0,4, mediana 7) | 33% / 43% / 62% | 167-233 ms | 85% | 3,0 px | 27 px |
+| **atual (liga a 2,5 ×, alpha 0,7, mediana 5)** | **53% / 58% / 76%** | **133-167 ms** | **87%** | 4,3 px | **25 px** |
+
+Com o limiar de 4 × o ruído (≥ 60 px com o piso de 15 px), movimentos
+abaixo de ~60 px nunca eram seguidos. Baixar só o limiar seguia mais, mas
+deixava o cursor inquieto (parado em 72-76%); com o passo maior (alpha
+0,7) o cursor chega e para em poucos quadros, e a mediana de 5 amostras
+reage mais cedo. As sacadas (200-400 px) continuam em 67 ms.
+
+Testado e descartado: manter o deslizamento até a mediana se renovar
+(seguia 64% dos degraus de 40 px, mas o cursor ficava parado em só 65%
+dos quadros com o olho fixo e o erro subia para 29 px).
+
 ### 4.1 Atraso do cursor
 
 **Medição.** O MediaPipe de cada quadro das duas sessões gravadas em vídeo
@@ -569,6 +593,22 @@ aprendia com esses pontos incompletos). O limite de giro também subiu de
 erro do olhar. O ganho (25 px/grau) é menor que o físico (~38) para
 favorecer a precisão. Serve só para quem tem algum controle da cabeça; o
 modo só com o olhar continua sendo o padrão.
+
+**Correção de 17/11: o cursor "ficava parado" no modo de precisão.** Na
+sessão de 17/11 15:45, reprocessada quadro a quadro com o modelo da
+própria sessão e o estado gravado (mouse, precisão), o olhar ficou 13
+vezes por 0,5 s ou mais a 150-360 px do cursor sem que ele se movesse, e
+TODAS no modo de precisão (nenhuma no modo normal). A âncora só mudava
+numa nova fixação a mais de 20% da largura (384 px), e nunca dentro da
+mesma fixação (olhar que desliza para outro lugar sem sacada nítida). Agora,
+como no MAGIC pointing (Zhai et al., 1999), o olhar manda enquanto a
+cabeça não está ajustando: a âncora acompanha o olhar estabilizado e o
+cursor anda como no modo normal. Quando a cabeça passa da zona morta (o
+ajuste começa), a âncora congela; ela volta a seguir o olhar numa nova
+fixação a mais de 10% da largura (192 px, acima do erro do olhar) ou se o
+olhar ficar longe por 0,3 s. Na mesma sessão: 13 -> 1 evento (162 px), e a
+distância mediana entre o olhar e o cursor no modo de precisão caiu de
+131 px (p90 313) para 54 px (p90 148), igual à do modo normal (48 / 158).
 
 ## 5. Etapa 5: calibração com vários pontos (`calibration.py`, `procedures.py`)
 
@@ -799,6 +839,51 @@ linear da pupila, o erro no estado do fim caía de 102 para 27 px (deriva de
 DEPOIS da calibração continua tratada na validação (reteste) e na
 recentralização (seções 6 e 7).
 
+### 5.4.1 Calibração por perseguição (opcional, `--perseguicao`)
+
+Na calibração por perseguição (*smooth pursuit*; Pfeuffer et al., 2013),
+um ponto percorre a tela a velocidade constante e a pessoa o segue com os
+olhos. Cada quadro vira uma amostra com o seu próprio alvo: centenas de
+posições em ~13-21 s, contra 16 alvos em ~35 s na grade. Duas formas
+(`CalibrationConfig.pursuit`):
+
+- **"soma"**: grade 3x4 → perseguição pelo perímetro (margem de 5%) →
+  etapa 2. O perímetro é onde o erro é maior (bordas, seção 5.11);
+- **"alternativa"**: perseguição pelo perímetro e pelas linhas do meio
+  (horizontal e vertical) + 5 alvos fixos (centro e 30/70%), no lugar da
+  grade. Os alvos fixos mantêm o critério de aceitação (LOO) e a repetição
+  de alvos ruins.
+
+O ponto fica parado 1 s no início (o olho chega) e anda a 420 px/s (~7°/s
+a 60 cm, abaixo do limite em que a perseguição suave passa a ter sacadas de
+correção). Amostras descartadas: o primeiro 0,4 s de movimento (o olho
+ainda acelera), 0,25 s depois de cada canto (o olho corta caminho e corrige
+com uma sacada) e quadros com salto > 2° em relação ao anterior (sacadas,
+olhar perdido). O alvo de cada amostra é a posição do ponto 0,1 s ANTES (o
+atraso do olho).
+
+No ajuste (`fit_from_samples`), as amostras da perseguição entram sempre
+no treino com peso total `pursuit_weight` (6 "alvos fixos"; cada alvo fixo
+pesa 1) e ficam fora das dobras da validação cruzada: o erro LOO continua
+medido só nos alvos fixos, comparável ao da grade. A postura de referência
+também usa só os alvos fixos. Os dados ficam no mesmo `calibracao_*.npz`
+(`pursuit_*`), e `tools/reavaliar.py` os recalcula a partir dos landmarks.
+
+Na simulação (usuário com o erro típico do MediaPipe, 3 sementes, erro no
+reteste com 9 alvos novos): grade + etapa 2 22 px, "soma" 20 px,
+"alternativa" 14 px. A simulação não tem o atraso variável nem as sacadas
+de correção do olho real.
+
+**Sessões reais (17/11, 4 calibrações com perseguição).** As amostras da
+perseguição erram ~80-89 px no próprio ajuste (o olho real atrasa de forma
+variável e corrige com sacadas), o dobro do erro de ajuste dos alvos
+fixos. Na mesma sessão, sem a perseguição ("sem perseguição" no
+benchmark): "soma" 164 -> 148 px e 92 -> 89 px na validação, ou seja, a
+perseguição piorava um pouco; na "alternativa", ela é necessária (5 alvos
+fixos sozinhos: 133 e 236 px, com ela 77 e 201 px), mas não supera a
+grade. Pesos 3 e 12 não mudam o quadro. A perseguição continua opcional
+e **desligada por padrão**.
+
 ### 5.5 Escolha e erro em pontos e poses novos
 
 O tipo de correção e a força do ridge são escolhidos por **validação
@@ -1023,6 +1108,38 @@ Conclusões:
   pixels que a 720p padrão (`--width 1920 --height 1080`, se a webcam
   suportar). Não há sessões gravadas em 1080p para medir.
 
+### 5.12 Análise de 17/11: o ganho vertical e o desvio que aparece depois
+
+Com as sessões de 17/11 (validação por olho e perseguição) e as 44
+validações gravadas:
+
+- **O desvio constante continua dominando.** Benchmark: 110 px na
+  validação, 74 px sem o desvio. Na sessão das 15:03, o alvo do centro
+  errava +93 px (y) no fim da calibração e −299 px na validação, 6 s
+  depois, sem mudança de postura (pitch da cabeça +0,5°, posição < 1 mm).
+- **O sinal vertical é fraco e a calibração o amplifica.** Comparando o
+  pitch das features entre o topo e a base da tela com a geometria real
+  (largura da tela e distância medida): o ganho efetivo é ~2 × o
+  geométrico na horizontal e **4-6 × na vertical** (o MediaPipe move a
+  íris na vertical ~1/5 do que deveria). O ruído quadro a quadro das
+  features é pequeno (6-26 px depois do ganho), mas um viés lento de 0,5°
+  no sinal vertical vira 100-250 px na tela. Esse viés é o desvio
+  constante.
+- **Pálpebras não acrescentam informação ao modelo.** Num ajuste só no
+  plano da imagem, somar a posição da pálpebra superior e a abertura do
+  olho à íris reduzia o erro vertical (164 -> 104 px), mas o modelo
+  geométrico atual já faz melhor (72 px no eixo y), e corrigir o resíduo
+  dele com os sinais das pálpebras não mudou nada (96 -> 96-98 px).
+- **Fonte da pupila.** A média das duas fontes continua a melhor (110 px;
+  só MediaPipe 136, só refinada 115).
+- **Correção do desvio logo depois de calibrar.** Os 4 primeiros alvos da
+  validação (no tempo) estimam o desvio e os 5 seguintes medem o erro (48
+  sessões): sem corrigir 105 px; corrigindo pela média de 1/2/3/4 alvos,
+  122/99/94/90 px (com 1 piora, como já se sabia); pela média de 4
+  encolhida pela incerteza (seção 7.1), **84 px** (mediana 88 -> 78),
+  piorando só 19% das sessões (31% sem encolher). Daí a conferência de 4
+  pontos depois de toda calibração.
+
 ### 5.11 De onde vem o desvio constante (análise de 16/11)
 
 Nas validações, o erro bruto (137 px) é dominado por um desvio constante
@@ -1127,6 +1244,12 @@ intermediários e bordas) e acontece em dois momentos:
 - **Reteste** (tecla `T`, mais tarde): mede e **corrige o desvio médio** dos
   alvos no cursor (se for menor que 25% da tela; senão o relatório pede
   para recalibrar).
+- **Revalidação periódica** (`ValidationConfig.revalidate_every_min`,
+  `--revalidar-min`; 10 min no modo pesquisa, desligada fora dele): o
+  mesmo reteste, iniciado sozinho depois de N minutos sem calibração,
+  recentralização ou validação, com o rosto visível. Como a checagem de
+  deriva do EyeLink, mede quanto o erro cresce ao longo da sessão e corrige
+  o desvio. Cancelar (ESC) só adia para o próximo intervalo.
 
 **Por que a validação imediata continua (modo pesquisa).** Nas 15 sessões
 com validação gravada até 16/11, o erro em pontos novos estimado na própria
@@ -1149,6 +1272,12 @@ Métricas, padrão em rastreamento ocular:
 - **Perda de dados**: fração dos quadros da coleta sem amostra válida
   (rosto perdido, piscada);
 - por região da tela: centro, intermediária (até 25% do centro) e bordas;
+- **por olho** (`por_olho` no json): acurácia, precisão (RMS e RMS-S2S) e
+  **disponibilidade** (fração dos quadros da coleta com o olho aberto e o
+  feixe atingindo a tela) de cada olho sozinho, com a mesma correção e o
+  mesmo offset do modelo, como no relatório do Tobii Pro. Mostra se um olho
+  é o problema (pálpebra caída, reflexo nos óculos, luz de um lado só) e
+  quanto a média ponderada dos dois ganha sobre o melhor olho;
 - o **desvio médio** (constante), a acurácia sem ele (dentro da amostra) e
   a **acurácia recentralizada**: cada alvo corrigido pela média dos erros
   dos OUTROS alvos (validação cruzada), o erro que sobra depois de uma
@@ -1201,6 +1330,26 @@ recentralizou passa a ser a referência do aviso de postura.
 
 Ao abrir o app com uma calibração salva, a recentralização roda
 **automaticamente** antes do uso (`CalibrationConfig.recenter_on_start`).
+
+**Conferência depois de calibrar (17/11).** A mesma recentralização roda
+logo depois de toda calibração (`CalibrationConfig.check_after_calibration`,
+~9 s), como a *drift correction* do EyeLink e a validação com correção do
+Tobii: o desvio constante aparece nos primeiros segundos de uso (seção
+5.12). No modo pesquisa, a validação imediata vem depois dela e mede o
+erro já com a correção.
+
+**Desvio encolhido pela incerteza** (`procedures.shrink_offset`; vale para
+a recentralização, a conferência, o reteste e a revalidação periódica). A
+média dos erros em poucos alvos é ruidosa: corrigir por ela inteira
+piorava 31% das sessões. O desvio aplicado é a média multiplicada por
+f = |m|² / (|m|² + 4·se²), em que se² é a variância dos erros entre os
+alvos dividida pelo número de alvos (estimador de James-Stein). Um desvio
+coerente (os 4 alvos erram para o mesmo lado) tem f ~ 1; um desvio do
+tamanho do ruído, f ~ 0. Nas 48 validações: 90 px com a média inteira, 85
+px com metade fixa, **84 px com f adaptativo**. Com um desvio artificial
+de 180 px somado a todos os alvos (recentralização manual com o cursor
+claramente deslocado), metade fixa deixava 123 px e o fator adaptativo
+91 px.
 
 ### 7.2 Aviso de postura
 
@@ -1394,3 +1543,8 @@ validação (`T`).
   Measures*. Oxford University Press, 2011 (definições de acurácia e
   precisão).
 - Projeto de referência: *Webcam3DTracker* (JEOresearch).
+- Zhai, S.; Morimoto, C.; Ihde, S. *Manual and Gaze Input Cascaded (MAGIC)
+  Pointing*. CHI 1999.
+- Pfeuffer, K.; Vidal, M.; Turner, J.; Bulling, A.; Gellersen, H. *Pursuit
+  Calibration: Making Gaze Calibration Less Tedious and More Flexible*.
+  UIST 2013.
