@@ -55,132 +55,96 @@ class OneEuroFilter:
         return self._x.copy()
 
 
-class FixationStabilizer:
-    """Estabilizador do cursor baseado em fixações e sacadas, com TRAVA.
+class GazeFollower:
+    """Estabilizador do cursor: salta nas sacadas; na fixação, fica PARADO
+    enquanto o olhar estimado está perto e desliza até ele quando o olhar se
+    move de verdade (histerese).
 
-    O olhar humano alterna entre FIXAÇÕES (olho parado num ponto por
-    200-600 ms) e SACADAS (saltos rápidos). Com webcam, a estimativa
-    durante uma fixação não treme só de quadro a quadro: ela PASSEIA. Nas
-    sessões gravadas, a autocorrelação entre quadros seguidos era 0,97, e o
-    ponto se afastava 50-130 px do início da fixação em 1,2 s, sem o olho
-    se mover (≈1-2,5°, bem acima do movimento fisiológico na fixação). A
-    versão anterior seguia a média de uma janela deslizante. Contra ruído
-    branco isso funciona, mas a média acompanha esse passeio e o cursor
-    "andava" com o olho parado (70% dos quadros com movimento).
+    O olhar humano alterna entre FIXAÇÕES (olho parado) e SACADAS (saltos
+    rápidos); dentro de uma fixação há também movimentos SUTIS (microssacadas
+    e pequenos reajustes de dezenas de pixels). Com webcam, a estimativa
+    numa fixação treme de quadro a quadro e também passeia devagar.
 
-    Estratégia:
-
-    * **Sacada.** Uma amostra a mais de ``limiar`` px da fixação atual é
+    * **Sacada.** Uma amostra a mais de ``limiar`` px da mediana recente é
       candidata. Depois de ``confirm_frames`` amostras seguidas, coerentes
-      entre si, o cursor salta para a amostra mais recente. Picos isolados
-      (piscada parcial, erro de detecção) são ignorados. O limiar se adapta
-      ao ruído medido: max(limiar_base, k * dispersão). Nas sessões
-      gravadas, o atraso extra do cursor depois que o ponto bruto chega ao
-      alvo é de 42 ms (mediana) e 110 ms (p90); antes, 92 e 292 ms.
-    * **Acomodação.** Nos primeiros ``settle_frames`` quadros de uma
-      fixação, o cursor desliza até a média das amostras (melhora a
-      estimativa logo após o salto).
-    * **Trava.** Depois disso, o cursor PARA. Só volta a se mover se as
-      últimas ``shift_frames`` amostras estiverem TODAS a mais de
-      ``raio de trava`` da posição travada (deslocamento pequeno, mas
-      sustentado; o passeio do ruído vai e volta). Aí começa uma nova
-      fixação no ponto médio dessas amostras.
-    * O raio de trava é max(``lock_px``, ``lock_k`` x passeio típico), e o
-      passeio típico é a dispersão das fixações anteriores (média móvel).
-      Com mais ruído (luz ruim, rosto longe), a trava fica mais larga. O
-      raio nunca passa de ``lock_cap`` (90%) do limiar de sacada.
+      entre si, o cursor salta para a mais recente (``fixation_id`` aumenta)
+      e, nos ``settle_frames`` quadros seguintes, desliza até a mediana das
+      amostras (o salto foi para UMA amostra, ruidosa). Picos isolados são
+      ignorados. limiar = max(limiar_base, k × ruído).
+    * **Fixação.** O destino é a mediana das últimas ``median_frames``
+      amostras. Parado, o cursor só começa a andar quando o destino se
+      afasta mais que ``start_k`` × ruído; aí desliza (``alpha`` do caminho
+      por quadro) até ficar a menos de ``stop_k`` × ruído e para de novo. O
+      ruído é o de quadro a quadro (robusto), não o passeio.
 
-    Com os dados gravados, os quadros com o cursor em movimento durante a
-    fixação caíram de 71% para ~6% (a maior parte no deslizamento logo
-    após a sacada), sem atraso nas sacadas (mediana de 2 quadros).
+    Histórico (bancada com as validações gravadas, 20 sessões, 180 alvos,
+    degraus sintéticos sobre o ruído real; seção 4.0 da metodologia):
+
+    * trava (até 16/11): o raio crescia com o passeio (188 px de mediana numa
+      sessão de uso); seguia 0%/5%/11% dos degraus de 40/70/100 px (o
+      cursor andava em blocos), cursor parado em 97% dos quadros;
+    * perseguição suave (16/11): deslizava sempre um pouco até o olhar;
+      seguia 38%/62%/66%, mas parado em só 72% (o cursor acompanhava o
+      passeio com o olho fixo);
+    * histerese (atual): segue 28%/58%/63%, parado em 86%, tremor 3,1 contra
+      3,9 px/quadro, mesmo erro no alvo.
     """
 
-    def __init__(self, saccade_px: float = 130.0, confirm_frames: int = 2,
-                 window: int = 30, follow: float = 0.6, lock_px: float = 65.0,
-                 lock_k: float = 3.5, shift_frames: int = 8, settle_frames: int = 8,
-                 noise_k: float = 3.0, lock_cap: float = 0.9):
+    def __init__(self, saccade_px: float = 134.0, confirm_frames: int = 2,
+                 median_frames: int = 7, start_k: float = 4.0, stop_k: float = 1.0,
+                 alpha: float = 0.4, noise_k: float = 3.0, noise_floor_px: float = 15.0,
+                 settle_frames: int = 8, window: int = 30):
         self.saccade_px = saccade_px
         self.confirm_frames = confirm_frames
-        self.window = window
-        self.follow = follow
-        self.lock_px = lock_px
-        self.lock_k = lock_k
-        self.shift_frames = shift_frames
-        self.settle_frames = settle_frames
+        self.median_frames = median_frames
+        self.start_k, self.stop_k, self.alpha = start_k, stop_k, alpha
         self.noise_k = noise_k
-        self.lock_cap = lock_cap
+        self.noise_floor_px = noise_floor_px
+        self.settle_frames = settle_frames
+        self.window = window
         self.reset()
 
     def reset(self):
         self.cursor: np.ndarray | None = None
-        self.goal: np.ndarray | None = None   # para onde o cursor desliza / onde trava
         self._buf: list[np.ndarray] = []      # amostras da fixação atual
         self._pending: list[np.ndarray] = []  # candidatas a sacada
         self._age = 0                          # amostras desde o início da fixação
+        self.moving = False                    # deslizando até o olhar
+        self.noise_px = self.noise_floor_px    # ruído de quadro a quadro (HUD)
         self.threshold = self.saccade_px
-        self.noise_px = 0.0     # dispersão da fixação atual (HUD)
-        self.wander_px = 0.0    # passeio típico (média das fixações anteriores)
-        self.fixation_id = 0    # incrementa a cada nova fixação (sacada ou deslocamento)
-
-    @property
-    def lock_radius(self) -> float:
-        return min(max(self.lock_px, self.lock_k * self.wander_px), self.lock_cap * self.threshold)
+        self.fixation_id = 0    # incrementa a cada sacada
 
     @property
     def settling(self) -> bool:
         """True nos primeiros ``settle_frames`` quadros de uma fixação."""
-        return self.goal is not None and self._age <= self.settle_frames
+        return self.cursor is not None and self._age <= self.settle_frames
 
-    @property
-    def locked(self) -> bool:
-        """True quando o cursor está parado numa fixação."""
-        return (self.goal is not None and self._age > self.settle_frames
-                and self.cursor is not None and np.array_equal(self.cursor, self.goal))
-
-    def _start_fixation(self, pts):
-        if len(self._buf) >= 10:
-            arr = np.asarray(self._buf)
-            disp = float(np.sqrt(np.mean(np.sum((arr - arr.mean(0)) ** 2, axis=1))))
-            self.wander_px = disp if self.wander_px == 0 else 0.8 * self.wander_px + 0.2 * disp
-        self._buf = [np.asarray(q, dtype=np.float64) for q in pts]
-        self._age = len(self._buf)
-        self.goal = np.mean(self._buf, axis=0)
+    def _start_fixation(self, p):
+        self._buf = [np.asarray(p, dtype=np.float64)]
+        self._age = 1
+        self.cursor = self._buf[0].copy()
+        self.moving = True
         self.fixation_id += 1
 
     def __call__(self, point) -> np.ndarray:
         p = np.asarray(point, dtype=np.float64)
         if self.cursor is None:
-            self.cursor = p.copy()
-            self._start_fixation([p])
+            self._start_fixation(p)
             return self.cursor.copy()
 
-        if len(self._buf) >= 8:
-            arr = np.asarray(self._buf)
-            self.noise_px = float(np.sqrt(np.sum(arr.var(axis=0))))
+        center = np.median(self._buf[-10:], axis=0)
         self.threshold = max(self.saccade_px, self.noise_k * self.noise_px)
-
-        center = np.mean(self._buf, axis=0)
         if np.linalg.norm(p - center) > self.threshold:
             self._pending.append(p)
             if len(self._pending) >= self.confirm_frames:
                 pend = np.asarray(self._pending)
-                pm = pend.mean(axis=0)
-                # As amostras pendentes precisam concordar entre si (um pico
-                # isolado não é sacada). A tolerância cresce com o tamanho do
-                # salto: o ponto bruto leva alguns quadros para atravessar a
-                # tela (o MediaPipe suaviza os landmarks), e nessa travessia
-                # as amostras ficam espalhadas.
+                # As pendentes precisam concordar entre si (um pico isolado não
+                # é sacada); a tolerância cresce com o tamanho do salto (o
+                # ponto bruto leva alguns quadros para atravessar a tela).
                 tol = max(self.threshold, 0.5 * np.linalg.norm(pend[-1] - center))
-                if np.max(np.linalg.norm(pend - pm, axis=1)) < tol:
-                    # Sacada confirmada: o cursor salta para a amostra MAIS
-                    # RECENTE e começa ali uma nova fixação (a acomodação
-                    # desliza até a média das amostras seguintes). A média das
-                    # pendentes ficava no meio do caminho da travessia, e o
-                    # cursor ainda tinha de deslizar até o destino: nas
-                    # sessões gravadas, o atraso p90 caiu de 235 para 110 ms.
-                    self._start_fixation(pend[-1:])
+                if np.max(np.linalg.norm(pend - pend.mean(axis=0), axis=1)) < tol:
                     self._pending = []
-                    self.cursor = pend[-1].copy()
+                    self._start_fixation(pend[-1])
                 else:
                     self._pending.pop(0)
             return self.cursor.copy()
@@ -190,21 +154,26 @@ class FixationStabilizer:
         self._age += 1
         if len(self._buf) > self.window:
             self._buf.pop(0)
+        if len(self._buf) >= 8:
+            # Ruído de quadro a quadro, robusto (MAD das diferenças), por amostra.
+            dif = np.diff(np.asarray(self._buf), axis=0)
+            mad = np.median(np.linalg.norm(dif - np.median(dif, axis=0), axis=1))
+            self.noise_px = max(self.noise_floor_px, 1.4826 * mad / np.sqrt(2))
 
+        goal = np.median(self._buf[-self.median_frames:], axis=0)
+        e = goal - self.cursor
+        dist = float(np.linalg.norm(e))
         if self._age <= self.settle_frames:
-            self.goal = np.mean(self._buf, axis=0)
-        else:
-            recent = np.asarray(self._buf[-self.shift_frames:])
-            if (len(recent) >= self.shift_frames and
-                    np.all(np.linalg.norm(recent - self.goal, axis=1) > self.lock_radius)):
-                # Deslocamento pequeno e sustentado: nova fixação ali perto.
-                self._start_fixation(recent)
-
-        d = self.goal - self.cursor
-        if np.linalg.norm(d) < 0.5:
-            self.cursor = self.goal.copy()
-        else:
-            self.cursor = self.cursor + self.follow * d
+            self.moving = True                 # acomodação depois da sacada
+        elif not self.moving and dist > self.start_k * self.noise_px:
+            self.moving = True                 # o olhar se moveu de verdade
+        if self.moving:
+            # Na acomodação, desliza um pouco mais depressa (0,5 por quadro).
+            a = max(self.alpha, 0.5) if self._age <= self.settle_frames else self.alpha
+            self.cursor = self.cursor + a * e
+            if (self._age > self.settle_frames
+                    and dist * (1.0 - self.alpha) < self.stop_k * self.noise_px):
+                self.moving = False
         return self.cursor.copy()
 
 

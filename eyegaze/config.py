@@ -95,31 +95,22 @@ class GazeConfig:
 
 @dataclass
 class StabilizerConfig:
-    # Estabilizador de fixação aplicado ao ponto na tela (cursor e dwell).
-    # Ver filters.FixationStabilizer.
+    # Estabilizador do cursor (filters.GazeFollower): salta nas sacadas e, na
+    # fixação, fica parado até o olhar se mover de verdade (histerese).
     saccade_ratio: float = 0.07   # salto mínimo (fração da largura da tela) p/ sacada
     confirm_frames: int = 2       # amostras seguidas fora da fixação p/ confirmar salto
-    window_frames: int = 30       # amostras guardadas da fixação atual (~1 s a 30 fps)
-    # Fração do caminho até o destino percorrida por quadro. 0,85 (era 0,6):
-    # chega mais rápido e se mexe menos na fixação (2,7% contra 3,8% dos
-    # quadros), sem mudar o tremor (metodologia, seção 4.1).
-    follow: float = 0.85
-    # Trava da fixação: depois de ``settle_frames`` quadros o cursor para e
-    # só volta a andar se ``shift_frames`` amostras seguidas ficarem fora do
-    # raio de trava = max(lock_ratio * largura, lock_k * passeio medido).
-    lock_ratio: float = 0.035     # ~67 px numa tela de 1920 px
-    # Passeio da estimativa com o olho parado: ~50 px de desvio (medido nos
-    # vídeos gravados). Com lock_k 2,5 e teto de 0,6 x limiar de sacada, o
-    # cursor "destravava" ~18 vezes por minuto seguindo esse passeio; com
-    # 3,5 e teto 0,9, ~6,5 vezes, sem mudar o atraso após sacadas.
-    lock_k: float = 3.5
-    lock_cap: float = 0.9         # raio de trava <= lock_cap x limiar de sacada
-    # Quadros seguidos fora da trava para seguir um movimento PEQUENO do
-    # olhar (menor que o limiar de sacada). 5 (~0,17 s; era 8): degraus de
-    # 60-100 px passam a ser seguidos em ~130 ms em vez de ~230 ms.
-    shift_frames: int = 5
-    settle_frames: int = 8
     noise_k: float = 3.0          # limiar de sacada = max(base, k * ruído medido)
+    median_frames: int = 7        # destino = mediana das últimas N amostras
+    # Histerese: parado, o cursor só anda quando o destino se afasta mais que
+    # start_k x ruído; desliza (alpha por quadro) até ficar a menos de
+    # stop_k x ruído e para. Escolhidos numa varredura com as validações
+    # gravadas (metodologia, seção 4.0): cursor parado em 86% dos quadros com
+    # o olho fixo, seguindo 58% dos movimentos sutis de 70 px.
+    start_k: float = 4.0
+    stop_k: float = 1.0
+    alpha: float = 0.4
+    noise_floor_px: float = 15.0
+    settle_frames: int = 8        # quadros de acomodação depois de uma sacada
 
 
 @dataclass
@@ -179,10 +170,25 @@ class CalibrationConfig:
     # Recentralização (R): desvios maiores que esta fração da tela (em cada
     # eixo) não são aplicados; a mensagem pede para recalibrar.
     recenter_max_frac: float = 0.25
+    # Critério de aceitação da calibração (como no Tobii e no EyeLink): com o
+    # erro em pontos novos (LOO) acima desta fração da largura da tela, o
+    # resultado recomenda refazer (ESPAÇO refaz na hora, sem salvar). Nas 35
+    # sessões com validação gravada, calibrações com LOO <= 90 px (4,7%)
+    # erraram 76 px na validação; acima disso, 123 px. Repetir só os pontos
+    # ruins não mudava a validação (108 -> 107 px), e juntar duas calibrações
+    # seguidas piorava (90 -> 108 px): refazer substitui a anterior.
+    redo_loo_frac: float = 0.047
     # Alvos da recentralização (frações da tela). O desvio é a MÉDIA dos
     # erros nesses alvos: com 1 ponto a correção piorava o erro nas
     # validações gravadas (138 -> 147 px); com 3, 96 px; com 5, 91 px.
     recenter_points: tuple = ((0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7))
+    # Etapa 2 da calibração (refinamento): depois da grade, estes alvos
+    # internos (frações da tela) e o ajuste usa TODOS os pontos juntos, como
+    # o "calibrar, validar e recalibrar" do EyeLink/Tobii. Nas 33 sessões com
+    # validação gravada, somar 4 alvos internos à grade reduziu o erro nos
+    # demais alvos de 105 para 85 px (−19%); com 8, para 86 px. Vazio = só
+    # a grade.
+    refine_points: tuple = ((0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7))
 
     # Etapa da cabeça (modo pesquisa; ``--pesquisa`` ou ``--gravar``): depois
     # dos alvos, o olhar fica no centro e a pessoa gira a cabeça seguindo as
@@ -219,12 +225,14 @@ class ValidationConfig:
     # o RETESTE, mais tarde: o primeiro ponto (centro) mede a deriva desde a
     # calibração e reancora.
     after_calibration: bool = False
-    # Alvos de validação (frações da tela), diferentes dos de calibração.
-    # O PRIMEIRO precisa ser o centro (ponto de reancoragem do reteste).
+    # Alvos de validação (frações da tela), diferentes dos de calibração
+    # (inclusive os da etapa 2, em 30/70%); visitados em ordem aleatória
+    # (procedures.ValidationProcedure). Até 16/11 os 4 diagonais ficavam em
+    # 30/70%; agora em 20/80%, mais perto das bordas.
     points: tuple = (
         (0.5, 0.5),
-        (0.3, 0.3), (0.7, 0.3),
-        (0.3, 0.7), (0.7, 0.7),
+        (0.2, 0.2), (0.8, 0.2),
+        (0.2, 0.8), (0.8, 0.8),
         (0.5, 0.2), (0.5, 0.8),
         (0.15, 0.5), (0.85, 0.5),
     )
@@ -244,6 +252,10 @@ class MouseConfig:
     # sumir por mais que isto, o filtro é reiniciado e o HUD mostra
     # "PAUSADO" (uma piscada ou um frame perdido não contam).
     face_lost_timeout_s: float = 0.5
+    # Liga o controle do mouse sozinho depois de uma calibração (ou da
+    # recentralização ao abrir o app): o uso não depende do teclado. A barra
+    # de controle pelo olhar pausa e religa.
+    enable_after_calibration: bool = True
 
 
 @dataclass
@@ -285,7 +297,20 @@ class FineConfig:
     gain_px_per_deg: float = 25.0   # o "físico" seria ~38 px/grau; menor = mais preciso
     deadzone_deg: float = 0.3       # balanço natural da cabeça não move o cursor
     max_px: float = 250.0           # ajuste máximo a partir do ponto do olhar
-    reset_deg: float = 6.0          # giro maior que isto = mudança de postura (zera)
+    # Giro maior que isto = mudança de postura (zera). Era 6°: a 25 px/grau,
+    # limitava o ajuste a ~140 px, menos que o erro do olhar (na sessão de
+    # 16/11, ajustes de até 183 px); 10° cobre o ajuste máximo (max_px).
+    reset_deg: float = 10.0
+    # No modo A, o olhar só "teleporta" o cursor: cursor = âncora + ajuste
+    # da cabeça, e a âncora só muda numa nova fixação a mais de
+    # ``warp_frac`` da largura da tela do CURSOR (a pessoa olhou para outro
+    # lugar). Mudanças menores da estimativa do olhar são ignoradas. Na
+    # sessão de 16/11 12:49, 96% do movimento do cursor no modo A vinha do
+    # ponto do olhar: mexer a cabeça com os olhos parados movia a estimativa
+    # ~28 px/grau na vertical e ~25 px/grau na HORIZONTAL ao inclinar a
+    # cabeça (por isso o cursor "andava para o lado"); e olhar para o
+    # cursor durante o ajuste (salto de 100-200 px) zerava o ajuste.
+    warp_frac: float = 0.2
 
 
 @dataclass
@@ -293,7 +318,25 @@ class DwellClickConfig:
     enabled_at_start: bool = False
     dwell_time_s: float = 1.0
     tolerance_px: int = 60
+    # No ajuste fino (tecla A), o clique só sai com o cursor PARADO: com 60 px
+    # de tolerância, os 24 cliques feitos com ajuste fino na sessão de 16/11
+    # saíram com o ajuste ainda em andamento.
+    fine_tolerance_px: int = 12
     cooldown_s: float = 1.0
+
+
+@dataclass
+class BarConfig:
+    # Barra de controle pelo olhar (gaze_bar.py): coluna de botões na borda
+    # ESQUERDA, centralizada na altura, durante o uso; liga/desliga o mouse,
+    # o clique, o modo de precisão, e recentraliza ou recalibra, sem teclado.
+    # Botões maiores que o erro típico do olhar (~70-120 px), colados na borda.
+    enabled: bool = True
+    dwell_s: float = 1.2           # olhar para um botão por este tempo o aciona
+    cooldown_s: float = 1.5
+    height_px: int = 100
+    width_px: int = 170
+    gap_px: int = 12
 
 
 @dataclass
@@ -323,4 +366,5 @@ class AppConfig:
     adapt: AdaptConfig = field(default_factory=AdaptConfig)
     dwell: DwellClickConfig = field(default_factory=DwellClickConfig)
     fine: FineConfig = field(default_factory=FineConfig)
+    bar: BarConfig = field(default_factory=BarConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)

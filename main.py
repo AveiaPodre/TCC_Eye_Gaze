@@ -17,6 +17,7 @@ import sys
 import time
 from pathlib import Path
 
+from eyegaze import system
 from eyegaze.app import EyeGazeApp
 from eyegaze.config import AppConfig
 from eyegaze.face_tracker import FaceTracker
@@ -184,7 +185,13 @@ def main(argv=None) -> int:
         print(f"[Gravação] Gravando em {recorder.video_path}")
 
     tracker = FaceTracker(cfg.tracker)
-    EyeGazeApp(cfg, tracker, source, screen_size, recorder=recorder).run()
+    # O Windows desacelera processos em segundo plano (o clique cai em outra
+    # janela): sem isto, o app caía de ~31 para 13-16 quadros por segundo.
+    system.prepare_process()
+    try:
+        EyeGazeApp(cfg, tracker, source, screen_size, recorder=recorder).run()
+    finally:
+        system.restore_process()
     return 0
 
 

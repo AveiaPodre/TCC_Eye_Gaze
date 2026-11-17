@@ -11,12 +11,13 @@ geometricamente, em cinco etapas:
 4. cada feixe é projetado num monitor virtual (o plano da tela, com a
    geometria suposta), e o ponto do olhar é a média dos dois pontos,
    ponderada pela qualidade de cada olho;
-5. a calibração com vários pontos (grade 3×4, ~30 s) ajusta o globo de cada
+5. a calibração em duas etapas (grade 3×4 e mais 4 pontos internos, ~35 s) ajusta o globo de cada
    olho e a correção entre o monitor virtual e o monitor real.
 
 Como a rotação e a posição da cabeça entram pela geometria, a pessoa pode
-girar ou deslocar a cabeça sem perder toda a pontaria. Um estabilizador de
-fixação mantém o cursor parado enquanto o olhar está parado.
+girar ou deslocar a cabeça sem perder toda a pontaria. Um estabilizador
+salta com o olhar nas sacadas e, dentro de uma fixação, mantém o cursor
+parado até o olho de fato se mover; aí desliza até o novo ponto.
 
 A geometria do olho parte do projeto *Webcam3DTracker* (esfera do olho +
 vetor centro→íris), reescrita para a API atual do MediaPipe. O
@@ -62,8 +63,10 @@ Fluxo recomendado:
 
 1. Sente-se como vai usar o computador, com o rosto bem iluminado e de frente
    para a câmera.
-2. Pressione **ESPAÇO** e olhe para cada um dos 12 alvos, que aparecem em
-   ordem aleatória. O círculo laranja encolhe enquanto o olho chega ao alvo.
+2. Pressione **ESPAÇO** e olhe para cada um dos 16 alvos: primeiro os 12
+   da grade, em ordem aleatória, e depois a **etapa 2** (refinamento), com
+   4 alvos internos. O modelo é ajustado com todos juntos (nas sessões
+   gravadas, a etapa 2 reduziu o erro em ~19%). O círculo laranja encolhe enquanto o olho chega ao alvo.
    A coleta (ponto verde com anel de progresso) só começa quando o olhar
    estabiliza no alvo. Na **calibração manual** (tecla **C**, útil quando um
    operador conduz a calibração), cada alvo só avança quando a pessoa,
@@ -76,29 +79,62 @@ Fluxo recomendado:
 4. A tela de resultado mostra o erro em cada alvo, o erro estimado em pontos
    novos (validação cruzada), quanto desse erro sobra só com o monitor
    virtual (sem a correção da etapa 5) e uma classificação da qualidade
-   (boa / razoável / ruim).
-5. **Modo pesquisa** (`--pesquisa` ou `--gravar`): depois dos alvos vem a
-   **etapa da cabeça (~10 s)**: um ponto verde fica no centro e, sem tirar os
-   olhos dele, a pessoa gira a cabeça na direção da seta (direita, esquerda,
-   cima, baixo) até a seta ficar **verde** (~10° para os lados, ~8° para
-   cima e para baixo). Essas amostras **não** entram no ajuste: medem o
-   erro com a cabeça em poses novas. Em seguida vem a **validação imediata**
-   (9 alvos novos), que mede o erro do modelo, em px e em graus, por região
-   da tela.
+   (boa / razoável / ruim). Se o erro em pontos novos passar de ~90 px
+   (4,7% da largura), a tela **recomenda refazer**: **ESPAÇO** refaz na
+   hora, sem salvar; outra tecla aceita assim. Nas sessões gravadas,
+   calibrações acima desse limite erraram ~60% mais no uso.
+5. **Modo pesquisa** (`--pesquisa` ou `--gravar`): depois da calibração vem
+   a **validação imediata** (9 alvos novos, em ordem aleatória), que mede o
+   erro do modelo, em px e em graus, por região da tela. Depois dela, o
+   **teste da cabeça (~10 s)**: um ponto verde fica no centro e, sem tirar
+   os olhos dele, a pessoa gira a cabeça na direção da seta (direita,
+   esquerda, cima, baixo) até a seta ficar **verde** (~10° para os lados,
+   ~8° para cima e para baixo). Essas amostras **não** entram no ajuste:
+   medem o erro com a cabeça em poses novas (`results/cabeca_*.npz`). O
+   teste vem por último porque os giros deixam um efeito passageiro que
+   contaminava a validação (`docs/metodologia.md`, seção 5.11). A tecla
+   **K** roda o teste da cabeça a qualquer momento.
 6. Mais tarde, a tecla **T** faz o **reteste**: mede o erro em 9 alvos e
    corrige no cursor o desvio médio entre eles. Os resultados vão para
    `results/`. Ao abrir o app com uma calibração salva, uma recentralização
    de 4 pontos roda sozinha antes do uso.
-7. Pressione **M** para ligar o mouse e **D** para ligar o clique por
-   permanência (*dwell-click*).
+7. **Uso sem teclado.** Depois da calibração, o controle do mouse liga
+   sozinho e aparece na borda esquerda da tela a **barra de controle pelo
+   olhar** (uma coluna de botões no meio da altura):
+   olhar ~1,2 s para um botão o aciona (o botão enche enquanto isso).
+
+   | Botão | Ação |
+   |---|---|
+   | **Mouse** | pausa / religa o controle do cursor (a barra continua funcionando com o mouse pausado) |
+   | **Clique** | liga / desliga o clique por permanência (olhar parado por 1 s clica) |
+   | **Precisão** | liga / desliga o modo de precisão: o olhar leva o cursor à região e pequenos giros da cabeça o ajustam |
+   | **Recentralizar** | corrige o desvio constante com 4 pontos (~9 s) |
+   | **Recalibrar** | refaz a calibração |
+
+   Olhar para a barra nunca gera clique do sistema. Os botões ficam colados
+   na borda esquerda, longe dos menus (no topo) e da barra de tarefas
+   (embaixo): mesmo que o olhar estimado "passe" da borda, ele ainda cai no
+   botão. A barra não rouba o foco do teclado.
 8. Se o HUD mostrar **"Postura fora da calibração"** (a pessoa se mexeu ou
    girou a cabeça além do que foi calibrado) ou o cursor ficar
-   sistematicamente deslocado, pressione **R** e olhe para os 4 pontos
-   (recentralização, ~9 s). Com um ponto só a correção piorava o erro; com
-   4, ele cai ~30% (`docs/metodologia.md`, seção 7).
-9. Com o **ajuste fino pela cabeça** (tecla **A**) e o dwell-click ligados,
-   cada clique feito depois de corrigir o cursor com a cabeça ensina o
-   desvio do olhar ao modelo (correção contínua, salva ao sair).
+   sistematicamente deslocado, use **Recentralizar** (ou a tecla **R**) e
+   olhe para os 4 pontos. Com um ponto só a correção piorava o erro; com 4,
+   ele cai ~30% (`docs/metodologia.md`, seção 7).
+9. No modo de precisão com o clique ligado, cada clique feito depois de
+   corrigir o cursor com a cabeça ensina o desvio do olhar ao modelo
+   (correção contínua, salva ao sair).
+
+O teclado fica para o operador: calibração manual (C), modo pesquisa,
+reteste (T), teste da cabeça (K) e as visualizações. As teclas M, D e A
+fazem o mesmo que os botões da barra.
+
+### Desempenho
+
+Ao iniciar, o app pede ao Windows para não desacelerá-lo em segundo plano
+(prioridade acima do normal, sem a redução de desempenho de processos em
+segundo plano e com o temporizador de 1 ms). Sem isso, quando o clique por
+permanência clicava em outra janela, o app passava para segundo plano e
+caía de ~31 para 13-16 quadros por segundo, e o olhar estimado piorava.
 
 ### Câmera
 
@@ -112,7 +148,10 @@ dshow` ou `--backend msmf` trocam o backend de captura no Windows.
 
 Os landmarks do MediaPipe são calculados num recorte do rosto de tamanho
 fixo, então a resolução da câmera quase não muda a precisão deles; ela vale
-para o refinamento da íris na imagem (`iris_refine.py`).
+para o refinamento da íris na imagem (`iris_refine.py`). Confira a linha
+`[Câmera]` no terminal: se a câmera não suportar a resolução pedida, ela
+entrega a máxima dela (a webcam do notebook de testes só vai até 1280×720,
+em todos os backends).
 
 
 ### Coletando dados para melhorar o modelo
@@ -152,9 +191,10 @@ da câmera (`--camera-fov`) ou a versão das medidas mudar.
 | `C` | calibrar, manual: cada alvo avança com ESPAÇO/ENTER enquanto a pessoa olha para ele |
 | `T` | reteste: mede o erro em 9 alvos novos, corrige o desvio médio no cursor e salva CSV/JSON em `results/` |
 | `R` | recentralizar (corrige o desvio constante com 4 pontos) |
-| `M` | liga/desliga o controle do mouse (exige calibração) |
-| `D` | liga/desliga o dwell-click |
-| `A` | liga/desliga o **ajuste fino pela cabeça**: o olhar leva o cursor à região e, enquanto você continua olhando, pequenos giros da cabeça (direita/esquerda/cima/baixo) movem o cursor a partir dali com precisão de poucos pixels. Um novo salto do olhar zera o ajuste. Parâmetros em `FineConfig` |
+| `K` | teste da cabeça: erro com a cabeça em poses novas, olhando o centro (no modo pesquisa, roda sozinho depois da validação imediata) |
+| `M` | liga/desliga o controle do mouse (exige calibração; liga sozinho depois de calibrar). Também pela barra |
+| `D` | liga/desliga o dwell-click. Também pela barra |
+| `A` | liga/desliga o **ajuste fino pela cabeça**: o olhar leva o cursor à região e, enquanto você continua olhando, pequenos giros da cabeça (direita/esquerda/cima/baixo) movem o cursor a partir dali com precisão de poucos pixels. No modo A o olhar só "teleporta" o cursor quando você olha para longe dele (> 20% da tela); fora disso, só a cabeça move o cursor (olhar para o cursor ou mexer a cabeça com os olhos parados não o faz pular). Depois de um clique, o cursor fica onde clicou. No modo A, o dwell-click espera o cursor parar. Parâmetros em `FineConfig` |
 | `L` | liga/desliga a visualização dos **landmarks** (malha, contorno dos olhos, íris, cantos) |
 | `G` | liga/desliga a visualização do **olhar**: para cada olho, o globo (0,4 × largura do olho), a pupila medida (verde), a pupila corrigida pelo ganho da calibração (anel laranja) e o feixe; vetor do olhar, ângulos e peso de cada olho |
 | `P` | liga/desliga os **eixos da cabeça** e os ângulos de pose |
@@ -176,6 +216,7 @@ valores iniciais de cada visualização ficam em `DisplayConfig`
   0,5 s sem rosto o HUD mostra "PAUSADO" e os filtros são reiniciados.
 - Durante piscadas (os dois olhos fechados) o cursor mantém a última posição.
 - Com `--reproduzir`, o mouse nunca é movido.
+- Olhar para a barra de controle nunca gera clique do sistema.
 
 ## Como funciona (resumo)
 
@@ -189,7 +230,7 @@ webcam -> 1. FaceLandmarker (478 landmarks + matriz de pose)
               média dos dois pontos, ponderada pelo erro de cada olho -> pixel virtual
        -> 5. correção monitor virtual -> real (calibração) -> pixel real
        -> aviso de postura fora da calibração (R recentraliza)
-       -> estabilizador de fixação (cursor parado na fixação, salta na sacada)
+       -> estabilizador (salta na sacada; na fixação, parado até o olhar se mover)
        -> mouse + dwell-click
 ```
 
@@ -213,12 +254,15 @@ eyegaze/
   gaze.py                  # etapas 1-2: âncora e pupila de cada olho em cm, piscadas
   eyeball.py               # etapas 2-4: centro do globo, feixes, ponto de cada olho, ajuste
   geometry.py              # câmera pinhole, intersecção de retas, monitor virtual (etapa 4)
-  filters.py               # One-Euro Filter e estabilizador de fixação com trava
+  filters.py               # One-Euro, estabilizador do cursor (GazeFollower), ajuste fino
   calibration.py           # etapa 5: ajuste do globo + correção monitor virtual -> real
   procedures.py            # calibração (com etapa da cabeça), validação e recentralização
   visualization.py         # landmarks, olhar, pose, minimapa, HUD, ajuda
   scene3d.py               # vista 3D: globos, feixes, intersecção, monitor virtual, cursor
   io_devices.py            # câmera/vídeo, gravação/reprodução de sessões, tela, mouse, dwell-click
+  control.py               # uso do cursor: mouse, clique, modo de precisão, correção contínua, barra
+  gaze_bar.py              # barra de controle pelo olhar (coluna de botões na borda esquerda)
+  system.py                # ajustes do Windows para não perder quadros em segundo plano
   app.py                   # loop principal e teclas
 tests/
   synthetic.py             # rosto 3D sintético (testes sem câmera)
@@ -268,10 +312,10 @@ pose e olhar conhecidos e conferem:
 
 | Sintoma | Ajuste |
 |---|---|
-| Cursor anda sozinho com o olhar parado | aumentar `StabilizerConfig.lock_ratio` (ex.: 0.05) ou `shift_frames` (ex.: 12) |
-| Cursor não acompanha pequenos deslocamentos do olhar | diminuir `StabilizerConfig.lock_ratio` (ex.: 0.025) ou `shift_frames` (ex.: 5) |
+| Cursor anda sozinho com o olhar parado | aumentar `StabilizerConfig.start_k` (ex.: 5) ou `median_frames` (ex.: 9) |
+| Cursor não acompanha pequenos deslocamentos do olhar | diminuir `StabilizerConfig.start_k` (ex.: 3) ou aumentar `alpha` |
 | Cursor salta sozinho | aumentar `StabilizerConfig.saccade_ratio` (ex.: 0.10) ou `confirm_frames` (ex.: 4) |
-| Cursor demora a chegar após olhar para outro lugar | diminuir `confirm_frames` (mín. 2) ou aumentar `follow` |
+| Cursor demora a chegar após olhar para outro lugar | diminuir `confirm_frames` (mín. 2) ou aumentar `alpha` |
 | Cursor desloca ao inclinar a cabeça / desvio vertical constante | recentralize (R); confira se a largura da tela foi detectada (linha `[Tela]` no terminal); se não, informe `--screen-width-cm` |
 | Cursor desloca quando gira a cabeça | refazer a calibração caprichando na etapa da cabeça (ver o erro com a cabeça em movimento na tela de resultado) |
 | Cliques acidentais | aumentar `DwellClickConfig.dwell_time_s` ou diminuir `tolerance_px` |

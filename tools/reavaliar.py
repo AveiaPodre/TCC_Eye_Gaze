@@ -98,7 +98,8 @@ def load(path: Path, cache: bool = True) -> CalibrationData | None:
     if cache and cached.exists():
         return CalibrationData.load(cached)
     data = CalibrationData.load(path)
-    if not data.has_landmarks:
+    head_only = not data.grid and bool(data.head_obs)   # cabeca_*.npz
+    if not (data.has_landmarks or head_only):
         return None if data.stale else data
     out = recompute(data)
     if cache:

@@ -146,8 +146,10 @@ def draw_status(img, lines: list[tuple[str, tuple[int, int, int]]]):
 HELP_LINES = [
     "ESPACO  calibrar (automatica)",
     "C  calibrar (manual: olhe + ESPACO)",
-    "T  validar (mede erro)",
-    "R  recentralizar (1 ponto)",
+    "T  reteste (mede e corrige desvio)",
+    "R  recentralizar (4 pontos)",
+    "K  teste da cabeca",
+    "Barra no topo: controle pelo olhar",
     "M  liga/desliga mouse",
     "D  liga/desliga dwell-click",
     "A  ajuste fino pela cabeca",

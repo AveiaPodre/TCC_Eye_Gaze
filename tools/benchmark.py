@@ -70,24 +70,40 @@ def _stamp(path: Path) -> datetime | None:
     return datetime.strptime(m.group(1), "%Y%m%d_%H%M%S") if m else None
 
 
+def _after(path: Path, candidates: list[Path], next_calib: Path | None) -> Path | None:
+    """Primeiro arquivo de ``candidates`` gravado depois de ``path`` (até 30
+    min) e antes da próxima calibração."""
+    t0 = _stamp(path)
+    t1 = _stamp(next_calib) if next_calib is not None else None
+    for c in candidates:
+        tc = _stamp(c)
+        if (t0 and tc and tc > t0 and (tc - t0).total_seconds() < PAIR_WINDOW_S
+                and (t1 is None or tc < t1)):
+            return c
+    return None
+
+
 def load_sessions(results: Path) -> list[Session]:
+    """Calibrações gravadas, cada uma com a validação e o teste da cabeça que
+    vieram depois dela (se houver). Até 15/11 o teste da cabeça estava dentro
+    da calibração; desde 16/11 é gravado à parte (cabeca_*.npz)."""
     calibs = sorted(results.glob("calibracao_*.npz"))
     valids = sorted(results.glob("validacao_*.npz"))
+    heads = sorted(results.glob("cabeca_*.npz"))
     sessions = []
     for i, cp in enumerate(calibs):
-        t0 = _stamp(cp)
-        t1 = _stamp(calibs[i + 1]) if i + 1 < len(calibs) else None
-        vp = None
-        for v in valids:
-            tv = _stamp(v)
-            if (t0 and tv and tv > t0 and (tv - t0).total_seconds() < PAIR_WINDOW_S
-                    and (t1 is None or tv < t1)):
-                vp = v
-                break
+        nxt = calibs[i + 1] if i + 1 < len(calibs) else None
+        vp = _after(cp, valids, nxt)
         c = load(cp)
         if c is None:
             print(f"  {cp.name}: sem landmarks (sessão antiga), ignorada")
             continue
+        hp = _after(cp, heads, nxt) if c.head_raw is None else None
+        if hp is not None:
+            h = load(hp)
+            if h is not None and h.head_raw is not None:
+                c.head_target, c.head_features = h.head_target, h.head_features
+                c.head_raw, c.head_obs = h.head_raw, h.head_obs
         sessions.append(Session(cp.stem.replace("calibracao_", ""), c,
                                 load(vp) if vp else None))
     return sessions

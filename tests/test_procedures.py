@@ -13,6 +13,18 @@ from eyegaze.procedures import (CalibrationProcedure, TargetProcedure, head_prog
                                 quality_label)
 
 from test_app import FakeTracker, make_app, run_procedure, settle
+
+def run_head_test(app, max_steps=4000):
+    """Calibra (modo pesquisa, sem validação imediata) e roda o teste da
+    cabeça, que começa sozinho ao fechar o resultado da calibração."""
+    from eyegaze.procedures import HeadStageProcedure
+    app.cfg.calibration.head_stage = True
+    app.handle_key(ord(" "))
+    run_procedure(app)
+    app.handle_key(13)
+    assert isinstance(app.procedure, HeadStageProcedure)
+    return run_procedure(app, max_steps=max_steps)
+
 from test_pipeline import SimUser
 
 
@@ -36,14 +48,18 @@ def test_targets_visited_in_random_order_and_all_collected(tmp_path):
     app.handle_key(ord(" "))
     proc = app.procedure
     n = app.cfg.calibration.grid_cols * app.cfg.calibration.grid_rows
-    assert sorted(proc.order) == list(range(n)) and n == 12
-    assert proc.order != list(range(n))            # não é linha a linha
+    k = len(app.cfg.calibration.refine_points)
+    assert n == 12 and k == 4
+    # Etapa 1: a grade em ordem aleatória; etapa 2: os 4 alvos internos.
+    assert sorted(proc.order[:n]) == list(range(n)) and proc.order[:n] != list(range(n))
+    assert sorted(proc.order[n:]) == list(range(n, n + k))
+    assert all(0.25 * 1920 < proc.targets[i][0] < 0.75 * 1920 for i in proc.order[n:])
     visited = []
     for _ in range(4000):
         app.step()
         if proc.collecting_done:
             break
-        if not proc.in_head_stage and (not visited or visited[-1] != proc.index):
+        if not visited or visited[-1] != proc.index:
             visited.append(proc.index)
     assert visited == proc.order
     assert all(len(s) >= proc.min_samples for s in proc.samples)
@@ -103,12 +119,10 @@ class StillHeadTracker(FakeTracker):
 
 def test_head_stage_finishes_for_user_who_cannot_move_head(tmp_path):
     app, _, _ = make_app(tmp_path)
-    app.cfg.calibration.head_stage = True
     tracker = StillHeadTracker()
     tracker.app = app
     app.tracker = tracker
-    app.handle_key(ord(" "))
-    proc = run_procedure(app, max_steps=6000)
+    proc = run_head_test(app, max_steps=6000)
     assert proc.collecting_done and proc.succeeded
     cfg = app.cfg.calibration
     expected = cfg.head_motion_settle_s + 4 * cfg.head_step_timeout_s + cfg.head_center_s
@@ -133,12 +147,10 @@ class OverTurnTracker(FakeTracker):
 
 def test_head_samples_beyond_range_are_not_used(tmp_path):
     app, _, _ = make_app(tmp_path)
-    app.cfg.calibration.head_stage = True
     tracker = OverTurnTracker()
     tracker.app = app
     app.tracker = tracker
-    app.handle_key(ord(" "))
-    proc = run_procedure(app)
+    proc = run_head_test(app)
     st = proc.stats
     assert st["n_cabeca_usadas"] < st["n_cabeca_total"]
     # A seta fica verde a 80% do alvo e a etapa avança: a pessoa passa pela
@@ -149,10 +161,14 @@ def test_head_samples_beyond_range_are_not_used(tmp_path):
 
 
 def test_head_arrow_renders_all_states(tmp_path):
+    from eyegaze.procedures import HeadStageProcedure
     app, tracker, _ = make_app(tmp_path)
-    app.cfg.calibration.head_stage = True
     app.handle_key(ord(" "))
+    run_procedure(app)
+    app.handle_key(13)
+    app.handle_key(ord("k"))                 # teste da cabeça pela tecla K
     proc = app.procedure
+    assert isinstance(proc, HeadStageProcedure)
     seen = set()
     for _ in range(4000):
         app.step()
@@ -174,7 +190,7 @@ class DistractedTracker(FakeTracker):
 
     def process(self, frame, ts):
         proc = self.app.procedure
-        if (isinstance(proc, CalibrationProcedure) and not proc.in_head_stage
+        if (isinstance(proc, CalibrationProcedure)
                 and not proc.collecting_done and not proc.retried_targets
                 and proc.index == self.bad_index):
             tx, ty = proc.current_target()
@@ -242,6 +258,25 @@ def test_posture_deviation(tmp_path):
     from eyegaze.calibration import CalibrationModel
     loaded = CalibrationModel.load(tmp_path / "c.json", (1920, 1080))
     assert np.allclose(loaded.posture_deviation(r_far)["ang"], far["ang"])
+
+
+def test_poor_calibration_offers_redo_on_space(tmp_path):
+    """Critério de aceitação: com o erro em pontos novos acima do limite, a
+    tela de resultado recomenda refazer; ESPAÇO refaz sem salvar a ruim, e
+    outra tecla aceita assim."""
+    app, _, _ = make_app(tmp_path)
+    app.handle_key(ord(" "))
+    proc = run_procedure(app)
+    assert proc.succeeded and not proc.redo_recommended      # usuário simulado: boa
+    proc.stats["erro_loo_medio_px"] = 0.06 * 1920              # finge uma calibração ruim
+    assert proc.redo_recommended
+    app.handle_key(32)                                         # ESPAÇO: refaz
+    assert isinstance(app.procedure, CalibrationProcedure) and app.procedure is not proc
+    assert not app.calibrated and not app.cfg.calibration.save_path.exists()
+    proc2 = run_procedure(app)
+    proc2.stats["erro_loo_medio_px"] = 0.06 * 1920
+    app.handle_key(13)                                         # outra tecla: aceita
+    assert app.calibrated and app.cfg.calibration.save_path.exists()
 
 
 def test_quality_label():
@@ -324,8 +359,9 @@ def test_known_target_correction_reduces_drift(tmp_path):
         step = app.confirm_target(key)
         assert step is not None and np.linalg.norm(step) <= app.cfg.adapt.max_step_px + 1e-6
     assert shift[0] > 80                              # a deriva apareceu (~117 px)
-    # A correção leva o erro TOTAL (deriva + erro de base) para perto de zero.
-    assert np.mean(errs[-3:]) < 0.3 * errs[0]
+    # A correção leva o erro TOTAL (deriva + erro de base) para perto de zero,
+    # até o piso do ruído da medida de ~0,5 s (~30 px neste usuário sintético).
+    assert np.mean(errs[-3:]) < 0.45 * errs[0]
     assert np.mean(errs[-3:]) <= float(np.hypot(*base)) + 15
 
 

@@ -117,6 +117,7 @@ class FakeMouse:
 def make_app(tmp_path):
     cfg = AppConfig()
     cfg.calibration.save_path = tmp_path / "cal.json"
+    cfg.mouse.enable_after_calibration = False   # testes específicos ligam
     cfg.validation.results_dir = tmp_path / "results"
     cfg.calibration.results_dir = tmp_path / "results"
     cfg.calibration.random_seed = 0   # ordem dos alvos reproduzível nos testes
@@ -160,12 +161,15 @@ def err(app, target):
     return float(np.hypot(*(app.screen_point - np.array(target))))
 
 
-def cursor_jitter(app, n=30):
-    pts = []
+def cursor_stillness(app, n=30):
+    """(trocas de fixação, movimento mediano por quadro em px) numa janela de
+    ``n`` quadros com o olhar parado."""
+    fid0, pts = app.stabilizer.fixation_id, []
     for _ in range(n):
         app.step()
         pts.append(app.screen_point.copy())
-    return float(np.mean(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+    moves = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    return app.stabilizer.fixation_id - fid0, float(np.median(moves))
 
 
 def test_end_to_end(tmp_path):
@@ -178,19 +182,26 @@ def test_end_to_end(tmp_path):
     app.handle_key(ord("m"))
     assert not mouse.enabled
 
-    # --- calibração (12 pontos + etapa da cabeça do modo pesquisa) -----
+    # --- calibração (12 pontos) + teste da cabeça do modo pesquisa ------
     app.cfg.calibration.head_stage = True
     app.handle_key(ord(" "))
-    proc = run_procedure(app, out_dir=out_dir, snap_head=True)
+    proc = run_procedure(app)
     assert proc.collecting_done and proc.succeeded
-    assert len(proc.results) == 12
-    assert len(proc.head_samples) > 60
-    assert proc.stats["erro_cabeca_px"] > 0
+    assert len(proc.results) == 16           # 12 da grade + 4 da etapa 2
     assert max(r.error_px for r in proc.results) < 70
     if out_dir:
         cv2.imwrite(os.path.join(out_dir, "calibracao_resultado.png"), app.last_target_view)
     app.handle_key(13)  # qualquer tecla fecha a tela de resultado
-    assert app.procedure is None and app.calibrated
+    assert app.calibrated
+    from eyegaze.procedures import HeadStageProcedure
+    assert isinstance(app.procedure, HeadStageProcedure)   # vem depois da calibração
+    proc = run_procedure(app, out_dir=out_dir, snap_head=True)
+    assert len(proc.head_samples) > 60
+    assert proc.stats["erro_cabeca_px"] > 0
+    assert app.model.info["erro_cabeca_px"] == proc.stats["erro_cabeca_px"]
+    assert proc.raw_path.exists()
+    app.handle_key(13)
+    assert app.procedure is None
     assert app.cfg.calibration.save_path.exists()
 
     # --- cursor estável e certo, inclusive com a cabeça girada --------
@@ -204,9 +215,10 @@ def test_end_to_end(tmp_path):
             # (compressão vertical da íris x forma tangente do modelo do olho;
             # ver test_pipeline.test_head_rotation_and_translation_are_compensated).
             assert err(app, target) < 160, (target, head, err(app, target))
-            # Até uma troca de fixação na janela: o estabilizador segue um
-            # deslocamento sustentado em 5 quadros (StabilizerConfig.shift_frames).
-            assert cursor_jitter(app) < 5.0, (target, head)
+            # Olhar parado: no máximo uma "sacada" falsa na janela e, no resto,
+            # o cursor quase parado (desliza devagar com o passeio da estimativa).
+            changes, median_move = cursor_stillness(app)
+            assert changes <= 1 and median_move < 1.0, (target, head, changes, median_move)
     # ... e com a cabeça deslocada (translação).
     tracker.head = (0, 0, 0)
     for pos in [(5.0, 10.0, 60.0), (0.0, 13.0, 52.0)]:
@@ -307,7 +319,8 @@ def test_calibration_without_head_stage(tmp_path):
     app.handle_key(ord(" "))
     proc = run_procedure(app)
     assert proc.succeeded and "erro_cabeca_px" not in proc.stats
-    assert proc.head_samples == []
+    app.handle_key(13)
+    assert app.procedure is None             # sem teste da cabeça no modo usuário
     app.handle_key(13)
     tracker.look_at = (700, 400)
     settle(app)
@@ -387,6 +400,150 @@ def test_head_fine_adjustment_moves_cursor_from_gaze_point(tmp_path):
     assert not app.fine_enabled
 
 
+def test_fine_adjustment_survives_looking_at_the_cursor(tmp_path):
+    """Ajustando com a cabeça, a pessoa olha para o CURSOR (um salto pequeno do
+    olhar): o ponto do olhar fica congelado, o cursor não pula e o ajuste é
+    mantido. Um salto grande (> 25% da tela) devolve o controle ao olhar."""
+    app, tracker, _ = make_app(tmp_path)
+    app.handle_key(ord(" "))
+    run_procedure(app)
+    app.handle_key(13)
+    app.handle_key(ord("a"))
+    tracker.look_at, tracker.head = (900, 500), (0, 0, 0)
+    settle(app, 60)
+    tracker.head = (3.0, 0, 0)               # ajuste de ~65 px para a direita
+    settle(app, 30)
+    adj, cur = app.fine.offset.copy(), app.screen_point.copy()
+    assert np.linalg.norm(adj) > 40 and app._fine_anchor is not None
+    tracker.look_at = (1050, 520)            # olha para o cursor (salto de ~150 px)
+    settle(app, 30)
+    assert np.linalg.norm(app.screen_point - cur) < 15, (cur, app.screen_point)
+    assert np.linalg.norm(app.fine.offset - adj) < 15
+    tracker.look_at = (300, 900)             # vai para outro lugar
+    settle(app, 45)
+    assert err(app, (300, 900)) < 100
+    assert app._fine_anchor is None or np.linalg.norm(app._fine_anchor - cur) > 300
+
+
+def test_fine_mode_cursor_follows_only_the_head(tmp_path):
+    """Modo A com os olhos parados: mexer a cabeça (inclusive inclinar) move o
+    cursor SÓ pelo ajuste da cabeça; a âncora do olhar não muda."""
+    app, tracker, _ = make_app(tmp_path)
+    app.handle_key(ord(" "))
+    run_procedure(app)
+    app.handle_key(13)
+    app.handle_key(ord("a"))
+    tracker.look_at, tracker.head = (900, 500), (0, 0, 0)
+    settle(app, 60)
+    anchor = app._fine_anchor.copy()
+    path = [(4.0 * np.sin(k / 15), -3.0 * np.sin(k / 23), 0.0) for k in range(120)]
+    offsets = []
+    for head in path:
+        tracker.head = head
+        app.step()
+        assert np.allclose(app._fine_anchor, anchor)
+        expected = np.clip(anchor + app.fine.offset, 0, np.array(SCREEN) - 1)
+        assert np.linalg.norm(app.screen_point - expected) < 1e-6
+        offsets.append(np.abs(app.fine.offset).max())
+    assert max(offsets) > 50                 # a cabeça de fato moveu o cursor (~90 px)
+
+
+def test_mouse_turns_on_after_calibration(tmp_path):
+    """Uso sem teclado: depois da calibração o mouse liga sozinho."""
+    app, _, mouse = make_app(tmp_path)
+    app.cfg.mouse.enable_after_calibration = True
+    app.handle_key(ord(" "))
+    run_procedure(app)
+    assert not mouse.enabled
+    app.handle_key(13)
+    assert app.calibrated and mouse.enabled
+
+
+def _look_at_button(app, tracker, key, max_steps=150):
+    """Olha para o centro de um botão da barra até ele ser acionado."""
+    bar = app.control.bar
+    b = next(b for b in bar.buttons if b.key == key)
+    tracker.look_at = ((b.rect[0] + b.rect[2]) / 2, (b.rect[1] + b.rect[3]) / 2)
+    fired = []
+    update = bar.update
+    bar.update = lambda p, now: fired.append(update(p, now)) or fired[-1]
+    try:
+        for _ in range(max_steps):
+            app.step()
+            if key in fired:
+                return
+    finally:
+        bar.update = update
+    raise AssertionError(f"botão {key} não foi acionado")
+
+
+def test_gaze_bar_toggles_functions_without_keyboard(tmp_path):
+    """Barra de controle pelo olhar: olhar ~1,2 s para um botão o aciona
+    (clique, precisão, mouse, recentralizar), e olhar para a barra nunca
+    gera clique do sistema."""
+    from eyegaze.procedures import RecenterProcedure
+    app, tracker, mouse = make_app(tmp_path)
+    app.cfg.mouse.enable_after_calibration = True
+    app.handle_key(ord(" "))
+    run_procedure(app)
+    app.handle_key(13)
+    assert mouse.enabled and not app.dwell_enabled
+    _look_at_button(app, tracker, "clique")
+    assert app.dwell_enabled and mouse.clicks == 0
+    tracker.look_at = (900.0, 600.0)             # longe da barra: o clique funciona
+    for _ in range(90):
+        app.step()
+        if mouse.clicks:
+            break
+    assert mouse.clicks >= 1
+    clicks = mouse.clicks
+    _look_at_button(app, tracker, "precisao")
+    assert app.fine_enabled and mouse.clicks == clicks
+    _look_at_button(app, tracker, "precisao")
+    assert not app.fine_enabled
+    _look_at_button(app, tracker, "mouse")
+    assert not mouse.enabled                     # pausado...
+    _look_at_button(app, tracker, "mouse")
+    assert mouse.enabled                         # ...e religado só com o olhar
+    _look_at_button(app, tracker, "recentralizar")
+    assert isinstance(app.procedure, RecenterProcedure)
+    assert mouse.clicks == clicks                # a barra nunca clicou
+
+
+def test_gaze_bar_is_a_column_on_the_left_edge():
+    from eyegaze.gaze_bar import GazeBar
+    bar = GazeBar((1920, 1080), ("a", "b", "c"), dwell_s=1.0)
+    assert all(b.rect[0] == 0 for b in bar.buttons)            # colada na borda esquerda
+    ys = [(b.rect[1] + b.rect[3]) / 2 for b in bar.buttons]
+    assert ys == sorted(ys) and abs(np.mean(ys) - 540) < 2     # empilhada, no meio da altura
+    b = bar.buttons[0]
+    cy = (b.rect[1] + b.rect[3]) / 2
+    assert bar.button_at((-40.0, cy)).key == "a"     # erro "para fora" da tela ainda conta
+    assert bar.button_at((b.rect[2] + 5, cy)) is None
+    assert bar.update((10, cy), 0.0) is None and bar.update((10, cy), 1.01) == "a"
+    assert bar.update((10, cy), 1.5) is None         # intervalo depois de acionar
+
+
+def test_dwell_waits_for_the_fine_adjustment_to_stop(tmp_path):
+    """No modo A, o clique por permanência só sai com o cursor parado: girar a
+    cabeça devagar (ajuste em andamento) não clica."""
+    app, tracker, mouse = make_app(tmp_path)
+    app.handle_key(ord(" "))
+    run_procedure(app)
+    app.handle_key(13)
+    app.handle_key(ord("m"))
+    app.handle_key(ord("a"))
+    tracker.look_at, tracker.head = (900, 500), (0, 0, 0)
+    settle(app, 60)
+    app.handle_key(ord("d"))
+    for k in range(60):                      # 2 s girando a cabeça devagar (0 -> 4°)
+        tracker.head = (4.0 * (k + 1) / 60, 0, 0)
+        app.step()
+    assert mouse.clicks == 0
+    settle(app, 45)                          # parou: o clique sai em ~1 s
+    assert mouse.clicks >= 1
+
+
 def test_immediate_validation_then_retest_recenters(tmp_path):
     """Modo pesquisa: calibrar dispara a validação imediata; o reteste (T) mede
     o desvio médio dos alvos e o corrige no cursor."""
@@ -399,7 +556,7 @@ def test_immediate_validation_then_retest_recenters(tmp_path):
     assert isinstance(app.procedure, ValidationProcedure) and app.procedure.kind == "imediata"
     proc = run_procedure(app)
     s = proc.summary
-    assert s["tipo"] == "imediata" and set(s["por_regiao_px"]) == {"centro", "intermediaria", "borda"}
+    assert s["tipo"] == "imediata" and {"centro", "borda"} <= set(s["por_regiao_px"])
     assert s["acuracia_media_graus"] is not None and s["distancia_cm"] > 0
     assert s["precisao_rms_s2s_px"] > 0 and 0 <= s["perda_de_dados"] < 0.05
     assert proc.applied_offset is None       # a imediata só mede

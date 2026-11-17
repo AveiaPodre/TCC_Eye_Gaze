@@ -20,11 +20,13 @@ usados para rejeitar outliers, detectar a fixação e no CSV, e o vetor bruto
 (ver gaze.py e calibration.py).
 
 A calibração percorre os alvos em ordem aleatória. Depois do ajuste, alvos
-com erro muito alto são coletados de novo, uma vez. No modo pesquisa há uma
-etapa extra no fim (``CalibrationConfig.head_stage``): o alvo fica no centro
-e uma seta pede que a pessoa gire a cabeça (direita, esquerda, cima, baixo)
-sem tirar o olho do alvo. Essas amostras NÃO entram no ajuste: medem o erro
-com a cabeça em poses novas.
+com erro muito alto são coletados de novo, uma vez. No modo pesquisa, depois
+da validação imediata, vem o teste da cabeça (``HeadStageProcedure``): o
+alvo fica no centro e uma seta pede que a pessoa gire a cabeça (direita,
+esquerda, cima, baixo) sem tirar o olho do alvo. Essas amostras não entram
+no ajuste: medem o erro com a cabeça em poses novas. A etapa vinha logo
+depois da grade, e o efeito passageiro dela contaminava a validação
+(docs/metodologia.md, seção 5.11).
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ import cv2
 import numpy as np
 
 from .calibration import (CalibrationData, CalibrationModel, PointResult, build_grid,
-                          fit_from_samples, head_angles, outlier_mask)
+                          fit_from_samples, head_angles, head_test_error, outlier_mask)
 from .config import CalibrationConfig, ValidationConfig
 from .gaze import RAW_FACE, RAW_SIZE, GazeSample
 
@@ -353,10 +355,11 @@ def _draw_point_results(canvas, results: list[PointResult], tol_px: float):
         _text(canvas, f"{pr.error_px:.0f}px", (t[0] + 18, t[1] - 18), 0.6)
 
 
-def quality_label(error_px: float, screen_w: int) -> tuple[str, str]:
-    """Classificação do erro estimado em pontos novos (fração da largura da tela)."""
+def quality_label(error_px: float, screen_w: int, good_frac: float = 0.047) -> tuple[str, str]:
+    """Classificação do erro estimado em pontos novos (fração da largura da tela).
+    ``good_frac``: limite de "boa" (CalibrationConfig.redo_loo_frac)."""
     frac = error_px / screen_w
-    if frac <= 0.045:
+    if frac <= good_frac:
         return "boa", "pode usar alvos medios (~10% da tela)"
     if frac <= 0.08:
         return "razoavel", "use alvos grandes; R corrige desvios"
@@ -390,9 +393,20 @@ class CalibrationProcedure(TargetProcedure):
 
     def __init__(self, screen_size, cfg: CalibrationConfig):
         targets = build_grid(*screen_size, cfg.grid_cols, cfg.grid_rows, cfg.margin_ratio)
+        rng = np.random.default_rng(cfg.random_seed)
         order = list(range(len(targets)))
         if cfg.shuffle_targets:
-            np.random.default_rng(cfg.random_seed).shuffle(order)
+            rng.shuffle(order)
+        # Etapa 2 (refinamento): alvos internos depois da grade, também em
+        # ordem aleatória; o ajuste usa todos os pontos juntos.
+        self.n_grid = len(targets)
+        refine = [(fx * screen_size[0], fy * screen_size[1])
+                  for fx, fy in getattr(cfg, "refine_points", ())]
+        stage2 = list(range(len(targets), len(targets) + len(refine)))
+        if cfg.shuffle_targets:
+            rng.shuffle(stage2)
+        targets = targets + refine
+        order = order + stage2
         super().__init__(targets, screen_size, cfg.settle_s, cfg.collect_s,
                          cfg.min_samples_per_point, settle_max_s=cfg.settle_max_s,
                          fixation_window=cfg.fixation_window,
@@ -403,150 +417,29 @@ class CalibrationProcedure(TargetProcedure):
         self.raw_path: Path | None = None
         self.results: list[PointResult] = []
         self.stats: dict = {}
-        # Etapa da cabeça.
-        self.head_start: float | None = None
-        self._head_done = False   # etapa concluída (a repetição de alvos não a refaz)
-        self.head_step = 0
-        self._step_start: float | None = None
-        self._reached_since: float | None = None
-        self.head_base: np.ndarray | None = None      # pose média da grade (yaw, pitch)
-        self.head_delta: np.ndarray | None = None     # desvio atual em relação a ela
-        self.head_samples: list[tuple[np.ndarray, np.ndarray]] = []
-        self.head_observations: list = []
         # Repetição de alvos ruins.
         self.retried_targets: list[int] = []
-        self._now = 0.0
-
-    # ----------------------------------------------- etapa da cabeça
-    @property
-    def in_head_stage(self) -> bool:
-        return (self.head_start is not None and not self._head_done
-                and not self.collecting_done and not self.computing)
 
     @property
-    def head_prompt(self) -> tuple[str, tuple[int, int]] | None:
-        """Direção pedida agora (None fora da etapa ou durante o 'prepare-se')."""
-        if not self.in_head_stage or self._step_start is None:
-            return None
-        return HEAD_PROMPTS[min(self.head_step, len(HEAD_PROMPTS) - 1)]
+    def redo_recommended(self) -> bool:
+        """Calibração concluída, mas com erro em pontos novos acima do critério
+        de aceitação (CalibrationConfig.redo_loo_frac)."""
+        loo = self.stats.get("erro_loo_medio_px")
+        return (self.succeeded and loo is not None
+                and loo > getattr(self.cfg, "redo_loo_frac", 0.047) * self.screen_w)
 
     @property
     def retrying(self) -> bool:
         return bool(self.retried_targets) and not self.collecting_done
 
-    def targets_done(self, now: float):
-        if self.cfg.head_stage and self.head_start is None:
-            self.head_start = now
-            grid = [np.atleast_2d(r) for i in range(len(self.targets))
-                    for r in [self.arrays(i)[1]] if len(r)]
-            self.head_base = (np.median(head_angles(np.vstack(grid)), axis=0)
-                              if grid else np.zeros(2))
-        else:
-            super().targets_done(now)
-
-    def _update_head(self, sample, now: float):
-        el = now - self.head_start
-        valid = sample is not None and sample.valid
-        if valid:
-            self._last_valid = now
-            self.head_delta = head_angles(sample.raw)[0] - self.head_base
-        if el < self.cfg.head_motion_settle_s:
-            return
-        if self._step_start is None:
-            self._step_start = now
-        if valid:
-            self.head_samples.append((sample.features(), sample.raw))
-            self.head_observations.append(sample.obs)
-
-        name, direction = HEAD_PROMPTS[self.head_step]
-        step_el = now - self._step_start
-        if direction == (0, 0):
-            # Etapa final: cabeça de volta ao centro.
-            if step_el >= self.cfg.head_center_s and len(self.head_samples) >= self.min_samples:
-                self._head_done = True
-                self.targets_done(now)
-            return
-        reached = (self.head_delta is not None and
-                   head_progress(self.head_delta, direction, self.cfg.head_target_deg)
-                   >= self.cfg.head_reach_frac)
-        if reached and self._reached_since is None:
-            self._reached_since = now
-        held = self._reached_since is not None and now - self._reached_since >= self.cfg.head_hold_s
-        if held or step_el >= self.cfg.head_step_timeout_s:
-            self.head_step += 1
-            self._step_start = now
-            self._reached_since = None
-
-    def update(self, sample, now: float):
-        self._now = now
-        if self._run_pending(now):
-            return
-        if self.in_head_stage:
-            self._update_head(sample, now)
-        else:
-            super().update(sample, now)
-
-    @property
-    def head_target(self) -> tuple[float, float]:
-        return (self.screen_w / 2, self.screen_h / 2)
-
-    def current_target(self) -> tuple[float, float]:
-        return self.head_target if self.in_head_stage else super().current_target()
-
     def status_line(self) -> str:
+        n = len(self.order)
         if self.retrying:
-            return (f"Calibracao: repetindo alvos com erro alto ({self.pos + 1}/{len(self.order)})"
+            return f"Calibracao: repetindo alvos com erro alto ({self.pos + 1}/{n})  -  ESC cancela"
+        if self.index >= self.n_grid:
+            return (f"Calibracao, etapa 2 (refinamento): olhe para o ponto ({self.pos + 1}/{n})"
                     "  -  ESC cancela")
         return super().status_line()
-
-    def render(self, now: float) -> np.ndarray:
-        self._now = now
-        if self.computing or not self.in_head_stage:
-            return super().render(now)
-        canvas = self._blank()
-        cx, cy = (int(v) for v in self.head_target)
-        cv2.circle(canvas, (cx, cy), 12, COLLECT, -1, cv2.LINE_AA)
-        cv2.circle(canvas, (cx, cy), 3, (0, 0, 0), -1, cv2.LINE_AA)
-
-        self._centered(canvas, "Mantenha o OLHAR no ponto verde e gire so a CABECA", 45)
-        prompt = self.head_prompt
-        if prompt is None:
-            self._centered(canvas, "Prepare-se...", 90)
-        else:
-            name, (dx, dy) = prompt
-            if dx or dy:
-                self._draw_head_arrow(canvas, (cx, cy), (dx, dy))
-                self._centered(canvas, f"Cabeca para a {name} ate a seta ficar verde", 90)
-            else:
-                self._centered(canvas, "Volte a cabeca ao CENTRO", 90)
-        self._centered(canvas, "Se nao puder mover a cabeca, apenas continue olhando o ponto",
-                       self.screen_h - 75)
-        if now - self._last_valid > 1.0:
-            self._centered(canvas, "Rosto/olhos nao detectados - posicione-se em frente a camera",
-                           135, WARN)
-        return canvas
-
-    def _draw_head_arrow(self, canvas, center, direction):
-        """Seta que enche conforme a cabeça gira: laranja -> verde ao chegar
-        no ângulo pedido; vermelha se passar da faixa aproveitada."""
-        cx, cy = center
-        dx, dy = direction
-        base = (cx + dx * 45, cy + dy * 45)
-        tip = (cx + dx * 220, cy + dy * 220)
-        cv2.arrowedLine(canvas, base, tip, GRAY, 3, cv2.LINE_AA, tipLength=0.2)
-        frac, too_far = 0.0, False
-        if self.head_delta is not None:
-            frac = head_progress(self.head_delta, direction, self.cfg.head_target_deg)
-            axis = 0 if dx else 1
-            too_far = abs(self.head_delta[axis]) > self.cfg.head_max_deg[axis]
-        reached = frac >= self.cfg.head_reach_frac
-        color = WARN if too_far else (COLLECT if reached else TARGET)
-        k = float(np.clip(frac, 0.0, 1.0))
-        if k > 0.02:
-            end = (int(base[0] + (tip[0] - base[0]) * k), int(base[1] + (tip[1] - base[1]) * k))
-            cv2.line(canvas, base, end, color, 10, cv2.LINE_AA)
-        if too_far:
-            self._centered(canvas, "Girou demais - volte um pouco", 180, WARN)
 
     # ------------------------------------------------------- ajuste
     def _collected_data(self) -> CalibrationData:
@@ -556,11 +449,6 @@ class CalibrationProcedure(TargetProcedure):
             data.grid.append((t, feats, raws))
             data.grid_obs.append(self.observations[i])
             data.grid_times.append(np.asarray(self.times[i], dtype=float))
-        data.head_obs = self.head_observations
-        if self.head_samples:
-            data.head_target = self.head_target
-            data.head_features = np.array([f for f, _ in self.head_samples])
-            data.head_raw = np.array([r for _, r in self.head_samples])
         return data
 
     def _fit(self, data: CalibrationData):
@@ -622,7 +510,8 @@ class CalibrationProcedure(TargetProcedure):
         if "erro_loo_medio_px" in st:
             # Erro de cada alvo quando ele fica FORA do ajuste: estimativa
             # honesta do erro em pontos novos (o erro de ajuste é otimista).
-            label, advice = quality_label(st["erro_loo_medio_px"], self.screen_w)
+            label, advice = quality_label(st["erro_loo_medio_px"], self.screen_w,
+                                          getattr(self.cfg, "redo_loo_frac", 0.047))
             self.message_lines.append(
                 f"Erro estimado em pontos novos: {st['erro_loo_medio_px']:.0f} px"
                 f"  (pupila {st.get('fonte_pupila', 'mediapipe')},"
@@ -639,6 +528,11 @@ class CalibrationProcedure(TargetProcedure):
         if self.retried_targets:
             self.message_lines.append(f"{len(self.retried_targets)} alvo(s) repetido(s)")
         self.message_lines.append("Branco = alvo, ponto colorido = estimativa.")
+        if self.redo_recommended:
+            self.message_lines.append(
+                "RECOMENDADO REFAZER: ESPACO refaz agora (sente-se como vai usar, rosto "
+                "iluminado, olhe o centro de cada ponto); outra tecla aceita assim.")
+            self.result_timeout_s = 30.0      # tempo para decidir
         print(f"[Calibração] Concluída. Erro médio de ajuste {errs.mean():.1f} px, "
               f"máx {errs.max():.1f} px. Estatísticas: "
               f"{ {k: v for k, v in st.items() if k not in ('candidatos', 'erro_loo_por_alvo_px', 'erro_loo_alvos')} }")
@@ -648,6 +542,176 @@ class CalibrationProcedure(TargetProcedure):
     def render_result(self, canvas):
         _draw_point_results(canvas, self.results, tol_px=0.05 * self.screen_w)
         super().render_result(canvas)
+
+
+class HeadStageProcedure(TargetProcedure):
+    """Teste da cabeça (modo pesquisa): olhar fixo no centro, cabeça girando
+    para a direita, a esquerda, para cima e para baixo, seguindo setas.
+
+    As amostras NÃO entram no ajuste: medem o erro com a cabeça em poses
+    novas (``calibration.head_test_error``), que fica em ``model.info`` e é
+    gravado em ``results/cabeca_<data>.npz``. Roda depois da validação
+    imediata: logo depois da grade, o efeito passageiro dos giros (~200 px
+    com a cabeça já de volta) contaminava a validação (metodologia, 5.11).
+    """
+
+    title = "Teste da cabeca"
+
+    def __init__(self, screen_size, model: CalibrationModel, cfg: CalibrationConfig):
+        center = (screen_size[0] / 2, screen_size[1] / 2)
+        super().__init__([center], screen_size, cfg.settle_s, cfg.collect_s,
+                         cfg.min_samples_per_point)
+        self.cfg = cfg
+        self.model = model
+        self.head_start: float | None = None
+        self.head_step = 0
+        self._step_start: float | None = None
+        self._reached_since: float | None = None
+        self.head_base = np.asarray(model.head_ref, dtype=float)   # pose da grade
+        self.head_delta: np.ndarray | None = None     # desvio atual em relação a ela
+        self.head_samples: list[tuple[np.ndarray, np.ndarray]] = []
+        self.head_observations: list = []
+        self.stats: dict = {}
+        self.raw_path: Path | None = None
+
+    @property
+    def in_head_stage(self) -> bool:
+        return self.head_start is not None and not self.collecting_done and not self.computing
+
+    @property
+    def head_prompt(self) -> tuple[str, tuple[int, int]] | None:
+        """Direção pedida agora (None fora da etapa ou durante o 'prepare-se')."""
+        if not self.in_head_stage or self._step_start is None:
+            return None
+        return HEAD_PROMPTS[min(self.head_step, len(HEAD_PROMPTS) - 1)]
+
+    @property
+    def head_target(self) -> tuple[float, float]:
+        return (self.screen_w / 2, self.screen_h / 2)
+
+    def update(self, sample, now: float):
+        if self._run_pending(now):
+            return
+        if self.collecting_done:
+            if self._result_since is None:
+                self._result_since = now
+            elif now - self._result_since > self.result_timeout_s:
+                self.finished = True
+            return
+        if self.head_start is None:
+            self.head_start = now
+            self._last_valid = now
+        self._update_head(sample, now)
+
+    def _update_head(self, sample, now: float):
+        el = now - self.head_start
+        valid = sample is not None and sample.valid
+        if valid:
+            self._last_valid = now
+            self.head_delta = head_angles(sample.raw)[0] - self.head_base
+        if el < self.cfg.head_motion_settle_s:
+            return
+        if self._step_start is None:
+            self._step_start = now
+        if valid:
+            self.head_samples.append((sample.features(), sample.raw))
+            self.head_observations.append(sample.obs)
+
+        name, direction = HEAD_PROMPTS[self.head_step]
+        step_el = now - self._step_start
+        if direction == (0, 0):
+            # Etapa final: cabeça de volta ao centro.
+            if step_el >= self.cfg.head_center_s and len(self.head_samples) >= self.min_samples:
+                self.computing = True     # resultado no próximo quadro
+            return
+        reached = (self.head_delta is not None and
+                   head_progress(self.head_delta, direction, self.cfg.head_target_deg)
+                   >= self.cfg.head_reach_frac)
+        if reached and self._reached_since is None:
+            self._reached_since = now
+        held = self._reached_since is not None and now - self._reached_since >= self.cfg.head_hold_s
+        if held or step_el >= self.cfg.head_step_timeout_s:
+            self.head_step += 1
+            self._step_start = now
+            self._reached_since = None
+
+    def on_complete(self):
+        if len(self.head_samples) < 5:
+            self.message_lines = ["Teste da cabeca: amostras insuficientes"]
+            return
+        data = CalibrationData(head_target=self.head_target,
+                               head_features=np.array([f for f, _ in self.head_samples]),
+                               head_raw=np.array([r for _, r in self.head_samples]),
+                               head_obs=self.head_observations)
+        self.stats = head_test_error(self.model, data.head_raw, data.head_target,
+                                     max_deg=self.cfg.head_max_deg, base=self.head_base)
+        self.model.info.update(self.stats)
+        try:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            self.raw_path = self.cfg.results_dir / f"cabeca_{stamp}.npz"
+            data.save(self.raw_path)
+        except OSError as exc:
+            self.raw_path = None
+            print(f"[Teste da cabeça] Não foi possível salvar os dados brutos: {exc}")
+        self.succeeded = True
+        st = self.stats
+        if "erro_cabeca_px" in st:
+            by_dir = "  ".join(f"{k} {v:.0f}" for k, v in st["erro_cabeca_por_direcao_px"].items())
+            self.message_lines = [
+                f"Teste da cabeca: {st['erro_cabeca_px']:.0f} px com a cabeca em poses novas",
+                f"Por direcao (px): {by_dir}",
+                f"{st['n_cabeca_usadas']} de {st['n_cabeca_total']} amostras dentro da faixa util"]
+        else:
+            self.message_lines = ["Teste da cabeca: a cabeca quase nao girou; sem medida"]
+        print(f"[Teste da cabeça] {st}")
+
+    def render(self, now: float) -> np.ndarray:
+        if self.computing or self.collecting_done:
+            return super().render(now)
+        canvas = self._blank()
+        cx, cy = (int(v) for v in self.head_target)
+        cv2.circle(canvas, (cx, cy), 12, COLLECT, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (cx, cy), 3, (0, 0, 0), -1, cv2.LINE_AA)
+
+        self._centered(canvas, "Mantenha o OLHAR no ponto verde e gire so a CABECA", 45)
+        prompt = self.head_prompt
+        if prompt is None:
+            self._centered(canvas, "Prepare-se...", 90)
+        else:
+            name, (dx, dy) = prompt
+            if dx or dy:
+                self._draw_head_arrow(canvas, (cx, cy), (dx, dy))
+                self._centered(canvas, f"Cabeca para a {name} ate a seta ficar verde", 90)
+            else:
+                self._centered(canvas, "Volte a cabeca ao CENTRO", 90)
+        self._centered(canvas, "Se nao puder mover a cabeca, apenas continue olhando o ponto",
+                       self.screen_h - 75)
+        if now - self._last_valid > 1.0:
+            self._centered(canvas, "Rosto/olhos nao detectados - posicione-se em frente a camera",
+                           135, WARN)
+        return canvas
+
+    def _draw_head_arrow(self, canvas, center, direction):
+        """Seta que enche conforme a cabeça gira: laranja -> verde ao chegar
+        no ângulo pedido; vermelha se passar da faixa aproveitada."""
+        cx, cy = center
+        dx, dy = direction
+        base = (cx + dx * 45, cy + dy * 45)
+        tip = (cx + dx * 220, cy + dy * 220)
+        cv2.arrowedLine(canvas, base, tip, GRAY, 3, cv2.LINE_AA, tipLength=0.2)
+        frac, too_far = 0.0, False
+        if self.head_delta is not None:
+            frac = head_progress(self.head_delta, direction, self.cfg.head_target_deg)
+            axis = 0 if dx else 1
+            too_far = abs(self.head_delta[axis]) > self.cfg.head_max_deg[axis]
+        reached = frac >= self.cfg.head_reach_frac
+        color = WARN if too_far else (COLLECT if reached else TARGET)
+        k = float(np.clip(frac, 0.0, 1.0))
+        if k > 0.02:
+            end = (int(base[0] + (tip[0] - base[0]) * k), int(base[1] + (tip[1] - base[1]) * k))
+            cv2.line(canvas, base, end, color, 10, cv2.LINE_AA)
+        if too_far:
+            self._centered(canvas, "Girou demais - volte um pouco", 180, WARN)
 
 
 def _gating(calib_cfg: CalibrationConfig) -> dict:
@@ -685,8 +749,15 @@ class ValidationProcedure(TargetProcedure):
     def __init__(self, screen_size, model: CalibrationModel, cfg: ValidationConfig,
                  calib_cfg: CalibrationConfig, kind: str = "reteste"):
         targets = [(fx * screen_size[0], fy * screen_size[1]) for fx, fy in cfg.points]
+        # Ordem aleatória: com a ordem fixa (centro sempre primeiro), o tempo
+        # desde o procedimento anterior e a posição do alvo ficavam
+        # confundidos (o primeiro alvo herdava o efeito da etapa da cabeça;
+        # docs/metodologia.md, seção 5.11). Semente da calibração (+1000) para
+        # a reprodução de sessões gravadas repetir a ordem.
+        seed = None if calib_cfg.random_seed is None else calib_cfg.random_seed + 1000
+        order = list(np.random.default_rng(seed).permutation(len(targets)))
         super().__init__(targets, screen_size, cfg.settle_s, cfg.collect_s,
-                         calib_cfg.min_samples_per_point, **_gating(calib_cfg))
+                         calib_cfg.min_samples_per_point, order=order, **_gating(calib_cfg))
         self.cfg = cfg
         self.kind = kind
         self.title = "Validacao imediata" if kind == "imediata" else "Reteste"
@@ -807,8 +878,9 @@ class ValidationProcedure(TargetProcedure):
             "calibracao": {k: v for k, v in self.model.info.items()
                            if k not in ("candidatos", "erro_loo_por_alvo_px", "erro_loo_alvos")},
             "por_alvo": [{"alvo": r.target, "estimativa": r.prediction, "regiao":
-                          self._region(r.target), "erro_px": r.error_px, "n": r.n_samples}
-                         for r in self.results],
+                          self._region(r.target), "erro_px": r.error_px, "n": r.n_samples,
+                          "ordem": self.order.index(i) + 1}
+                         for i, r in enumerate(self.results)],
         }
 
         # Reteste: corrige o desvio médio (recentralização com todos os alvos).

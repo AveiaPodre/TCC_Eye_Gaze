@@ -82,16 +82,20 @@ def head_direction(delta: np.ndarray) -> np.ndarray:
 
 
 def head_test_error(model: "CalibrationModel", head_raw: np.ndarray, head_target,
-                    grid_raw: np.ndarray, max_deg: tuple[float, float] | None = (15.0, 12.0)
-                    ) -> dict:
+                    grid_raw: np.ndarray | None = None,
+                    max_deg: tuple[float, float] | None = (15.0, 12.0),
+                    base: np.ndarray | None = None) -> dict:
     """Erro (px) com a cabeça em poses novas, nas amostras da etapa da cabeça
     (que não entram no ajuste). Para cada direção (direita, esquerda, cima,
     baixo), a mediana da distância de cada amostra ao alvo; o resultado é a
     média das direções. Amostras além de ``max_deg`` (yaw, pitch) da pose da
     grade são descartadas: nesses ângulos os landmarks do olho deixam de ser
-    confiáveis."""
+    confiáveis. ``base``: pose (yaw, pitch) de referência; sem ela, a mediana
+    da pose em ``grid_raw``."""
     hr = np.atleast_2d(head_raw)
-    delta = head_angles(hr) - np.median(head_angles(grid_raw), axis=0)
+    if base is None:
+        base = np.median(head_angles(grid_raw), axis=0)
+    delta = head_angles(hr) - np.asarray(base, dtype=float)
     use = np.max(np.abs(delta), axis=1) >= HEAD_STILL_DEG
     if max_deg is not None:
         use &= (np.abs(delta[:, 0]) <= max_deg[0]) & (np.abs(delta[:, 1]) <= max_deg[1])

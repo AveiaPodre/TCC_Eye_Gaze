@@ -6,7 +6,8 @@ Loop principal da aplicação.
               + EyeballModel               2-3. centro do globo, feixes, intersecção
            -> VirtualScreen                4. vetor do olhar -> monitor virtual
            -> CalibrationModel             5. correção monitor virtual -> real
-           -> FixationStabilizer -> mouse / dwell
+           -> GazeFollower (estabilizador)
+           -> CursorControl (control.py)   mouse, clique, precisão, barra pelo olhar
 
 Antes de calibrar, o mesmo pipeline roda com o globo anatômico típico e sem
 correção (o ponto do monitor virtual é o cursor); a calibração troca os dois
@@ -14,6 +15,12 @@ pelos ajustados.
 
 Os procedimentos de calibração, validação e recentralização rodam DENTRO
 deste mesmo loop (procedures.py), então o rastreamento nunca para.
+
+Uso sem teclado: depois da calibração o mouse liga sozinho e a barra de
+controle pelo olhar (gaze_bar.py) aparece na borda esquerda; ela liga e
+desliga o mouse, o clique por permanência e o modo de precisão, e
+recentraliza ou recalibra. O teclado fica para o operador (calibração
+manual, pesquisa, visualizações).
 """
 
 from __future__ import annotations
@@ -29,12 +36,14 @@ from . import geometry, scene3d
 from . import visualization as vis
 from .calibration import CalibrationModel, build_grid
 from .config import AppConfig
-from .filters import FixationStabilizer, HeadFineTuner, OneEuroFilter
+from .control import CursorControl
+from .filters import GazeFollower, OneEuroFilter
+from .gaze_bar import make_view
 from .gaze import GazeEstimator, GazeSample, direction_to_angles
 from .geometry import VirtualScreen
-from .io_devices import DwellClick, MouseController
-from .procedures import (CalibrationProcedure, RecenterProcedure, TargetProcedure,
-                         ValidationProcedure)
+from .io_devices import MouseController
+from .procedures import (CalibrationProcedure, HeadStageProcedure, RecenterProcedure,
+                         TargetProcedure, ValidationProcedure)
 
 GREEN = (80, 230, 80)
 RED = (80, 80, 255)
@@ -62,21 +71,19 @@ class EyeGazeApp:
         geometry.set_camera_hfov(cfg.camera.hfov_deg)
         self.estimator = GazeEstimator(cfg.gaze)
         st = cfg.stabilizer
-        self.stabilizer = FixationStabilizer(
+        self.stabilizer = GazeFollower(
             saccade_px=st.saccade_ratio * screen_size[0], confirm_frames=st.confirm_frames,
-            window=st.window_frames, follow=st.follow, lock_px=st.lock_ratio * screen_size[0],
-            lock_k=st.lock_k, shift_frames=st.shift_frames, settle_frames=st.settle_frames,
-            noise_k=st.noise_k, lock_cap=st.lock_cap)
+            median_frames=st.median_frames, start_k=st.start_k, stop_k=st.stop_k,
+            alpha=st.alpha, noise_k=st.noise_k, noise_floor_px=st.noise_floor_px,
+            settle_frames=st.settle_frames)
         # Suavização SÓ da exibição do ponto no monitor virtual (vista 3D):
         # a estimativa bruta treme de quadro a quadro; o cursor não usa isto.
         self._display_filter = OneEuroFilter(1.5, 0.01, 1.0)
         self.virtual_point_display: np.ndarray | None = None
-        fc = cfg.fine
-        self.fine_enabled = fc.enabled
-        self.fine = HeadFineTuner(fc.gain_px_per_deg, fc.deadzone_deg, fc.max_px, fc.reset_deg)
-        self.dwell = DwellClick(cfg.dwell.dwell_time_s, cfg.dwell.tolerance_px,
-                                cfg.dwell.cooldown_s)
-        self.dwell_enabled = cfg.dwell.enabled_at_start
+        # Uso do cursor: mouse, clique por permanência, modo de precisão,
+        # correção contínua e barra de controle pelo olhar (control.py).
+        self.control = CursorControl(cfg, screen_size, self.mouse, self.toast)
+        self.bar_view = None      # janela da barra (aberta em run())
 
         d = cfg.display
         self.show_landmarks = d.show_landmarks
@@ -120,17 +127,44 @@ class EyeGazeApp:
         self.last_camera_view: np.ndarray | None = None
         self.last_target_view: np.ndarray | None = None
         self._target_window_open = False
-        self._last_mouse: np.ndarray | None = None
-        # Amostras recentes (vetor bruto) para correções por alvo conhecido.
-        self.recent_raw: deque = deque(maxlen=cfg.adapt.window_frames)
         # Aviso de postura fora da calibração.
         self.posture_off = False
         self._posture_off_since: float | None = None
-        # Correção contínua por alvos conhecidos (confirm_target e cliques
-        # depois do ajuste fino pela cabeça): quantas correções foram feitas
-        # e se o modelo mudou desde que foi salvo.
-        self.online_corrections = 0
-        self._model_dirty = False
+
+    # ------------------------------------------- atalhos para o CursorControl
+    @property
+    def fine(self):
+        return self.control.fine
+
+    @property
+    def fine_enabled(self) -> bool:
+        return self.control.fine_enabled
+
+    @property
+    def dwell(self):
+        return self.control.dwell
+
+    @property
+    def dwell_enabled(self) -> bool:
+        return self.control.dwell_enabled
+
+    @property
+    def recent_raw(self):
+        return self.control.recent_raw
+
+    @property
+    def online_corrections(self) -> int:
+        return self.control.online_corrections
+
+    @property
+    def _fine_anchor(self):
+        return self.control.anchor
+
+    def confirm_target(self, target) -> np.ndarray | None:
+        """Informa que o usuário acabou de selecionar algo com centro
+        conhecido (ex.: uma tecla do teclado virtual). Corrige a deriva do
+        offset com as amostras recentes. Devolve a correção aplicada (px)."""
+        return self.control.confirm_target(self.model if self.calibrated else None, target)
 
     # ------------------------------------------------------------ helpers
     def toast(self, message: str, seconds: float = 1.6):
@@ -171,33 +205,6 @@ class EyeGazeApp:
         elif now - self._posture_off_since >= pc.sustain_s:
             self.posture_off = True
 
-    def confirm_target(self, target) -> np.ndarray | None:
-        """Informa que o usuário acabou de selecionar algo com centro
-        conhecido (ex.: uma tecla do teclado virtual). Corrige a deriva do
-        offset com as amostras recentes. Devolve a correção aplicada (px)."""
-        if not self.calibrated or len(self.recent_raw) < 3:
-            return None
-        a = self.cfg.adapt
-        step = self.model.correct_with_known_target(np.array(self.recent_raw), target,
-                                                    a.gain, a.max_step_px)
-        self.recent_raw.clear()
-        self.online_corrections += 1
-        self._model_dirty = True
-        return step
-
-    def _learn_from_fine_click(self):
-        """Clique depois do ajuste fino pela cabeça: o ponto final do cursor é
-        o alvo, e o ajuste feito com a cabeça é o erro do olhar ali. Corrige o
-        offset (como confirm_target) e zera o ajuste fino."""
-        a = self.cfg.adapt
-        if not (a.learn_from_fine_clicks and self.fine_enabled and self.calibrated
-                and self.screen_point is not None):
-            return
-        if float(np.linalg.norm(self.fine.offset)) < a.fine_min_px:
-            return
-        if self.confirm_target(self.screen_point.copy()) is not None:
-            self.fine.reset()
-
     # --------------------------------------------------------- pipeline
     def process_frame(self, frame: np.ndarray, timestamp_ms: int, now: float):
         if self._last_frame_time is not None:
@@ -215,7 +222,7 @@ class EyeGazeApp:
         point = (self._map_to_screen(self.sample)
                  if self.sample is not None and self.sample.valid else None)
         if point is not None:
-            self.recent_raw.append(self.sample.raw)
+            self.control.recent_raw.append(self.sample.raw)
             self._update_posture(self.sample, now)
             self.screen_point_raw = point
             v = self.active_model.virtual_px(self.sample.raw)[0]
@@ -223,17 +230,15 @@ class EyeGazeApp:
                 self.virtual_point_display = self._display_filter(v, now)
             w, h = self.screen_size
             stab = self.stabilizer(self.screen_point_raw)
-            if self.fine_enabled and self.calibrated:
-                hy, hp, _ = self.sample.head.euler_deg
-                stab = self.fine(stab, self.stabilizer.fixation_id, (hy, hp), now,
-                                 settling=self.stabilizer.settling)
+            if self.control.fine_enabled and self.calibrated:
+                stab = self.control.apply_fine(stab, self.sample, self.stabilizer, now)
             self.screen_point = np.array([np.clip(stab[0], 0, w - 1), np.clip(stab[1], 0, h - 1)])
             self.trail.append(self.screen_point.copy())
         elif not face_recent:
             # Rosto perdido: zera os filtros para não "puxar" a posição antiga.
             self.stabilizer.reset()
-            self.fine.reset()
-            self.recent_raw.clear()
+            self.control.release_fine()
+            self.control.recent_raw.clear()
             self.screen_point_raw = None
             self.virtual_point_display = None
             self._display_filter.reset()
@@ -250,17 +255,12 @@ class EyeGazeApp:
         # (Se o rosto some, o cursor fica parado onde está.)
         can_control = (self.calibrated and self.obs is not None
                        and self.screen_point is not None)
-        if self.mouse.enabled and can_control:
-            if (self._last_mouse is None
-                    or np.max(np.abs(self.screen_point - self._last_mouse)) >= 1.0):
-                self.mouse.move(*self.screen_point)
-                self._last_mouse = self.screen_point.copy()
-            if self.dwell_enabled and self.dwell.update(self.screen_point, now):
-                self.mouse.click()
-                self._learn_from_fine_click()
-                self.toast("Clique (dwell)", 0.8)
-        else:
-            self.dwell.reset()
+        action = self.control.act(self.screen_point, self.model if self.calibrated else None,
+                                  can_control, now)
+        if action == "recentralizar":
+            self.start_recenter()
+        elif action == "recalibrar":
+            self.start_calibration(manual=False)
 
     # ----------------------------------------------------- procedimentos
     def start_calibration(self, manual: bool | None = None):
@@ -283,8 +283,16 @@ class EyeGazeApp:
             return
         self.procedure = ValidationProcedure(self.screen_size, self.model,
                                              self.cfg.validation, self.cfg.calibration, kind)
-        self.toast("Validacao imediata" if kind == "imediata"
-                   else "Reteste: olhe primeiro para o centro")
+        self.toast("Validacao imediata" if kind == "imediata" else "Reteste")
+
+    def start_head_test(self):
+        """Teste da cabeça (modo pesquisa ou tecla K): erro com a cabeça em
+        poses novas, olhando o centro."""
+        if not self.calibrated:
+            self.toast("Calibre primeiro (ESPACO)")
+            return
+        self.procedure = HeadStageProcedure(self.screen_size, self.model, self.cfg.calibration)
+        self.toast("Teste da cabeca: olhe o ponto e siga as setas com a cabeca")
 
     def start_recenter(self):
         if not self.calibrated:
@@ -302,22 +310,43 @@ class EyeGazeApp:
             self.estimator.eyeball = self.model.eyeball
             self.stabilizer.reset()
             self.model.save(self.cfg.calibration.save_path)
-            self.online_corrections, self._model_dirty = 0, False
+            self.control.online_corrections, self.control.model_dirty = 0, False
             self.toast("Calibracao salva")
+            self._auto_mouse()
+            # Modo pesquisa: validação imediata e, DEPOIS dela, o teste da
+            # cabeça (o efeito passageiro dos giros contaminava a validação;
+            # docs/metodologia.md, seção 5.11).
             if self.cfg.validation.after_calibration:
                 self.start_validation("imediata")
+                return
+            if self.cfg.calibration.head_stage:
+                self.start_head_test()
                 return
         elif isinstance(proc, RecenterProcedure) and proc.succeeded:
             # A postura nova passa a ser a referência do aviso.
             self.model.save(self.cfg.calibration.save_path)
-            self._model_dirty = False
+            self.control.model_dirty = False
             self.toast("Recentralizado")
+            self._auto_mouse()
         elif isinstance(proc, ValidationProcedure) and proc.applied_offset is not None:
             self.model.save(self.cfg.calibration.save_path)
-            self._model_dirty = False
+            self.control.model_dirty = False
+        elif (isinstance(proc, ValidationProcedure) and proc.kind == "imediata"
+              and proc.collecting_done and self.cfg.calibration.head_stage):
+            self.start_head_test()
+            return
+        elif isinstance(proc, HeadStageProcedure) and proc.succeeded:
+            self.model.save(self.cfg.calibration.save_path)   # resultado em model.info
         elif isinstance(proc, RecenterProcedure) and proc.collecting_done:
             self.toast("Desvio grande demais: recalibre (ESPACO)", 4.0)
         self.posture_off, self._posture_off_since = False, None
+
+    def _auto_mouse(self):
+        """Depois de calibrar ou recentralizar, o mouse liga sozinho (o uso
+        não depende do teclado; a barra pausa e religa)."""
+        if (self.cfg.mouse.enable_after_calibration and self.calibrated
+                and not self.mouse.enabled and self.mouse.available):
+            self.control.set_mouse(True, True)
 
     def cancel_procedure(self):
         if self.procedure is not None:
@@ -341,6 +370,14 @@ class EyeGazeApp:
             elif key in (32, 13) and getattr(self.procedure, "awaiting_confirmation", False):
                 # Calibração manual: confirma que está olhando para o alvo.
                 self.procedure.confirm(self.clock())
+            elif (key == 32 and self.procedure.collecting_done
+                  and isinstance(self.procedure, CalibrationProcedure)
+                  and self.procedure.redo_recommended):
+                # Calibração abaixo do critério: refaz na hora, sem salvar.
+                manual = self.procedure.manual
+                self.procedure = None
+                self._close_target_window()
+                self.start_calibration(manual=manual)
             elif self.procedure.collecting_done:
                 self.procedure.acknowledge()
                 self._finish_procedure()
@@ -357,18 +394,12 @@ class EyeGazeApp:
             self.start_validation()
         elif ch == "r":
             self.start_recenter()
+        elif ch == "k":
+            self.start_head_test()
         elif ch == "m":
-            if not self.calibrated:
-                self.toast("Calibre antes de ligar o mouse")
-            elif not self.mouse.available:
-                self.toast("Mouse indisponivel (instale pynput)")
-            else:
-                self.mouse.enabled = not self.mouse.enabled
-                self.toast(f"Mouse: {'ON' if self.mouse.enabled else 'OFF'}")
+            self.control.set_mouse(not self.mouse.enabled, self.calibrated)
         elif ch == "d":
-            self.dwell_enabled = not self.dwell_enabled
-            self.dwell.reset()
-            self.toast(f"Dwell-click: {'ON' if self.dwell_enabled else 'OFF'}")
+            self.control.set_dwell(not self.control.dwell_enabled)
         elif ch == "l":
             self.show_landmarks = not self.show_landmarks
             self.toast(f"Landmarks: {'ON' if self.show_landmarks else 'OFF'}")
@@ -389,9 +420,7 @@ class EyeGazeApp:
         elif ch == "h":
             self.show_help = not self.show_help
         elif ch == "a":
-            self.fine_enabled = not self.fine_enabled
-            self.fine.reset()
-            self.toast(f"Ajuste fino pela cabeca: {'ON' if self.fine_enabled else 'OFF'}")
+            self.control.set_fine(not self.control.fine_enabled)
         elif ch == "f":
             self.mirror = not self.mirror
             self.toast(f"Espelhar imagem: {'ON' if self.mirror else 'OFF'}")
@@ -428,19 +457,20 @@ class EyeGazeApp:
             lines.append(("Mouse: ON" if face_recent else "Mouse: PAUSADO (sem rosto)",
                           GREEN if face_recent else RED))
         else:
-            lines.append(("Mouse: OFF (M)", GRAY))
-        lines.append((f"Dwell-click: {'ON' if self.dwell_enabled else 'OFF'} (D)",
+            lines.append(("Mouse: OFF (M ou barra)", GRAY))
+        lines.append((f"Clique pelo olhar: {'ON' if self.dwell_enabled else 'OFF'} (D ou barra)",
                       GREEN if self.dwell_enabled else GRAY))
         if self.fine_enabled:
             ox, oy = self.fine.offset
-            lines.append((f"Ajuste fino pela cabeca: ON (A)  desvio ({ox:+.0f}, {oy:+.0f}) px", GREEN))
+            lines.append((f"Modo de precisao: ON (A ou barra)  ajuste ({ox:+.0f}, {oy:+.0f}) px",
+                          GREEN))
         else:
-            lines.append(("Ajuste fino pela cabeca: OFF (A)", GRAY))
+            lines.append(("Modo de precisao: OFF (A ou barra)", GRAY))
         if self.posture_off:
             lines.append(("Postura fora da calibracao: R para recentralizar", YELLOW))
-        if self.online_corrections:
+        if self.control.online_corrections:
             ox, oy = self.model.offset
-            lines.append((f"Correcao continua: {self.online_corrections} alvo(s), "
+            lines.append((f"Correcao continua: {self.control.online_corrections} alvo(s), "
                           f"desvio ({ox:+.0f}, {oy:+.0f}) px", GRAY))
         gaze = self.sample.gaze if self.sample is not None else None
         if self.show_gaze and gaze is not None:
@@ -538,6 +568,10 @@ class EyeGazeApp:
         if self.show_scene3d:
             self.last_scene_view = self.render_scene_view()
 
+        if self.bar_view is not None and self.control.bar is not None:
+            # Barra visível durante o uso (some nos procedimentos, que ocupam a tela).
+            self.bar_view.show(self.control.bar, self.calibrated and self.procedure is None)
+
         keys = []
         if not self.headless:
             cv2.imshow(self.cfg.display.window_name, self.last_camera_view)
@@ -564,12 +598,18 @@ class EyeGazeApp:
     def run(self):
         if not self.headless:
             cv2.namedWindow(self.cfg.display.window_name, cv2.WINDOW_NORMAL)
+            if self.control.bar is not None:
+                self.bar_view = make_view(self.control.bar, self.headless)
+                if hasattr(self.bar_view, "give_focus_to"):
+                    self.bar_view.give_focus_to(self.cfg.display.window_name)
         print("Pronto. ESPACO = calibrar | H = ajuda | Q = sair")
         try:
             while self.step():
                 pass
         finally:
-            if self.calibrated and self._model_dirty:
+            if self.bar_view is not None:
+                self.bar_view.close()
+            if self.calibrated and self.control.model_dirty:
                 # Guarda a correção contínua aprendida durante o uso.
                 self.model.save(self.cfg.calibration.save_path)
             self.source.release()

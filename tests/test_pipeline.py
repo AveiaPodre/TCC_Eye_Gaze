@@ -9,7 +9,7 @@ from eyegaze.calibration import (CalibrationData, CalibrationModel, build_grid,
                                  correction_basis, fit_from_samples, reject_outliers)
 from eyegaze.config import GazeConfig
 from eyegaze.eyeball import RADIUS_CM, EyeballModel
-from eyegaze.filters import FixationStabilizer, OneEuroFilter
+from eyegaze.filters import GazeFollower, OneEuroFilter
 from eyegaze.gaze import RAW_SIZE, GazeEstimator, direction_to_angles
 from eyegaze.geometry import VirtualScreen, closest_point_between_rays
 from eyegaze.head_pose import estimate_head_pose
@@ -490,7 +490,7 @@ def _jitter_scenario(seed=0, noise=45.0):
 def test_stabilizer_removes_tremor_during_fixation():
     """Problema relatado: com o mouse ligado o cursor tremia sem parar."""
     truth, raw = _jitter_scenario()
-    st = FixationStabilizer()
+    st = GazeFollower()
     out = np.array([st(p) for p in raw])
     step = np.linalg.norm(np.diff(out[25:60], axis=0), axis=1)
     raw_step = np.linalg.norm(np.diff(raw[25:60], axis=0), axis=1)
@@ -500,7 +500,7 @@ def test_stabilizer_removes_tremor_during_fixation():
 
 def test_stabilizer_follows_saccades_quickly():
     truth, raw = _jitter_scenario(1)
-    st = FixationStabilizer()
+    st = GazeFollower()
     out = np.array([st(p) for p in raw])
     arrived = np.argmax(np.linalg.norm(out[60:] - truth[60:], axis=1) < 60)
     # <= 200 ms a 30 fps. Com este ruído BRANCO de 45 px por eixo, uma amostra
@@ -513,7 +513,7 @@ def test_stabilizer_follows_saccades_quickly():
 
 
 def test_stabilizer_ignores_isolated_spikes():
-    st = FixationStabilizer()
+    st = GazeFollower()
     for _ in range(30):
         st(np.array([800.0, 400.0]))
     for spike in ([1500.0, 900.0], [800.0, 400.0], [200.0, 100.0], [800.0, 400.0]):
@@ -522,12 +522,14 @@ def test_stabilizer_ignores_isolated_spikes():
 
 
 def test_stabilizer_follows_slow_drift():
-    st = FixationStabilizer()
+    st = GazeFollower()
     xs = np.linspace(500, 700, 120)   # 200 px em 4 s (perseguição lenta)
     outs = [st(np.array([x, 500.0]))[0] for x in xs]
-    # Segue em degraus: fica no máximo ~1 raio de trava atrás, e não trava de vez.
-    assert abs(outs[-1] - 700) < st.lock_radius + 20
-    assert outs[-1] > 600
+    # Segue pouco atrás do olhar, em pequenos deslizes (histerese: parado até
+    # o olhar se afastar ~4x o ruído, depois desliza até ele), sem saltos.
+    assert abs(outs[-1] - 700) < 80
+    steps = np.abs(np.diff(outs[30:]))
+    assert steps.max() < 35
 
 
 def _wander(n, sigma, rho, rng):
@@ -538,20 +540,26 @@ def _wander(n, sigma, rho, rng):
     return e
 
 
-def test_stabilizer_holds_still_when_estimate_wanders():
-    """Problema relatado: com a vista parada o cursor se movia um pouco.
-
-    A estimativa real não treme de quadro a quadro, ela passeia (ruído
-    correlacionado). A média deslizante acompanhava esse passeio."""
+def test_stabilizer_follows_subtle_gaze_steps_without_wandering_much():
+    """Problema relatado: o cursor só se movia em grandes blocos. Com a
+    estimativa passeando como a real (ruído correlacionado), um movimento
+    sutil do olhar (degrau de 80 px) é seguido em menos de ~0,4 s, e com o
+    olho parado o cursor anda bem menos que a estimativa."""
     rng = np.random.default_rng(3)
-    moving = []
+    followed, still_ratio = [], []
     for _ in range(20):
-        st = FixationStabilizer(saccade_px=134, lock_px=67)
-        raw = np.array([900.0, 500.0]) + _wander(60, 20.0, 0.97, rng)
+        st = GazeFollower(saccade_px=134)
+        raw = np.array([900.0, 500.0]) + _wander(90, 20.0, 0.97, rng)
+        raw += rng.normal(0, 10, raw.shape)            # tremor de quadro a quadro
+        raw[45:, 0] += 80.0                            # o olho andou 80 px
         out = np.array([st(p) for p in raw])
-        step = np.linalg.norm(np.diff(out[15:], axis=0), axis=1)
-        moving.append(np.mean(step > 0.5))
-    assert np.mean(moving) < 0.05   # cursor parado em >95% dos quadros da fixação
+        moved = out[57, 0] - out[44, 0]                # 0,4 s depois do degrau
+        followed.append(moved > 40)                    # ao menos metade do degrau
+        cursor_path = np.sum(np.linalg.norm(np.diff(out[15:45], axis=0), axis=1))
+        raw_path = np.sum(np.linalg.norm(np.diff(raw[15:45], axis=0), axis=1))
+        still_ratio.append(cursor_path / raw_path)
+    assert np.mean(followed) >= 0.8
+    assert np.mean(still_ratio) < 0.25       # o cursor anda < 1/4 do que a estimativa anda
 
 
 def test_head_fine_tuner_directions_deadzone_and_resets():

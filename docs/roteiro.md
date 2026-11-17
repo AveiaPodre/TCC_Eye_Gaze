@@ -94,20 +94,110 @@ novas (45 calibrações, 15 com validação): LOO 119 px, validação 137 px
 - [x] Testado, **sem efeito mensurável**: piscada pela média dos 3 pares de
       pontos das pálpebras (as sessões gravadas só guardam quadros de olho
       aberto). Não adotado.
-- [ ] Refinamento semeado pelo MediaPipe: buscar o centro só a ~1 íris do
-      ponto do MediaPipe, com peso gaussiano. Precisa dos quadros do
-      vídeo: sessões com vídeo têm os timestamps de cada quadro, que
-      batem com os dos landmarks gravados.
-- [ ] Comparar o centróide com o método de gradientes (Timm e Barth, 2011)
-      nesses quadros.
+- [x] Testado nos quadros originais (9 calibrações com vídeo de 16/11):
+      centróide semeado pelo MediaPipe (peso gaussiano, σ = 1 e 0,7 raio)
+      e método de gradientes (Timm e Barth, 2011). Nenhum supera o
+      centróide atual (LOO 92 px, validação 90/68 px); os gradientes são
+      piores (LOO 109 px): a 720p a íris tem ~5 px de raio.
+- [x] Mistura MediaPipe/refinada na pupila (24 sessões): 50/50 (atual) é o
+      equilíbrio; 60% da refinada ganha ~2 px de acurácia e perde ~5 px de
+      tremor.
+- [x] Tempo de coleta por alvo: com metade (0,6 s), LOO +5% e validação
+      +1,5%; alongar a calibração não compensa.
+- [x] Resolução: a webcam do notebook de testes só entrega 1280×720 (em
+      todos os backends, com e sem MJPG). O ganho de resolução depende de
+      uma webcam externa (de preferência 1080p, embaixo do monitor).
 
 ## Fase 6: o desvio constante e a postura
 
-- [ ] O desvio da validação acompanha o deslocamento vertical do rosto
-      (correlação 0,68): investigar se a compensação da translação vertical
-      da cabeça está subestimada (ex.: escala da distância, âncora vertical).
+- [x] Investigação (metodologia, seção 5.11): não é deriva no tempo durante
+      a calibração (0,5 px/s); a postura explica no máximo ~30 px (~12 px
+      por grau de inclinação); há um viés de forma comum (+40 px em y nos
+      alvos internos); e a etapa da cabeça deixa um efeito passageiro de
+      ~200 px que contamina o começo da validação.
+- [x] Validação em ordem aleatória (separa tempo de posição do alvo).
+- [x] Modo pesquisa: validação imediata ANTES do teste da cabeça
+      (`HeadStageProcedure`, gravado em `cabeca_*.npz`; tecla K). Confirmar
+      com sessões novas que o desvio da validação imediata diminui.
+- [ ] Viés de forma: testar margem maior na grade (alvos menos colados na
+      borda, onde a pálpebra cobre a íris e a correção extrapola). Precisa
+      de sessões novas.
 - [ ] Posição da câmera configurável no monitor virtual (`gap_cm` com
       sinal); sessões com a webcam embaixo do monitor.
+
+## Fase 6b: precisão para alvos pequenos (sessão de 16/11 12:22)
+
+- [x] Modo A = âncora + cabeça: o olhar só teleporta o cursor (nova
+      fixação a > 20% da tela do cursor). Mexer a cabeça com os olhos
+      parados movia a estimativa ~25-28 px/grau (inclusive de lado); nos
+      dados do teste da cabeça, o movimento que não vinha da cabeça caiu
+      ~60%.
+- [x] Investigado nos 47 testes da cabeça gravados: NÃO há acoplamento
+      sistemático "inclinar a cabeça -> cursor para o lado" (−0,8 ± 9
+      px/grau; o −25 px/grau medido no uso vinha de mexer os olhos junto). O
+      que varia muito é a sensibilidade VERTICAL à inclinação: −11 ± 28 px
+      por grau, de sessão para sessão.
+- [ ] Compensação da cabeça fora do modo A: aprender, por sessão, a
+      sensibilidade vertical à inclinação com o teste da cabeça (hoje só
+      teste). Antes, ela entrava no ajuste e melhorava pouco a validação;
+      reavaliar com o teste da cabeça vindo depois da validação.
+- [x] Dwell-click no modo A só com o cursor parado (12 px): os 24 cliques
+      com ajuste fino saíam com o ajuste em andamento.
+- [x] Limite de giro do ajuste fino 6° → 10° (6° limitava o ajuste a
+      ~140 px, menos que o erro do olhar).
+- [ ] Gravar uma sessão com o modo A para medir o efeito (a reprodução de
+      uma sessão gravada não mostra o efeito interativo: a pessoa reagia ao
+      cursor antigo).
+- [ ] Clique por permanência acidental: 58 cliques em ~90 s de uso (um a
+      cada ~2 s). Avaliar dwell mais longo, ou, no modo A, clicar só depois
+      de um ajuste.
+
+## Fase 6c: cursor que segue o olhar (16/11, à tarde)
+
+- [x] Estabilizador novo (`GazeFollower`, "perseguição suave") no lugar da
+      trava: o cursor andava em blocos (seguia 0% dos movimentos sutis de
+      40 px e 5% dos de 70 px; agora 41% e 61%, em ~130 ms), com o cursor
+      parado em 72% dos quadros de fixação (97% antes) e o mesmo erro.
+- [x] Investigada a piora depois de mexer a cabeça (~208 px de mudança com a
+      cabeça de volta): não é o estado do rastreamento do MediaPipe
+      (reiniciá-lo não muda nada); o modo IMAGE reduz à metade mas triplica
+      o tremor. Causa em aberto; defesas: R (4 pontos) e correção contínua.
+- [x] Cursor "se movendo demais com a vista fixa": histerese no lugar da
+      perseguição suave (parado em 86% dos quadros com o olho fixo, contra
+      72%; segue 58% dos movimentos de 70 px, contra 62%).
+- [x] Bordas (sobretudo a de baixo, 148 px contra ~100 px no meio):
+      correção cúbica e abertura do olho na correção testadas, ganho de
+      0-4 px; não adotadas. Limite da medida da íris com a pálpebra.
+
+## Fase 6d: calibração em duas etapas (16/11, à noite)
+
+- [x] Removidos o clique com zoom e a firmeza ajustável por teclas (fora
+      do escopo: dificultavam o uso).
+- [x] Etapa 2 da calibração: 4 alvos internos depois da grade, ajuste com
+      os 16 pontos juntos. Nas 33 sessões com validação: erro nos alvos fora
+      do ajuste 105 → 85 px (−19%). Alvos diagonais da validação movidos
+      para 20/80% (independentes da calibração).
+- [x] Borda de baixo: a estimativa fica ~62 px ACIMA do alvo na última
+      linha (saturação: a pálpebra cobre a íris; o olho fecha ~25% olhando
+      para baixo); não é piscada falsa (nenhuma amostra perdida).
+- [x] Sessão de 16/11 17:17: validação 77 e 56 px (2,0° e 1,4°).
+- [x] Critério de aceitação: LOO > 4,7% da largura -> "recomendado refazer"
+      (ESPAÇO refaz sem salvar). LOO <= 90 px: validação 76 px; > 90: 123 px.
+      Repetir só pontos ruins ou juntar calibrações não ajudou.
+
+## Fase 6f: uso pleno sem teclado e desempenho (17/11)
+
+- [x] Lentidão com o clique e o modo de precisão: o app caía de ~31 para
+      13-16 fps depois dos primeiros cliques (segundo plano no Windows).
+      `system.py` desliga a desaceleração em segundo plano e mantém o
+      temporizador de 1 ms.
+- [x] Barra de controle pelo olhar na borda esquerda, centralizada na
+      altura (Mouse, Clique, Precisão, Recentralizar, Recalibrar); janela do
+      OpenCV sem moldura e sem roubar o foco (com o tkinter, os atalhos do
+      teclado paravam); o mouse liga sozinho depois da calibração.
+- [x] Uso do cursor reorganizado em `control.py` (`CursorControl`).
+- [ ] Sessão de uso real só pelo olhar (barra + clique + precisão) para
+      confirmar os ~30 fps e medir a taxa de acerto.
 
 ## Fase 7: uso real e documentação
 

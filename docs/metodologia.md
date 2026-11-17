@@ -294,7 +294,8 @@ continuamente.
 
 A solução usa a estrutura do próprio olhar. O olho alterna entre
 **fixações** (parado num ponto por 200–600 ms) e **sacadas** (saltos
-rápidos). O `FixationStabilizer` foi inspirado nos detectores de fixação por
+rápidos). Até 16/11, o `FixationStabilizer` (substituído pelo
+`GazeFollower`, seção 4.0) foi inspirado nos detectores de fixação por
 dispersão (I-DT; Salvucci e Goldberg, 2000):
 
 1. **Sacada:** uma amostra a mais de L px da média da fixação é candidata.
@@ -350,6 +351,58 @@ O One-Euro continua sendo usado, com parâmetros mais suaves, só nos ângulos
 mostrados no HUD e no mapeamento antes da calibração. O HUD mostra o ruído
 estimado (`ruido ~N px`). O minimapa mostra o ponto bruto (cinza) e o cursor
 estabilizado (amarelo).
+
+### 4.0 Versão de 16/11: perseguição suave no lugar da trava
+
+O usuário relatou que o cursor "só se move em grandes blocos" e não segue
+movimentos sutis do olhar. A causa era a trava: o raio crescia com o
+passeio medido da estimativa (mediana de 188 px numa sessão de uso), e
+movimentos menores que isso só apareciam como um salto quando o desvio
+acumulado passava do raio. O estabilizador passou a ser o `GazeFollower`:
+
+1. **sacada:** igual (limiar adaptativo, 2 amostras coerentes, salta para
+   a mais recente), seguida de uma acomodação rápida até a mediana das
+   amostras seguintes (8 quadros);
+2. **fixação:** o destino é a mediana das últimas 7 amostras; a cada
+   quadro o cursor anda uma fração α do caminho, com α = 0,01 abaixo de
+   1,6 × o ruído de quadro a quadro (só ruído: o cursor quase não se mexe),
+   α = 0,5 a partir de 2,5 × o ruído (movimento real) e transição linear
+   entre os dois. O ruído é o de quadro a quadro (MAD das diferenças), não
+   o passeio.
+
+**Bancada.** As validações gravadas (20 sessões, 180 alvos, ~1,2 s cada)
+com o ponto bruto de cada quadro; em cada alvo, a partir do 12º quadro,
+soma-se um degrau sintético (um movimento sutil do olho) ao ruído real.
+"Segue" = o cursor chega a menos de 40% do degrau do novo ponto e anda ao
+menos metade do degrau, até o fim do alvo (~0,7 s depois):
+
+| Filtro | segue 40 px | 70 px | 100 px | 150 px | cursor parado (olho parado) | tremor | erro no alvo |
+|---|---|---|---|---|---|---|---|
+| trava (até 16/11) | 0% | 5% | 11% | 75% | 97% | 1,3 px/quadro | 133 px |
+| trava menor (lock_k 1,5, teto 0,5) | 2% | 42% | 69% | 83% | 91% | 3,1 | 135 |
+| One-Euro na mediana (vários parâmetros) | 42-44% | 61-62% | 69-72% | 85-87% | 21-36% | 6,2-7,9 | 137-139 |
+| perseguição suave (16/11, à tarde) | 38-41% | 61-62% (133 ms) | 66% | 83% | 72% | 3,9 | 135 |
+| **histerese (adotada, 16/11 à noite)** | **28%** | **58%** (133 ms) | **64%** | **82%** | **86%** | **3,1** | **135** |
+
+O passeio da estimativa (~30-50 px com o olho parado) limita os degraus
+menores: qualquer filtro que siga um degrau de 40 px também segue um
+passeio de 40 px. A perseguição suave foi escolhida numa varredura (mediana
+de 5, 7 ou 9 quadros; limiares de 0,8 a 1,6 e de 2,5 a 3,5 × o ruído; α de
+0 a 0,01 e de 0,3 a 0,5) como o menor tremor entre os que seguem ao menos
+60% dos degraus de 70 px. O tremor com o olho parado é um deslize lento (o
+cursor acompanha devagar o passeio), não um salto.
+
+**Histerese (versão atual).** Com a perseguição suave o usuário relatou o
+cursor "se movendo demais com a vista fixa": ele deslizava sempre um pouco
+até o olhar e acompanhava o passeio. Na versão atual o cursor fica PARADO
+enquanto o destino (mediana de 7 amostras) está a menos de 4 × o ruído de
+quadro a quadro; ao passar disso, desliza (40% do caminho por quadro) até
+ficar a menos de 1 × o ruído e para de novo. Numa varredura (liga a 2,5 a
+4 × o ruído, desliga a 0,3 ou 1 ×, mediana de 7 ou 9), a combinação
+escolhida deixa o cursor parado em 86% dos quadros com o olho fixo (72% na
+perseguição suave), seguindo 58% dos movimentos de 70 px (62%).
+
+As seções 4.1 e 4.2 descrevem a versão com trava, mantidas como histórico.
 
 ### 4.1 Atraso do cursor
 
@@ -478,20 +531,50 @@ O modo híbrido (`filters.HeadFineTuner`, desligado por padrão) usa as duas:
    com zona morta de 0,3° (o balanço natural da cabeça não move o cursor),
    limite de 250 px, girar para a direita move para a direita e inclinar para
    cima move para cima;
-4. uma nova fixação (sacada ou deslocamento do olhar) zera o ajuste, e um
-   giro maior que 6° também (mudança de postura).
+4. **o olhar só "teleporta" o cursor**: cursor = âncora + ajuste da
+   cabeça, e a âncora só muda numa nova fixação a mais de 20% da largura
+   da tela do cursor (a pessoa olhou para outro lugar). Mudanças menores da
+   estimativa do olhar são ignoradas; um giro maior que 10° zera o ajuste
+   (mudança de postura);
+5. depois de um clique, o cursor fica onde clicou (a âncora vai para ele e
+   a cabeça vira a nova referência);
+6. o clique por permanência só sai com o cursor parado (tolerância de
+   12 px no modo A, contra 60 px fora dele).
 
-Enquanto a pessoa ajusta pela cabeça e continua olhando o alvo, o olho
-gira ao contrário da cabeça. Com a compensação da cabeça do modelo, a
-estimativa do olhar fica no lugar, dentro do raio de trava, e o ponto da
-fixação não muda. O ganho (25 px/grau) é menor que o físico (~38) para
+**Por que a âncora (sessão de 16/11 12:49).** Com os olhos parados, mexer a
+cabeça mexe a estimativa do olhar: ~28 px por grau na vertical (somando
+com o ajuste da cabeça, o cursor andava o dobro) e ~25 px por grau na
+HORIZONTAL ao inclinar a cabeça (o cursor "andava para o lado"). No modo A,
+96% do movimento do cursor vinha do ponto do olhar e 7,5% do ajuste da
+cabeça. Nas amostras do teste da cabeça (olhos fixos no centro, cabeça
+girando até ±12°), o movimento do cursor que NÃO vinha da cabeça caiu de
+545 para 220 px/s e de 1.146 para 437 px/s (saltos de 16 para 6 e de 31
+para 11); o que sobra são giros grandes, em que a estimativa se afasta
+mais que o limite de teleporte. Em ajustes de até ~5° (~125 px), o cursor
+responde só à cabeça. Permitir o teleporte só com a cabeça parada foi
+testado e não teve ganho consistente.
+
+**Antes (sessão de 16/11 12:22, ~3,5 min de uso com o modo A).** Para ajustar o cursor com a cabeça, a pessoa olha para o
+CURSOR, que está deslocado do alvo pelo erro do olhar (100-200 px). Esse
+salto do olhar era tomado como uma nova fixação: o ajuste era zerado e o
+cursor pulava para o novo ponto do olhar, num ciclo que impedia ajustes
+delicados (23 ajustes de mais de 15 px perdidos assim, 43 px na mediana).
+Além disso, o raio de trava do estabilizador chegou a 188 px (mediana):
+movimentos do olhar menores que isso não movem o cursor, e o ajuste pela
+cabeça é a única forma de chegar a um alvo pequeno. E, com a tolerância de
+60 px do clique por permanência, os 24 cliques feitos com ajuste fino
+saíram com o ajuste ainda em andamento (e a correção contínua, seção 7.3,
+aprendia com esses pontos incompletos). O limite de giro também subiu de
+6° para 10°: a 25 px/grau, 6° limitavam o ajuste a ~140 px, menos que o
+erro do olhar. O ganho (25 px/grau) é menor que o físico (~38) para
 favorecer a precisão. Serve só para quem tem algum controle da cabeça; o
 modo só com o olhar continua sendo o padrão.
 
 ## 5. Etapa 5: calibração com vários pontos (`calibration.py`, `procedures.py`)
 
-A pessoa olha para alvos conhecidos (grade 3×4, ~30 s). Com essas amostras,
-a calibração ajusta, em ordem:
+A pessoa olha para alvos conhecidos em duas etapas: a grade 3×4 e, depois,
+4 alvos internos (refinamento; ~35 s no total). Com todas as amostras
+juntas, a calibração ajusta, em ordem:
 
 1. o **globo ocular** de cada olho (seção 5.2), que faz o feixe passar pelo
    alvo;
@@ -599,6 +682,48 @@ tem o sinal mais fraco e precisa das 4 linhas. A grade passou para 3×4
 (de ~45–60 s para ~25–30 s, contando as checagens do centro que
 existiam).
 
+**Etapa 2: refinamento (16/11, à noite).** As plataformas de referência
+calibram, validam com alvos novos e recalibram (EyeLink: calibração de 9
+ou 13 pontos seguida de validação; Tobii: recalibração dos pontos ruins).
+O teste com os dados gravados: em cada uma das 33 sessões com validação
+gravada logo depois da calibração, os alvos da validação foram somados à
+grade como pontos de calibração e o erro foi medido nos alvos que ficaram
+de fora.
+
+| Calibração | erro nos alvos fora do ajuste |
+|---|---|
+| só a grade | 105-111 px |
+| grade + os outros 8 alvos internos (validação cruzada) | 86 px |
+| **grade + 4 alvos nos quadrantes (30/70%)** | **85 px** (base 105) |
+| grade + 4 quadrantes + centro | 86 px (base 106) |
+| grade + cruz (centro, 20/80% na vertical, 15/85% na horizontal) | 95 px (base 119) |
+
+Quatro alvos internos dão quase todo o ganho (−19%), por ~9 s a mais. O
+ganho vem de cobrir melhor o interior e de os pontos serem vistos logo
+antes do uso (parte do desvio constante, seção 5.11, já entra no ajuste).
+A calibração passou a ter a etapa 2 (`CalibrationConfig.refine_points`),
+e os 4 alvos diagonais da validação saíram de 30/70% para 20/80% da tela,
+para a validação continuar independente da calibração. Nas duas primeiras
+calibrações gravadas com a etapa 2 (16/11 17:17), a validação nos novos
+alvos deu 77 e 56 px (2,0° e 1,4°; a segunda é o menor erro do projeto).
+
+**Critério de aceitação (16/11, à noite).** A qualidade varia muito entre
+calibrações da mesma sessão (LOO de 116 e 51 px nas duas acima). Testado
+nas 35 sessões com validação:
+
+| Estratégia | validação |
+|---|---|
+| repetir só os pontos ruins (regra atual: > 2,5× a mediana e > 154 px) | 107 px (sem repetir: 108) |
+| repetir com regras mais rígidas (até 2,4 pontos por calibração) | 107 px |
+| juntar duas calibrações seguidas num ajuste só | 108 px (só a mais recente: 90; só a anterior: 184) |
+| calibrações com LOO <= 90 px (11 sessões) / > 90 px (24) | 76 / 123 px |
+
+O problema é a calibração inteira (postura, luz, ruído naquele momento), não
+pontos isolados, e uma calibração "envelhece" em minutos. A tela de
+resultado passou a recomendar refazer quando o LOO passa de 4,7% da
+largura da tela (`CalibrationConfig.redo_loo_frac`, ~90 px em 1920 px): o
+ESPAÇO refaz na hora, sem salvar a calibração ruim; outra tecla aceita.
+
 Para cada alvo, a coleta começa quando o olhar **fixa** no alvo: depois de
 0,6 s de acomodação, espera-se que 6 quadros seguidos fiquem a menos de 0,8°
 da mediana deles, com limite de 1,8 s. Assim, as primeiras amostras não são
@@ -608,19 +733,24 @@ válidas. Se o rosto sumir, o alvo espera até juntar pelo menos 8 amostras.
 Em cada alvo, amostras com escore-Z modificado (MAD) > 3,5 são descartadas
 (Iglewicz e Hoaglin, 1993).
 
-**Etapa da cabeça (só no modo pesquisa, `--pesquisa` ou `--gravar`):** o
-alvo fica no centro da tela e uma seta pede que a pessoa gire a cabeça para
+**Teste da cabeça (`HeadStageProcedure`; no modo pesquisa, roda sozinho
+depois da validação imediata; tecla `K` a qualquer momento):** o alvo fica
+no centro da tela e uma seta pede que a pessoa gire a cabeça para
 a direita, a esquerda, para cima e para baixo, sem tirar o olho do alvo, e
 depois volte ao centro. A seta enche conforme a cabeça gira (medida em
-relação à pose mediana durante a grade) e fica verde ao chegar a 80% do
+relação à pose de referência do modelo, a mediana da grade ou a da última
+recentralização) e fica verde ao chegar a 80% do
 ângulo pedido (10° de yaw e 8° de pitch). Depois de 0,6 s ali, passa à
 próxima direção. Quem não alcança o ângulo segue depois de 4 s. Se a
 cabeça passar de 15° de yaw ou 12° de pitch, a seta fica vermelha e
 aparece "girou demais": sem guia, as pessoas giravam até 30° (yaw) e 40°
 (pitch), ângulos em que os landmarks do olho deixam de ser confiáveis.
 Essas amostras **não entram no ajuste**: medem o erro com a cabeça em
-poses novas (seção 5.5). No modo usuário (padrão) a etapa não existe: ela
-é inadequada para quem não consegue mover a cabeça.
+poses novas (seção 5.5), gravado em `model.info` e em
+`results/cabeca_<data>.npz`. Até 16/11 a etapa vinha logo depois da grade,
+antes da validação, e o efeito passageiro dos giros contaminava a
+validação (seção 5.11). No modo usuário (padrão) ela não roda: é
+inadequada para quem não consegue mover a cabeça.
 
 **Calibração manual (tecla C).** Cada alvo só avança quando o usuário,
 olhando para ele, aperta ESPAÇO ou ENTER. As amostras usadas são as de 1 s
@@ -893,6 +1023,100 @@ Conclusões:
   pixels que a 720p padrão (`--width 1920 --height 1080`, se a webcam
   suportar). Não há sessões gravadas em 1080p para medir.
 
+### 5.11 De onde vem o desvio constante (análise de 16/11)
+
+Nas validações, o erro bruto (137 px) é dominado por um desvio constante
+(~106 px em média, de 7 a 332 px conforme a sessão; sem ele, 82 px). Quatro
+hipóteses foram testadas com as 45 calibrações gravadas (15 com validação):
+
+1. **Deriva no tempo durante a calibração.** Com a grade em ordem
+   aleatória, o erro de cada alvo deixado fora do ajuste (com sinal) foi
+   comparado ao instante em que o alvo foi visto: 0,5 px/s (correlação
+   0,07). Não há deriva mensurável em ~25 s.
+2. **Mudança de postura.** Na etapa da cabeça (olhar fixo no centro, fora
+   do ajuste; 6.661 amostras com até ±15°/±12°), o erro vertical acompanha a
+   inclinação da cabeça em ~12 px por grau (~47 px por cm de deslocamento
+   vertical do rosto; rotação e translação andam juntas, correlação −0,96,
+   e não dá para separá-las). Entre calibrar e validar, a postura mudou em
+   geral menos de 2° e 1 cm: isso explica no máximo ~30 px.
+3. **Viés de forma do modelo.** O erro com sinal dos alvos fora do ajuste
+   depende da posição: +15 a +44 px em y nos alvos internos e −67 px na
+   última linha (a correção extrapola para dentro). Na validação, só com
+   alvos internos, o desvio médio das 15 sessões é (+34, +45) px: parte do
+   desvio é esse viés, comum a todas as sessões.
+4. **Efeito da etapa da cabeça (modo pesquisa).** Com a cabeça de volta à
+   pose da grade (< 2°) e o olhar no centro, o erro no FIM da etapa da
+   cabeça foi de ~207 px, quase sempre para cima (y de −115 a −358 px na
+   maioria das sessões). O primeiro alvo da validação, logo depois e sempre
+   o centro, tinha y negativo em 11 de 15 sessões, enquanto os demais alvos
+   tinham y positivo na maioria. A etapa da cabeça deixa um efeito
+   passageiro (postura que não volta exatamente, ou a malha do MediaPipe
+   que se acomoda de outro jeito depois de giros grandes), que contamina o
+   começo da validação. Isso também explica por que reancorar pelo centro
+   (o primeiro alvo) piorava o erro (seção 7).
+
+Como a ordem da validação era fixa (o centro sempre primeiro), o tempo
+desde a etapa da cabeça e a posição do alvo ficavam confundidos. A partir
+de 16/11 os alvos da validação são visitados em ordem aleatória (e o JSON
+registra a ordem de cada alvo), e no modo pesquisa a validação imediata
+vem ANTES do teste da cabeça, para que ela meça o modelo e não o efeito da
+etapa (no modo usuário a etapa não existe).
+
+**A precisão depois de mexer a cabeça (16/11, à tarde).** Nos testes da
+cabeça das 5 calibrações de 16/11 com vídeo, com a cabeça de volta a menos
+de 2° da pose da grade e o olhar no mesmo ponto, o erro mudou 90-330 px
+(média 208 px) entre antes e depois dos giros, quase sempre para cima; a
+postura em si explicaria ~30 px. Reprocessando os quadros dos vídeos:
+
+| MediaPipe | mudança depois dos giros | precisão RMS | validação (sem desvio) |
+|---|---|---|---|
+| modo VIDEO (rastreamento entre quadros, o usado) | 208 px | 30 px | 99 (66) px |
+| modo IMAGE (detecção do rosto em cada quadro) | 100 px | 85 px | 131 (87) px |
+| VIDEO, reiniciando o rastreamento com a cabeça parada depois de um giro > 5° | 217 px | 36 px | 115 (76) px |
+
+O modo IMAGE reduz o efeito à metade, mas quase triplica o tremor (o recorte
+do rosto muda a cada quadro, e a posição dos landmarks depende do recorte:
+o mesmo quadro dá um viés de −400 a −600 px em y entre os dois modos).
+Reiniciar o rastreamento não muda nada, então o efeito não é o estado do
+rastreamento. A causa continua aberta; as defesas são a recentralização de
+4 pontos (seção 7.1) e a correção contínua pelos cliques (seção 7.3).
+
+**Medida da íris (16/11, à tarde).** Com os quadros originais das 9
+calibrações de 16/11 que têm vídeo e validação, o centro refinado da íris
+foi recalculado com outras medidas (fonte da pupila: média com o MediaPipe):
+
+| Medida do centro da íris | LOO | validação (sem desvio) | precisão RMS |
+|---|---|---|---|
+| **centróide dos pixels escuros (atual)** | **92 px** | **90 (68) px** | 34 px |
+| centróide semeado pelo MediaPipe (peso gaussiano, σ = 1 raio) | 94 | 92 (69) | 33 |
+| idem, σ = 0,7 raio | 95 | 93 (70) | 32 |
+| gradientes (Timm e Barth, 2011) | 109 | 92 (69) | 35 |
+| só o MediaPipe | 108 | 104 (79) | 21 |
+
+Nenhuma supera a atual. Nas 24 sessões com validação, o peso da medida
+refinada na média com o MediaPipe varia a acurácia e o tremor em sentidos
+opostos (0,25: validação 130 px, RMS 28; 0,5: 119 px, RMS 37; 0,75: 116 px,
+RMS 48); 0,5 continua. Coletar metade das amostras por alvo (0,6 s) piora
+o LOO em 5% e a validação em 1,5%: alongar a coleta não compensa. O
+próximo ganho provável é a resolução da imagem (1080p), ainda sem sessões
+gravadas para medir.
+
+**Bordas da tela (16/11, à noite).** Erro em pontos novos (LOO) por
+posição do alvo, nas 60 calibrações gravadas: linha de cima (5%) 119 px,
+linhas internas 88-104 px, linha de baixo (95%) 148 px; colunas laterais
+123-129 px, coluna central 92 px. Duas tentativas de melhorar as bordas:
+
+| Variante | LOO | borda de cima | borda de baixo | validação |
+|---|---|---|---|---|
+| correção até quadrática (atual) | 114 | — | 143 | 113 (75) |
+| + termos cúbicos (u³, v³; escolhidos por validação cruzada) | 113 | — | 142 | 114 (75) |
+| + abertura do olho (padronizada) na correção | 118 (base 120) | 114 (base 117) | 145 (base 149) | — |
+
+Nenhuma muda o quadro: nos extremos, sobretudo olhando para baixo, a
+pálpebra cobre a íris e o centro medido deixa de acompanhar o olho; a
+correção não recupera um sinal que a medida não tem. O clique com zoom
+(seção 8.1) é a forma de clicar com precisão também nas bordas.
+
 ## 6. Validação (`procedures.py` → `ValidationProcedure`)
 
 A validação usa **9 alvos diferentes dos da calibração** (centro,
@@ -1026,7 +1250,58 @@ Regras de segurança:
 
 - o mouse só liga com calibração;
 - sem rosto no frame, o cursor fica parado;
-- o dwell é reiniciado sempre que o controle é interrompido.
+- o dwell é reiniciado sempre que o controle é interrompido;
+- olhar para a barra de controle nunca gera clique do sistema.
+
+### 8.0 Uso sem teclado: barra de controle pelo olhar (`gaze_bar.py`, `control.py`)
+
+O público do projeto muitas vezes não usa teclado. Como nas barras do Tobii
+Dynavox e do Windows Eye Control, uma coluna de 5 botões grandes (170 × 100
+px, maiores que o erro típico do olhar) fica na borda esquerda da tela,
+centralizada na altura, durante o uso (longe dos menus e da barra de título,
+no topo, e da barra de tarefas, embaixo):
+Mouse (pausa/religa), Clique (por permanência), Precisão (ajuste pela
+cabeça), Recentralizar e Recalibrar. Olhar 1,2 s para um botão o aciona,
+com intervalo de 1,5 s entre acionamentos. A barra fica colada na borda de
+esquerda: um olhar estimado à esquerda da tela ainda cai no botão (borda
+"infinita", lei de Fitts). A barra funciona
+com o mouse pausado, e olhar para ela não gera clique do sistema. Depois de
+uma calibração (ou da recentralização ao abrir o app), o mouse liga
+sozinho. Desenhar a barra custa ~4 ms quando algo muda e ~0,15 ms quando
+nada muda (ela só é redesenhada quando um estado ou o progresso muda).
+
+A janela da barra é do próprio OpenCV, sem moldura, sempre na frente e sem
+roubar o foco (estilos do Windows ajustados pela API do sistema). A primeira
+versão usava o tkinter, que a cada quadro processava todas as mensagens do
+programa, inclusive as teclas destinadas à janela da câmera: os atalhos do
+teclado paravam de funcionar.
+
+O uso do cursor (mouse, clique por permanência, modo de precisão, correção
+contínua e barra) fica em `control.CursorControl`; o `app.py` cuida da
+câmera, do pipeline, dos procedimentos e do desenho.
+
+### 8.0.1 Desempenho em segundo plano (`system.py`)
+
+Nas sessões gravadas de 16/11, com o clique por permanência e o modo de
+precisão ligados, o app caía de ~31 para 13-16 quadros por segundo depois
+dos primeiros cliques e não voltava, mesmo com o clique desligado (sessão
+12:22: 31,2 fps antes, 12,8 fps depois, 20,8 fps com o clique já
+desligado). O processamento não explica isso: um quadro leva ~15 ms
+(MediaPipe com a íris refinada 8,4 ms, desenho da câmera 3,8 ms, modelo
+0,8 ms), contra 33 ms entre quadros da câmera. O clique cai em outra janela
+e o app passa para segundo plano; o Windows 11 desacelera processos em
+segundo plano (EcoQoS) e ignora o temporizador de 1 ms deles, e cada espera
+curta do laço vira ~15 ms. Ao iniciar, o app pede prioridade acima do
+normal e desliga essas duas desacelerações para o próprio processo
+(`SetProcessInformation` com `ProcessPowerThrottling`, e `timeBeginPeriod(1)`).
+
+### 8.1 Clique com zoom (removido)
+
+Em 16/11 o app teve um clique com zoom (o primeiro clique por permanência
+abria uma lupa 3× em volta do cursor e o segundo clicava no ponto
+correspondente, dividindo o erro do olhar por 3). Foi removido a pedido do
+usuário: a etapa extra dificultava o uso da ferramenta, e o foco passou a
+ser a precisão da calibração e da detecção.
 
 ## 9. Visualização em tempo real (`visualization.py`)
 
