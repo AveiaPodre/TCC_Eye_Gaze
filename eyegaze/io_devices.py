@@ -1,10 +1,15 @@
 """
-Entrada (câmera / arquivo de vídeo), tamanho da tela e controle do mouse.
+Entrada (câmera / arquivo de vídeo / sessão gravada), gravação de sessões,
+tamanho da tela e controle do mouse.
 """
 
 from __future__ import annotations
 
+import json
+import queue
+import threading
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -17,37 +22,246 @@ class FrameSource:
     câmera: grave uma sessão e rode o pipeline sobre ela.
     """
 
+    BACKENDS = {"auto": cv2.CAP_ANY, "dshow": cv2.CAP_DSHOW, "msmf": cv2.CAP_MSMF}
+
     def __init__(self, camera_index: int = 0, video_path: str | None = None,
-                 width: int = 1280, height: int = 720, fps: int = 30):
+                 width: int = 1280, height: int = 720, fps: int = 30,
+                 backend: str = "auto", mjpg: bool = True, exposure: float | None = None,
+                 autofocus: bool = True):
         self.is_file = video_path is not None
-        self.cap = cv2.VideoCapture(video_path if self.is_file else camera_index)
+        if self.is_file:
+            self.cap = cv2.VideoCapture(video_path)
+        else:
+            self.cap = cv2.VideoCapture(camera_index, self.BACKENDS.get(backend, cv2.CAP_ANY))
         if not self.cap.isOpened():
             what = video_path if self.is_file else f"câmera {camera_index}"
             raise RuntimeError(f"Não foi possível abrir {what}. "
-                               "Tente outro índice com --camera N.")
+                               "Tente outro índice com --camera N ou outro --backend.")
         if not self.is_file:
+            if mjpg:
+                # O formato precisa vir ANTES da resolução: alguns drivers só
+                # oferecem resoluções altas a 30 fps em MJPG.
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             self.cap.set(cv2.CAP_PROP_FPS, fps)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # ignorado por alguns drivers
+            if exposure is not None:
+                # 0.25 = exposição manual no DirectShow; o MSMF usa 0/1. Cada
+                # driver aceita ou ignora; o valor lido é mostrado no início.
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, float(exposure))
+            if not autofocus:
+                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
         self._t0 = time.monotonic()
+        # Fps REAL (medido pela thread de leitura), não o pedido ao driver.
+        self._grab_times: list[float] = []
+        # Webcam: uma thread lê a câmera sem parar e guarda só o quadro mais
+        # recente. Com leitura síncrona, quando o processamento de um quadro
+        # passava de ~33 ms (calibração/validação, gravação), o driver
+        # acumulava quadros e o app processava imagens cada vez mais velhas:
+        # atraso de vários quadros antes mesmo do estabilizador.
+        self._latest: tuple[np.ndarray, int] | None = None
+        self._new = threading.Event()
+        self._stop = False
+        self._failed = False
+        self._thread = None
+        if not self.is_file:
+            self._thread = threading.Thread(target=self._grab, daemon=True)
+            self._thread.start()
+
+    def _grab(self):
+        while not self._stop:
+            ok, frame = self.cap.read()
+            if not ok:
+                self._failed = True
+                self._new.set()
+                return
+            now = time.monotonic()
+            self._latest = (frame, int((now - self._t0) * 1000))
+            self._grab_times.append(now)
+            if len(self._grab_times) > 90:
+                del self._grab_times[:-90]
+            self._new.set()
 
     def read(self) -> tuple[np.ndarray | None, int]:
-        ok, frame = self.cap.read()
-        if not ok:
-            return None, 0
         if self.is_file:
-            ts = int(self.cap.get(cv2.CAP_PROP_POS_MSEC))
-        else:
-            ts = int((time.monotonic() - self._t0) * 1000)
-        return frame, ts
+            ok, frame = self.cap.read()
+            if not ok:
+                return None, 0
+            return frame, int(self.cap.get(cv2.CAP_PROP_POS_MSEC))
+        # Espera um quadro NOVO (não reprocessa o mesmo) e pega o mais recente;
+        # os intermediários são descartados.
+        if not self._new.wait(timeout=2.0) or self._failed or self._latest is None:
+            return None, 0
+        self._new.clear()
+        return self._latest
 
     @property
     def resolution(self) -> tuple[int, int]:
         return (int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
                 int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 
+    @property
+    def measured_fps(self) -> float | None:
+        """Fps real da câmera nos últimos ~3 s (None se ainda não deu para medir)."""
+        t = list(self._grab_times)
+        if len(t) < 10:
+            return None
+        return (len(t) - 1) / max(t[-1] - t[0], 1e-6)
+
+    def describe(self) -> str:
+        """Formato, fps pedido ao driver e exposição, para o log de início."""
+        cc = int(self.cap.get(cv2.CAP_PROP_FOURCC))
+        fourcc = "".join(chr((cc >> 8 * i) & 0xFF) for i in range(4)).strip("\x00") or "?"
+        return (f"formato {fourcc}, fps do driver {self.cap.get(cv2.CAP_PROP_FPS):.0f}, "
+                f"exposição {self.cap.get(cv2.CAP_PROP_EXPOSURE):.1f}, "
+                f"backend {self.cap.getBackendName()}")
+
+    def release(self):
+        self._stop = True
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self.cap.release()
+
+
+class SessionRecorder:
+    """Grava a sessão para reprodução offline: vídeo da câmera (MJPG, pouca
+    perda de detalhe na região dos olhos) + JSON com o timestamp de cada
+    quadro, as teclas pressionadas (com o índice do quadro) e a tela.
+
+    Tamanho: ~2-4 MB/s em 720p. Ver ReplaySource e ``main.py --reproduzir``.
+    """
+
+    def __init__(self, base_path: Path, fps: float, frame_size: tuple[int, int],
+                 screen_size: tuple[int, int], seed: int,
+                 screen_width_cm: float | None = None, protocol: dict | None = None):
+        self.base = Path(base_path)
+        self.base.parent.mkdir(parents=True, exist_ok=True)
+        self.video_path = self.base.with_suffix(".avi")
+        self.meta_path = self.base.with_suffix(".json")
+        self._writer = cv2.VideoWriter(str(self.video_path), cv2.VideoWriter_fourcc(*"MJPG"),
+                                       float(fps), tuple(int(v) for v in frame_size))
+        if not self._writer.isOpened():
+            raise RuntimeError(f"Não foi possível gravar {self.video_path}")
+        self.meta = {"versao": 1, "tela": list(screen_size), "camera": list(frame_size),
+                     "fps": fps, "semente": int(seed), "tela_cm": screen_width_cm,
+                     "protocolo": protocol,
+                     "timestamps_ms": [], "teclas": [],
+                     # Por quadro: tempo de processamento (ms) e estado do uso
+                     # (bits: mouse, clique, precisão, procedimento).
+                     "proc_ms": [], "estado": []}
+        # A compressão MJPG (~3,5 ms por quadro em 720p) roda numa thread:
+        # no laço principal, ela empurrava o tempo por quadro para perto dos
+        # 33 ms entre quadros da câmera.
+        self._queue: queue.Queue = queue.Queue(maxsize=120)
+        self._thread = threading.Thread(target=self._write_loop, daemon=True)
+        self._thread.start()
+
+    def _write_loop(self):
+        while True:
+            frame = self._queue.get()
+            if frame is None:
+                break
+            self._writer.write(frame)
+
+    @property
+    def frame_index(self) -> int:
+        """Índice do último quadro gravado."""
+        return len(self.meta["timestamps_ms"]) - 1
+
+    def write(self, frame: np.ndarray, timestamp_ms: int):
+        self._queue.put(frame)       # bloqueia só se a thread atrasar 4 s
+        self.meta["timestamps_ms"].append(int(timestamp_ms))
+
+    def log_frame(self, proc_ms: float, state: int):
+        self.meta["proc_ms"].append(round(float(proc_ms), 1))
+        self.meta["estado"].append(int(state))
+
+    def log_key(self, key: int):
+        self.meta["teclas"].append([self.frame_index, int(key)])
+
+    def close(self):
+        self._queue.put(None)
+        self._thread.join()
+        self._writer.release()
+        self.meta_path.write_text(json.dumps(self.meta), encoding="utf-8")
+        print(f"[Gravação] {len(self.meta['timestamps_ms'])} quadros em {self.video_path}")
+
+
+class ReplaySource:
+    """Lê uma sessão gravada por SessionRecorder com os timestamps originais.
+
+    ``now()`` devolve o tempo do quadro atual (s), para usar como relógio do
+    app: a reprodução é determinística e independe da velocidade do PC.
+    ``keys_for_frame(i)`` devolve as teclas pressionadas depois do quadro i.
+    """
+
+    is_file = True
+
+    def __init__(self, meta_path: Path):
+        meta_path = Path(meta_path).with_suffix(".json")
+        self.meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        self.cap = cv2.VideoCapture(str(meta_path.with_suffix(".avi")))
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Não foi possível abrir {meta_path.with_suffix('.avi')}")
+        self._ts = self.meta["timestamps_ms"]
+        self._keys: dict[int, list[int]] = {}
+        for idx, key in self.meta["teclas"]:
+            self._keys.setdefault(int(idx), []).append(int(key))
+        self.frame_index = -1
+
+    @property
+    def screen_size(self) -> tuple[int, int]:
+        return tuple(self.meta["tela"])
+
+    @property
+    def seed(self) -> int:
+        return int(self.meta["semente"])
+
+    @property
+    def screen_width_cm(self) -> float | None:
+        """Largura física da tela gravada (None em gravações antigas)."""
+        return self.meta.get("tela_cm")
+
+    @property
+    def protocol(self) -> dict | None:
+        """Protocolo da calibração gravado (None em gravações antigas)."""
+        return self.meta.get("protocolo")
+
+    @property
+    def resolution(self) -> tuple[int, int]:
+        return tuple(self.meta["camera"])
+
+    def read(self) -> tuple[np.ndarray | None, int]:
+        ok, frame = self.cap.read()
+        if not ok or self.frame_index + 1 >= len(self._ts):
+            return None, 0
+        self.frame_index += 1
+        return frame, self._ts[self.frame_index]
+
+    def now(self) -> float:
+        return self._ts[max(self.frame_index, 0)] / 1000.0
+
+    def keys_for_frame(self, index: int) -> list[int]:
+        return self._keys.get(index, [])
+
     def release(self):
         self.cap.release()
+
+
+class NullMouse:
+    """Mouse que não faz nada (reprodução de sessões gravadas)."""
+
+    def __init__(self):
+        self.enabled = False
+        self.available = True
+
+    def move(self, x: float, y: float):
+        pass
+
+    def click(self):
+        pass
 
 
 def detect_screen_size() -> tuple[int, int] | None:
@@ -68,6 +282,37 @@ def detect_screen_size() -> tuple[int, int] | None:
         return size
     except Exception:  # noqa: BLE001
         return None
+
+
+def detect_screen_width_cm(screen_size: tuple[int, int] | None = None) -> float | None:
+    """Largura física do monitor principal em cm, ou None se não der.
+
+    No Windows, ``GetDeviceCaps(HORZSIZE/VERTSIZE)`` devolve o tamanho
+    físico informado pelo monitor (EDID), em mm. O valor só é aceito se for
+    plausível (15-300 cm) e se a proporção bater com a da resolução (até
+    10% de diferença): projetores e alguns adaptadores informam 0 ou
+    valores genéricos. Nos outros sistemas, use --screen-width-cm.
+    """
+    import sys
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+        user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+        dc = user32.GetDC(0)
+        try:
+            w_mm, h_mm = gdi32.GetDeviceCaps(dc, 4), gdi32.GetDeviceCaps(dc, 6)
+        finally:
+            user32.ReleaseDC(0, dc)
+    except Exception:  # noqa: BLE001
+        return None
+    if not (150 <= w_mm <= 3000 and h_mm > 0):
+        return None
+    if screen_size is not None:
+        aspect_px = screen_size[0] / screen_size[1]
+        if abs((w_mm / h_mm) / aspect_px - 1.0) > 0.10:
+            return None
+    return w_mm / 10.0
 
 
 class MouseController:

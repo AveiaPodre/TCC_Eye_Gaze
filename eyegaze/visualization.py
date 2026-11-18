@@ -13,6 +13,8 @@ import numpy as np
 
 from .face_tracker import FaceObservation
 from .gaze import GazeSample
+from .eyeball import RADIUS_CM
+from .geometry import cm_to_px, focal_px
 from .landmarks import LEFT_EYE, RIGHT_EYE
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -53,19 +55,40 @@ def draw_landmarks(img, obs: FaceObservation):
 
 
 def draw_gaze(img, sample: GazeSample):
-    ray_len = 2.5 * sample.head.scale_px
-    for eye in sample.eyes:
-        color = (255, 255, 0) if eye.open else (120, 120, 120)
-        cv2.circle(img, _p(eye.eyeball_center_px), max(2, int(eye.eyeball_radius_px)),
-                   color, 1, cv2.LINE_AA)
-        cv2.circle(img, _p(eye.iris_px), 3, color, -1, cv2.LINE_AA)
-        if eye.open:
-            end = eye.iris_px + eye.direction_cam * ray_len
-            cv2.line(img, _p(eye.iris_px), _p(end), (0, 255, 120), 1, cv2.LINE_AA)
-    if sample.direction_cam is not None:
-        origin = np.mean([e.iris_px for e in sample.eyes], axis=0)
-        end = origin + sample.direction_cam * ray_len * 1.4
-        cv2.arrowedLine(img, _p(origin), _p(end), (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.15)
+    """Etapas 2-3 sobre a imagem, para cada olho:
+
+    * o globo (círculo, raio = 0,4 × largura do olho, em volta do centro),
+      com o tamanho de um olho real;
+    * a pupila MEDIDA (ponto verde) e a pupila CORRIGIDA pelo ganho da
+      calibração (anel laranja, onde o feixe sai do globo): o MediaPipe
+      encolhe o movimento da íris, e a distância entre as duas mostra essa
+      correção;
+    * o feixe, do centro do globo pela pupila corrigida;
+
+    e o vetor do olhar a partir do ponto entre os olhos (seta amarela)."""
+    gaze = sample.gaze
+    if gaze is None:
+        for eye in sample.eyes:
+            cv2.circle(img, _p(eye.iris_px), 3, (120, 120, 120), -1, cv2.LINE_AA)
+        return
+    size = (img.shape[1], img.shape[0])
+    f = focal_px(size[0])
+    for k in range(2):
+        c_px = cm_to_px(gaze.centers[k], size)
+        z = max(float(gaze.centers[k][2]), 1e-3)
+        color = (255, 255, 0) if gaze.open[k] else (120, 120, 120)
+        r = RADIUS_CM if gaze.radii is None else float(gaze.radii[k])
+        cv2.circle(img, _p(c_px), max(2, int(round(f * r / z))), color, 1, cv2.LINE_AA)
+        cv2.circle(img, _p(c_px), 2, color, -1, cv2.LINE_AA)
+        cv2.circle(img, _p(sample.eyes[k].iris_px), 2, (0, 255, 120), -1, cv2.LINE_AA)
+        if gaze.open[k]:
+            cv2.circle(img, _p(cm_to_px(gaze.corrected[k], size)), 4, (0, 140, 255), 1,
+                       cv2.LINE_AA)
+            far = cm_to_px(gaze.centers[k] + 6.0 * gaze.directions[k], size)
+            cv2.line(img, _p(c_px), _p(far), (0, 255, 120), 1, cv2.LINE_AA)
+    o_px = cm_to_px(gaze.origin, size)
+    end = cm_to_px(gaze.origin + 9.0 * gaze.direction, size)
+    cv2.arrowedLine(img, _p(o_px), _p(end), (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.15)
 
 
 def draw_head_pose(img, sample: GazeSample):
@@ -80,6 +103,17 @@ def draw_head_pose(img, sample: GazeSample):
 
 
 # ------------------------------------------------------------------- HUD
+def shade(img, x0, y0, x1, y1, color, alpha: float):
+    """Escurece um retângulo (fundo semitransparente) só na região dele:
+    misturar a imagem inteira custava ~1 ms por painel em 720p."""
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = max(x0, 0), max(y0, 0), min(x1 + 1, w), min(y1 + 1, h)
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = img[y0:y1, x0:x1]
+    cv2.addWeighted(np.full_like(roi, color), alpha, roi, 1.0 - alpha, 0, roi)
+
+
 def draw_minimap(img, screen_size, point, raw_point, trail, targets, dwell_progress,
                  calibrated: bool):
     sw, sh = screen_size
@@ -88,9 +122,7 @@ def draw_minimap(img, screen_size, point, raw_point, trail, targets, dwell_progr
     mh = int(mw * sh / sw)
     x0, y0 = w - mw - 12, h - mh - 12
 
-    overlay = img.copy()
-    cv2.rectangle(overlay, (x0, y0), (x0 + mw, y0 + mh), (30, 30, 30), -1)
-    cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
+    shade(img, x0, y0, x0 + mw, y0 + mh, (30, 30, 30), 0.7)
     cv2.rectangle(img, (x0, y0), (x0 + mw, y0 + mh), (200, 200, 200), 1)
 
     def to_map(p):
@@ -121,14 +153,19 @@ def draw_status(img, lines: list[tuple[str, tuple[int, int, int]]]):
 
 
 HELP_LINES = [
-    "ESPACO/C  calibrar (9 pontos)",
-    "T  validar (mede erro)",
-    "R  recentralizar (1 ponto)",
+    "ESPACO  calibrar (automatica)",
+    "C  calibrar (manual: olhe + ESPACO)",
+    "T  reteste (mede e corrige desvio)",
+    "R  recentralizar (4 pontos)",
+    "K  teste da cabeca",
+    "Barra na esquerda: controle pelo olhar",
     "M  liga/desliga mouse",
     "D  liga/desliga dwell-click",
+    "A  ajuste fino pela cabeca",
     "L  landmarks   G  olhar",
     "P  pose cabeca V  minimapa",
-    "F  espelhar    H  ajuda",
+    "3  vista 3D    F  espelhar",
+    "H  ajuda",
     "Q/ESC  sair",
 ]
 
@@ -137,9 +174,7 @@ def draw_help(img):
     h, w = img.shape[:2]
     bw, bh = 280, 22 * len(HELP_LINES) + 14
     x0, y0 = 10, h - bh - 10
-    overlay = img.copy()
-    cv2.rectangle(overlay, (x0, y0), (x0 + bw, y0 + bh), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.65, img, 0.35, 0, img)
+    shade(img, x0, y0, x0 + bw, y0 + bh, (20, 20, 20), 0.65)
     for i, s in enumerate(HELP_LINES):
         text(img, s, (x0 + 10, y0 + 24 + 22 * i), 0.5)
 

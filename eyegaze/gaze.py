@@ -1,45 +1,45 @@
 """
-Estimação da direção do olhar (modelo geométrico de globo ocular).
+Etapas 1 e 2 do pipeline: dos landmarks às medidas 3D de cada olho.
 
-Ideia herdada do Webcam3DTracker: cada olho é uma esfera que gira dentro da
-cabeça; a direção do olhar é o vetor do centro da esfera até a íris. As
-diferenças em relação à referência:
+Pipeline completo (ver docs/metodologia.md):
 
-1. O centro do olho é ancorado nos CANTOS do olho a cada frame (pontos
-   presos ao crânio), em vez de ser "travado" uma única vez na calibração.
-   Assim não acumula erro se a pessoa se mexe.
-2. O deslocamento da íris é medido no referencial da CABEÇA (head_pose.py)
-   e normalizado pela largura do olho. Com isso ele independe da distância
-   à câmera e da rotação da cabeça.
-3. Não usamos o z da íris (a coordenada mais ruidosa do MediaPipe): a
-   profundidade da íris sai da própria restrição de estar na esfera.
+    1. landmarks do rosto (face_tracker.py);
+    2. centro do globo ocular e centro da pupila de cada olho (aqui e em
+       eyeball.py);
+    3. feixe de cada olho (centro do globo -> pupila) (eyeball.py);
+    4. cada feixe é projetado no monitor virtual e os dois pontos são
+       combinados (média ponderada pela qualidade de cada olho;
+       calibration.CalibrationModel.virtual_px);
+    5. a calibração com vários pontos ajusta o globo de cada olho e a
+       correção monitor virtual -> monitor real (calibration.py).
 
-Para cada olho:
-    m  = ponto médio dos cantos;  w = distância entre os cantos
-    (dx, dy, _) = R^T (íris - m) / w          (referencial da cabeça)
-    pitch_olho = asin(-dy / rho)
-    yaw_olho   = asin( dx / (rho cos pitch_olho))
-onde rho = raio do globo ocular / largura do olho (~0.4).
+Este módulo mede, a cada quadro, tudo em cm no referencial da câmera
+(geometry.py):
 
-A direção do olho na cabeça é convertida para a câmera (g = R g_cabeça) e os
-dois olhos são combinados. O resultado final são dois ângulos no
-referencial da câmera, que combinam rotação da cabeça + rotação dos olhos:
+* a rotação da cabeça R (head_pose.py) e a posição do rosto E;
+* a ÂNCORA de cada olho: o ponto médio dos cantos;
+* um ponto RÍGIDO na ponte do nariz (entre os olhos), que não se move com
+  as pálpebras (os cantos se movem um pouco com o olhar vertical). O modelo
+  do globo usa a ponte para a coordenada vertical da âncora (eyeball.py);
+* a PUPILA de cada olho: o centro da íris na imagem (média do anel de 4
+  pontos e do centro do MediaPipe, ou o centro refinado na imagem,
+  iris_refine.py), levado a 3D pela linha de visada da câmera até o plano
+  do olho (plano que passa pela âncora, perpendicular ao eixo z da cabeça).
+  O z da íris do MediaPipe não é usado: é a coordenada mais ruidosa e, ao
+  girar a cabeça, contaminava as outras. Para o FEIXE EXIBIDO (desenho e
+  HUD), a posição da pupila em relação à âncora passa por um filtro
+  One-Euro (GazeConfig.pupil_filter), que estabiliza os feixes desenhados.
+  O vetor bruto (cursor e calibração) leva a pupila sem
+  filtro: para o cursor, o estabilizador de fixação trata o ruído melhor e
+  sem atraso;
+* se cada olho está aberto (EAR relativo à linha de base de cada pessoa).
 
-    yaw   > 0  -> olhando para a DIREITA do usuário
-    pitch > 0  -> olhando para CIMA
+O CENTRO DO GLOBO não aparece na imagem: ele fica num deslocamento fixo no
+referencial da cabeça a partir da âncora, estimado na calibração
+(eyeball.EyeballModel). Antes de calibrar, usa-se o valor anatômico típico.
 
-Esses dois ângulos servem para o HUD e para rejeitar outliers. A
-calibração usa as medidas brutas (``GazeSample.raw``), incluindo as
-medidas verticais pelas PÁLPEBRAS:
-
-    lid_v   = (íris_y - linha média das pálpebras) / largura do olho
-    abertura = (pálpebra inferior - superior) / largura do olho
-
-Nos dados reais, o centro da íris do MediaPipe quase não se move na
-vertical em relação aos cantos do olho (cerca de 3 graus de variação para a
-tela inteira, contra os ~15-18 esperados). Já as pálpebras acompanham o
-olhar vertical (a superior desce quando se olha para baixo), então essas
-duas medidas trazem a maior parte do sinal vertical.
+Tudo isso vai para o vetor bruto ``GazeSample.raw`` (layout abaixo), a
+entrada da calibração. Ele é gravado nas sessões para reanálise offline.
 """
 
 from __future__ import annotations
@@ -50,230 +50,225 @@ import numpy as np
 
 from .config import GazeConfig
 from .face_tracker import FaceObservation
+from .geometry import focal_px, pixel_ray, px3d_to_cm, ray_plane
+from .filters import OneEuroFilter
 from .head_pose import HeadPose, estimate_head_pose
-from .landmarks import LEFT_EYE, RIGHT_EYE, EyeIndices
+from .landmarks import LEFT_EYE, RIGHT_EYE, RIGID_NOSE, EyeIndices
+
+# --------------------------------------------------------- layout de ``raw``
+# Pontos em cm: cada landmark é convertido antes de tirar médias (a
+# perspectiva não comuta com a média em pixels). As larguras dos olhos
+# (cantos externo-interno, cm) dão o tamanho anatômico de cada globo.
+# [R (9, linha a linha) | E (3) | âncora D (3), pupila D (3), âncora E (3),
+#  pupila E (3) | pupila refinada D (3), pupila refinada E (3) |
+#  aberto D, aberto E | ponte do nariz (3) | largura do olho D, E]
+#  (D = olho direito, E = esquerdo)
+RAW_R = slice(0, 9)
+RAW_FACE = slice(9, 12)
+RAW_OPEN = slice(30, 32)
+RAW_NOSE = slice(32, 35)
+RAW_EYE_WIDTH = slice(35, 37)
+RAW_SIZE = 37
+# Fontes do centro da pupila (ver raw_parts).
+PUPIL_SOURCES = ("mediapipe", "refinada", "media")
+EYES: tuple[EyeIndices, ...] = (RIGHT_EYE, LEFT_EYE)
+
+
+def raw_parts(raw: np.ndarray, source: str = "mediapipe"):
+    """Separa o vetor bruto: R (n, 3, 3), âncoras (n, 2, 3), pupilas (n, 2, 3)
+    da fonte pedida e olhos abertos (n, 2).
+
+    Fontes do centro da pupila: ``mediapipe`` (centro da íris dos landmarks),
+    ``refinada`` (centro da íris medido na imagem, iris_refine.py) e ``media``
+    (média das duas; padrão da calibração quando a refinada existe).
+    """
+    raw = np.atleast_2d(raw)
+    R = raw[:, RAW_R].reshape(-1, 3, 3)
+    A = np.stack([raw[:, 12:15], raw[:, 18:21]], axis=1)
+    P_mp = np.stack([raw[:, 15:18], raw[:, 21:24]], axis=1)
+    if source == "refinada":
+        P = np.stack([raw[:, 24:27], raw[:, 27:30]], axis=1)
+    elif source == "media":   # média das duas fontes
+        P = 0.5 * (P_mp + np.stack([raw[:, 24:27], raw[:, 27:30]], axis=1))
+    else:
+        P = P_mp
+    return R, A, P, raw[:, RAW_OPEN] > 0.5
+
+
+def has_refined_pupil(raw: np.ndarray) -> bool:
+    """True se a fonte refinada difere da do MediaPipe em alguma amostra."""
+    raw = np.atleast_2d(raw)
+    return not np.allclose(raw[:, 24:30], raw[:, [15, 16, 17, 21, 22, 23]])
 
 
 @dataclass
-class EyeGaze:
+class EyeMeasure:
     name: str
-    iris_px: np.ndarray            # (3,) centro da íris
-    corners_mid_px: np.ndarray     # (3,) ponto médio dos cantos
-    eyeball_center_px: np.ndarray  # (3,) centro estimado do globo ocular
-    eyeball_radius_px: float
-    direction_cam: np.ndarray      # (3,) vetor unitário no referencial da câmera
-    yaw_in_head_deg: float
-    pitch_in_head_deg: float
-    ear: float                     # eye aspect ratio
+    iris_px: np.ndarray       # (2,) centro da íris na imagem (desenho)
+    anchor_cm: np.ndarray     # (3,) ponto médio dos cantos
+    pupil_cm: np.ndarray      # (3,) pupila (MediaPipe)
+    pupil_ref_cm: np.ndarray  # (3,) pupila refinada (= MediaPipe se indisponível)
+    width_cm: float           # distância entre os cantos (cm)
+    ear: float                # eye aspect ratio
     open: bool
-    # Deslocamento da íris em relação ao ponto médio dos cantos, no
-    # referencial da cabeça, em larguras de olho (entrada da calibração).
-    offset_u: float = 0.0
-    offset_v: float = 0.0
-    # Medidas verticais pelas pálpebras (ver docstring do módulo).
-    lid_v: float = 0.0
-    aperture: float = 0.0
-    # (u, v, lid_v) com o centro da íris refinado na imagem (iris_refine.py);
-    # igual ao do MediaPipe quando o refinamento não está disponível.
-    refined: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    refined_ok: bool = False
 
 
 @dataclass
 class GazeSample:
     timestamp_ms: int
     head: HeadPose
-    eyes: list[EyeGaze]
-    direction_cam: np.ndarray | None  # combinação dos olhos abertos
-    yaw_deg: float | None
-    pitch_deg: float | None
-    blink: bool                       # ambos os olhos fechados
+    eyes: list[EyeMeasure]
+    raw: np.ndarray                    # vetor bruto (layout acima)
+    gaze: "object | None" = None       # eyeball.GazeRay (feixes de cada olho, vetor)
+    blink: bool = False                # os dois olhos fechados
     extras: dict = field(default_factory=dict)
-    # Vetor bruto usado pela calibração (ver calibration.RAW_LAYOUT):
-    # [R (9, linha a linha), posição do olho em cm (3), u, v, lid_v, abertura
-    #  (íris do MediaPipe), u, v, lid_v, abertura (íris refinada)]
-    raw: np.ndarray | None = None
-    # Observacao de origem (landmarks), gravada para reanalise offline.
-    obs: FaceObservation | None = None
+    obs: FaceObservation | None = None  # landmarks de origem (reanálise offline)
 
     @property
     def valid(self) -> bool:
-        return self.direction_cam is not None and not self.blink
+        return self.gaze is not None and not self.blink
+
+    @property
+    def yaw_deg(self) -> float | None:
+        return None if self.gaze is None else direction_to_angles(self.gaze.direction)[0]
+
+    @property
+    def pitch_deg(self) -> float | None:
+        return None if self.gaze is None else direction_to_angles(self.gaze.direction)[1]
 
     def features(self) -> np.ndarray:
-        """Vetor de entrada do modelo de calibração: [yaw, pitch] em graus."""
-        return np.array([self.yaw_deg, self.pitch_deg], dtype=np.float64)
+        """(yaw, pitch) do olhar em graus: detecção de fixação e de outliers."""
+        return np.array(direction_to_angles(self.gaze.direction), dtype=np.float64)
 
 
-def direction_to_angles(direction: np.ndarray) -> tuple[float, float]:
-    """Converte vetor (referencial da câmera, pixels 3D) em (yaw, pitch) graus."""
-    gx, gy, gz = direction
-    yaw = np.degrees(np.arctan2(-gx, -gz))
-    pitch = np.degrees(np.arctan2(-gy, np.hypot(gx, gz)))
-    return float(yaw), float(pitch)
+def direction_to_angles(direction) -> tuple[float, float]:
+    """Vetor no referencial da câmera -> (yaw, pitch) em graus.
+
+    yaw > 0: para a DIREITA do usuário; pitch > 0: para CIMA."""
+    gx, gy, gz = np.asarray(direction, dtype=np.float64)
+    return (float(np.degrees(np.arctan2(-gx, -gz))),
+            float(np.degrees(np.arctan2(-gy, np.hypot(gx, gz)))))
 
 
-def angles_to_head_direction(yaw_rad: float, pitch_rad: float) -> np.ndarray:
-    """Direção no referencial da cabeça para ângulos olho-na-cabeça.
-
-    yaw > 0 move a íris para +x da cabeça (lado esquerdo do usuário na
-    convenção de landmarks), pitch > 0 move para cima (-y). Olhar para a
-    frente é -z.
-    """
-    cp = np.cos(pitch_rad)
-    return np.array([
-        np.sin(yaw_rad) * cp,
-        -np.sin(pitch_rad),
-        -np.cos(yaw_rad) * cp,
-    ])
-
-
-_C = np.diag([1.0, -1.0, -1.0])
-
-
-def eye_position_cm(obs: FaceObservation, head: HeadPose, assumed_hfov_deg: float = 60.0,
+def eye_position_cm(obs: FaceObservation, head: HeadPose,
                     outer_canthi_cm: float = 9.0) -> np.ndarray:
-    """Posição 3D do rosto em relação à câmera, em cm.
+    """Posição 3D do rosto (cm, referencial da câmera): ponte do nariz.
 
-    Eixos como em pixels 3D: x para a direita da imagem, y para baixo, z
-    para longe da câmera (z > 0 = distância).
-
-    Usa a translação da matriz de pose do FaceLandmarker (espaço métrico,
-    em cm). Sem ela, estima por câmera pinhole: distância = f * 9 cm /
-    distância entre cantos externos em px (9 cm é a média adulta).
-    """
-    if obs.transform is not None:
-        return _C @ np.asarray(obs.transform, dtype=np.float64)[:3, 3]
-    f = 0.5 * obs.image_width / np.tan(np.radians(assumed_hfov_deg / 2))
+    Distância pela câmera pinhole: z = f · 9 cm / distância 3D entre os
+    cantos externos em px (o z do MediaPipe está na escala de x, então a
+    distância 3D quase não muda com a rotação da cabeça). A translação da
+    matriz do MediaPipe não é usada: a escala dela não é coerente com a
+    câmera suposta (ver GazeConfig.outer_canthi_cm)."""
+    f = focal_px(obs.image_width)
     z = f * outer_canthi_cm / max(head.scale_px, 1e-6)
     cx, cy = head.origin[0], head.origin[1]
     return np.array([(cx - obs.image_width / 2) * z / f,
-                     (cy - obs.image_height / 2) * z / f,
-                     z])
+                     (cy - obs.image_height / 2) * z / f, z])
 
 
-def on_eyeball(point: np.ndarray, center: np.ndarray, radius: float) -> np.ndarray:
-    """Substitui o z de ``point`` pelo z da superfície FRONTAL do globo.
-
-    Mantém x e y da imagem (bem medidos) e resolve a profundidade pela
-    interseção da linha de visada da câmera (paralela a z) com a esfera.
-    Se a linha não cruza a esfera, usa a profundidade do centro.
-    """
-    d2 = (point[0] - center[0]) ** 2 + (point[1] - center[1]) ** 2
-    z = center[2] - np.sqrt(max(radius ** 2 - d2, 0.0))
-    return np.array([point[0], point[1], z])
+def pupil_on_eye_plane(xy, image_size, anchor_cm, normal) -> np.ndarray:
+    """Pupila em 3D: linha de visada da câmera pelo pixel ``xy`` cruzada com o
+    plano do olho (passa pela âncora, normal = eixo z da cabeça)."""
+    P, _ = ray_plane(np.zeros(3), pixel_ray(np.asarray(xy, dtype=np.float64), image_size),
+                     anchor_cm, normal)
+    return P
 
 
 class GazeEstimator:
-    def __init__(self, cfg: GazeConfig):
+    """Landmarks -> GazeSample. ``eyeball`` (eyeball.EyeballModel) dá os
+    feixes e o vetor do olhar de cada quadro; o app troca o
+    modelo anatômico padrão pelo calibrado."""
+
+    def __init__(self, cfg: GazeConfig, eyeball=None):
+        from .eyeball import EyeballModel
         self.cfg = cfg
-        self._ear_baseline = {RIGHT_EYE.name: cfg.ear_open_initial,
-                              LEFT_EYE.name: cfg.ear_open_initial}
+        self.eyeball = eyeball if eyeball is not None else EyeballModel()
+        self._ear_baseline = {e.name: cfg.ear_open_initial for e in EYES}
+        # Filtro da pupila por olho e por fonte (ver GazeConfig.pupil_filter).
+        self._pupil_filters = {(k, src): OneEuroFilter(cfg.pupil_min_cutoff, cfg.pupil_beta, 1.0)
+                               for k in range(2) for src in range(2)}
+        self._last_t: float | None = None
 
-    def _eye(self, pts: np.ndarray, head: HeadPose, idx: EyeIndices,
-             refined_xy: np.ndarray | None = None) -> EyeGaze:
-        outer = pts[idx.outer_corner]
-        inner = pts[idx.inner_corner]
-        mid = (outer + inner) / 2.0
-        width = max(float(np.linalg.norm(outer - inner)), 1e-6)
+    def _filter_pupil(self, key, pupil, anchor, R, t: float) -> np.ndarray:
+        """Filtra a pupila no referencial da cabeça, em relação à âncora: só o
+        movimento do olho é suavizado; a rotação e a translação da cabeça
+        passam direto."""
+        q = R.T @ (pupil - anchor)
+        q[:2] = self._pupil_filters[key](q[:2], t)
+        return anchor + R @ q
 
-        # Centro da íris: média do anel (4 pontos) + ponto central.
-        iris = np.vstack([pts[list(idx.iris_ring)], pts[idx.iris_center]]).mean(axis=0)
+    def _eye(self, obs: FaceObservation, head: HeadPose, depth_cm: float, idx: EyeIndices,
+             refined_xy) -> EyeMeasure:
+        pts = obs.points
+        size = (obs.image_width, obs.image_height)
+        outer, inner = pts[idx.outer_corner], pts[idx.inner_corner]
+        width = max(float(np.linalg.norm(outer[:2] - inner[:2])), 1e-6)
+        # Cada ponto vai para cm e só depois se tira a média: a perspectiva
+        # não comuta com a média em pixels.
+        corners = px3d_to_cm(np.stack([outer, inner]), size, depth_cm)
+        anchor = corners.mean(axis=0)
+        width_cm = float(np.linalg.norm(corners[0] - corners[1]))
+        normal = head.R[:, 2]
 
-        rho = self.cfg.eyeball_radius_ratio
-        radius_px = rho * width
-        # Centro do globo: atrás do ponto médio dos cantos (para a frente
-        # é -z, então "atrás" é +z no referencial da cabeça).
-        eyeball_center = mid + head.R @ np.array([0.0, 0.0, radius_px])
+        iris = np.vstack([pts[list(idx.iris_ring)], pts[idx.iris_center]]).mean(axis=0)[:2]
+        pupil = pupil_on_eye_plane(iris, size, anchor, normal)
+        ok_ref = refined_xy is not None and bool(np.all(np.isfinite(refined_xy)))
+        pupil_ref = pupil_on_eye_plane(refined_xy, size, anchor, normal) if ok_ref else pupil
 
-        # O z da íris do MediaPipe NÃO é usado: ele é ruidoso e, ao girar
-        # o vetor para o referencial da cabeça (R^T), "vazava" para u e v
-        # quando a cabeça girava (nos dados reais, u variava 4,5x mais por
-        # grau de cabeça do que por grau de olho, e v ~14x). A profundidade
-        # sai da restrição de a íris estar na superfície do globo.
-        def to_eye(p: np.ndarray) -> np.ndarray:
-            return head.R.T @ (on_eyeball(p, eyeball_center, radius_px) - mid) / width
-
-        local = to_eye(iris)
-        sin_pitch = np.clip(-local[1] / rho, -0.95, 0.95)
-        pitch = float(np.arcsin(sin_pitch))
-        sin_yaw = np.clip(local[0] / (rho * np.cos(pitch)), -0.95, 0.95)
-        yaw = float(np.arcsin(sin_yaw))
-
-        dir_head = angles_to_head_direction(yaw, pitch)
-        dir_cam = head.R @ dir_head
-
-        # Pálpebras (média de vários pontos): também apoiadas no globo, com a
-        # mesma correção de profundidade.
-        up = pts[list(idx.upper_lid_ring or (idx.upper_lid,))].mean(axis=0)
-        lo = pts[list(idx.lower_lid_ring or (idx.lower_lid,))].mean(axis=0)
-        up_l = to_eye(up)
-        lo_l = to_eye(lo)
-        lid_mid = (up_l[1] + lo_l[1]) / 2
-        lid_v = float(local[1] - lid_mid)
-        aperture = float(lo_l[1] - up_l[1])
-
-        refined_ok = refined_xy is not None and bool(np.all(np.isfinite(refined_xy)))
-        if refined_ok:
-            # z provisório: on_eyeball recalcula a profundidade.
-            loc_r = to_eye(np.array([refined_xy[0], refined_xy[1], mid[2]]))
-            refined = (float(loc_r[0]), float(loc_r[1]), float(loc_r[1] - lid_mid))
-        else:
-            refined = (float(local[0]), float(local[1]), lid_v)
-
-        # EAR: abertura vertical / largura.
-        ear = float(np.linalg.norm(pts[idx.upper_lid] - pts[idx.lower_lid]) / width)
+        # EAR: abertura vertical / largura; limiar relativo à linha de base.
+        ear = float(np.linalg.norm(pts[idx.upper_lid][:2] - pts[idx.lower_lid][:2]) / width)
         baseline = self._ear_baseline[idx.name]
         is_open = ear >= self.cfg.blink_ratio * baseline
         if is_open:
             a = self.cfg.ear_baseline_alpha
             self._ear_baseline[idx.name] = (1 - a) * baseline + a * ear
-
-        return EyeGaze(
-            name=idx.name,
-            iris_px=iris,
-            corners_mid_px=mid,
-            eyeball_center_px=eyeball_center,
-            eyeball_radius_px=radius_px,
-            direction_cam=dir_cam,
-            # Sinal invertido para seguir a convenção da saída
-            # (yaw > 0 = direita do usuário).
-            yaw_in_head_deg=float(-np.degrees(yaw)),
-            pitch_in_head_deg=float(np.degrees(pitch)),
-            ear=ear,
-            open=bool(is_open),
-            offset_u=float(local[0]),
-            offset_v=float(local[1]),
-            lid_v=lid_v,
-            aperture=aperture,
-            refined=refined,
-            refined_ok=refined_ok,
-        )
+        return EyeMeasure(idx.name, iris, anchor, pupil, pupil_ref, width_cm, ear,
+                          bool(is_open))
 
     def estimate(self, obs: FaceObservation) -> GazeSample:
-        pts = obs.points
-        head, pose_source = estimate_head_pose(pts, obs.transform, self.cfg.head_pose_source)
-        extras = {"pose_source": pose_source}
+        head, pose_source = estimate_head_pose(obs.points, obs.transform,
+                                               self.cfg.head_pose_source)
+        face = eye_position_cm(obs, head, self.cfg.outer_canthi_cm)
         ref = obs.iris_refined
-        eyes = [self._eye(pts, head, RIGHT_EYE, None if ref is None else ref[0]),
-                self._eye(pts, head, LEFT_EYE, None if ref is None else ref[1])]
+        eyes = [self._eye(obs, head, float(face[2]), idx, None if ref is None else ref[k])
+                for k, idx in enumerate(EYES)]
+        nose = px3d_to_cm(obs.points[list(RIGID_NOSE)], (obs.image_width, obs.image_height),
+                          float(face[2])).mean(axis=0)
 
-        open_eyes = [e for e in eyes if e.open]
-        if not open_eyes:
-            return GazeSample(obs.timestamp_ms, head, eyes, None, None, None, blink=True,
-                              extras=extras)
+        def pack(p_mp, p_ref):
+            return np.concatenate([head.R.reshape(-1), face,
+                                   eyes[0].anchor_cm, p_mp[0], eyes[1].anchor_cm, p_mp[1],
+                                   p_ref[0], p_ref[1],
+                                   [float(eyes[0].open), float(eyes[1].open)], nose,
+                                   [eyes[0].width_cm, eyes[1].width_cm]])
 
-        combined = np.mean([e.direction_cam for e in open_eyes], axis=0)
-        combined /= np.linalg.norm(combined)
-        yaw, pitch = direction_to_angles(combined)
-
-        u = float(np.mean([e.offset_u for e in open_eyes]))
-        v = float(np.mean([e.offset_v for e in open_eyes]))
-        lv = float(np.mean([e.lid_v for e in open_eyes]))
-        ap = float(np.mean([e.aperture for e in open_eyes]))
-        ur, vr, lvr = np.mean([e.refined for e in open_eyes], axis=0)
-        extras["iris_refinada"] = all(e.refined_ok for e in open_eyes)
-        raw = np.concatenate([head.R.reshape(-1), eye_position_cm(obs, head),
-                              [u, v, lv, ap, ur, vr, lvr, ap]])
-        return GazeSample(obs.timestamp_ms, head, eyes, combined, yaw, pitch, blink=False,
-                          extras=extras, raw=raw, obs=obs)
+        # ``raw`` (cursor e calibração) leva a pupila SEM filtro: o
+        # estabilizador de fixação trata o ruído melhor e sem atraso (seção
+        # 4.1 da metodologia). O filtro vale só para o feixe exibido.
+        raw = pack([e.pupil_cm for e in eyes], [e.pupil_ref_cm for e in eyes])
+        raw_view = raw
+        if self.cfg.pupil_filter:
+            t = obs.timestamp_ms / 1000.0
+            gap = self._last_t is None or not 0 < t - self._last_t <= self.cfg.pupil_filter_reset_s
+            self._last_t = t
+            p_mp, p_ref = [], []
+            for k, e in enumerate(eyes):
+                if gap or not e.open:
+                    for src in range(2):
+                        self._pupil_filters[(k, src)].reset()
+                if e.open:
+                    p_mp.append(self._filter_pupil((k, 0), e.pupil_cm, e.anchor_cm, head.R, t))
+                    p_ref.append(self._filter_pupil((k, 1), e.pupil_ref_cm, e.anchor_cm,
+                                                    head.R, t))
+                else:
+                    p_mp.append(e.pupil_cm)
+                    p_ref.append(e.pupil_ref_cm)
+            raw_view = pack(p_mp, p_ref)
+        extras = {"pose_source": pose_source,
+                  "iris_refinada": ref is not None and bool(np.all(np.isfinite(ref)))}
+        blink = not any(e.open for e in eyes)
+        sample = GazeSample(obs.timestamp_ms, head, eyes, raw, blink=blink, extras=extras,
+                            obs=obs)
+        if not blink:
+            sample.gaze = self.eyeball.ray(raw_view)
+        return sample

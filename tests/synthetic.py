@@ -25,6 +25,7 @@ BASE = {
     127: (-7.0, 0.5, 4.0), 356: (7.0, 0.5, 4.0),
     151: (0.0, -6.0, 1.5), 9: (0.0, -3.5, 0.5), 8: (0.0, -2.5, 0.3),
     2: (0.0, 5.0, -1.5), 164: (0.0, 6.0, -0.8), 168: (0.0, -1.0, 0.0),
+    6: (0.0, 0.5, -0.4), 197: (0.0, 1.5, -0.8),   # ponte do nariz
 }
 
 
@@ -49,7 +50,9 @@ def make_points(gaze_yaw=0.0, gaze_pitch=0.0, head=(0.0, 0.0, 0.0),
                 center=(640.0, 360.0, 0.0), scale=12.0, blink=False,
                 noise_px=0.0, rng: np.random.Generator | None = None,
                 gaze_vec=None, rho_true: float = RHO, v_scale: float = 1.0,
-                pitch_coupling: float = 0.0, lid_follow: float = 0.0) -> np.ndarray:
+                pitch_coupling: float = 0.0, lid_follow: float = 0.0,
+                pupil_drift: float = 0.0,
+                perspective_cm=None) -> np.ndarray:
     """Landmarks sintéticos.
 
     gaze_vec: direção do olhar na câmera (substitui gaze_yaw/gaze_pitch).
@@ -61,6 +64,12 @@ def make_points(gaze_yaw=0.0, gaze_pitch=0.0, head=(0.0, 0.0, 0.0),
         pitch da cabeça (perspectiva/pálpebra), em raios por radiano.
     lid_follow: quanto as pálpebras acompanham o deslocamento vertical
         verdadeiro do olho (a superior desce ao olhar para baixo).
+    pupil_drift: deriva da medida da pupila (cm, vertical no referencial da
+        cabeça), sem o olho girar.
+    perspective_cm: posição da cabeça (cm, referencial da câmera). Com ela,
+        x e y são a projeção em PERSPECTIVA de cada ponto (como os landmarks
+        reais do MediaPipe) e z é a profundidade relativa ao rosto na escala
+        de x; sem ela, perspectiva fraca (escala única ``scale``).
     """
     rng = rng or np.random.default_rng(0)
     R = rot(*head)
@@ -96,17 +105,34 @@ def make_points(gaze_yaw=0.0, gaze_pitch=0.0, head=(0.0, 0.0, 0.0),
         for k, dx in zip((eye.lower_lid,) + eye.lower_lid_ring, (0, -0.4, 0, 0.4)):
             local[k] = on_ball(dx, lo_y)
 
+    if pupil_drift:
+        # Deriva da medida da pupila (cm, vertical no referencial da cabeça):
+        # a íris "escorrega" em relação aos cantos sem o olho girar, como a
+        # deriva lenta observada nas calibrações reais.
+        for eye in (RIGHT_EYE, LEFT_EYE):
+            for k in (eye.iris_center,) + eye.iris_ring:
+                local[k] = local[k] + np.array([0.0, pupil_drift, 0.0])
     pts = rng.uniform([-6, -6, -1], [6, 7, 3], size=(478, 3))
     for k, v in local.items():
         pts[k] = v
-    out = scale * (pts @ R.T) + np.asarray(center)
+    if perspective_cm is not None:
+        P = np.asarray(perspective_cm, dtype=float) + pts @ R.T
+        z0 = float(perspective_cm[2])
+        out = np.column_stack([IMG_W / 2 + FOCAL * P[:, 0] / P[:, 2],
+                               IMG_H / 2 + FOCAL * P[:, 1] / P[:, 2],
+                               (P[:, 2] - z0) * FOCAL / z0])
+    else:
+        out = scale * (pts @ R.T) + np.asarray(center)
     if noise_px:
         out += rng.normal(0, noise_px, out.shape)
     return out
 
 
 IMG_W, IMG_H = 1280, 720
-FOCAL = 0.5 * IMG_W / math.tan(math.radians(30))   # câmera com FOV horizontal de 60°
+# Câmera sintética com 60° de campo horizontal. Os testes ajustam o pipeline
+# para a mesma câmera (conftest.py); o padrão do app é 90° (notebook).
+SYNTH_HFOV_DEG = 60.0
+FOCAL = 0.5 * IMG_W / math.tan(math.radians(SYNTH_HFOV_DEG / 2))
 
 
 def make_transform(head=(0.0, 0.0, 0.0), head_pos_cm=(0.0, 0.0, 50.0)) -> np.ndarray:
@@ -121,9 +147,12 @@ def make_transform(head=(0.0, 0.0, 0.0), head_pos_cm=(0.0, 0.0, 50.0)) -> np.nda
 def make_observation(*args, timestamp_ms=0, with_transform=False, head_pos_cm=None,
                      **kwargs) -> FaceObservation:
     """Observação sintética. Com head_pos_cm (x, y, z em cm, eixos da imagem),
-    a posição e a escala do rosto na imagem seguem uma câmera pinhole."""
+    cada landmark é projetado por uma câmera pinhole (perspectiva verdadeira),
+    a menos que ``center``/``scale`` sejam dados."""
     if head_pos_cm is not None:
         x, y, z = head_pos_cm
+        if "center" not in kwargs and "scale" not in kwargs:
+            kwargs["perspective_cm"] = tuple(head_pos_cm)
         kwargs.setdefault("center", (IMG_W / 2 + FOCAL * x / z, IMG_H / 2 + FOCAL * y / z, 0.0))
         kwargs.setdefault("scale", FOCAL / z)
     pts = make_points(*args, **kwargs)

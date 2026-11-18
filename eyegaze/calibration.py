@@ -1,37 +1,41 @@
 """
-Modelo de calibração: medidas do rosto -> pixel da tela.
+Etapa 5 do pipeline: calibração com vários pontos.
 
-Versão 3 (regressão com geometria da cabeça). A versão anterior otimizava
-parâmetros do olho (ganho, offset) por Nelder-Mead dentro de um modelo
-geométrico de raio do olhar. Com dados reais isso falhou: o sinal vertical
-da íris é ~5x menor que o previsto pela esfera e o pitch tem um viés de
-~30 graus, então o otimizador ia para os limites e nem os próprios alvos da
-calibração eram ajustados (RMSE de ~300 px).
+O cursor sai do pipeline geométrico (ver gaze.py e eyeball.py):
 
-Agora a geometria entra só onde ela é confiável, a CABEÇA:
+    landmarks -> âncora + pupila de cada olho (cm)
+              -> centro do globo de cada olho -> feixe centro -> pupila
+              -> projeção de cada feixe no MONITOR VIRTUAL (plano da tela,
+                 geometria suposta) -> média ponderada dos dois olhos
+              -> correção monitor virtual -> MONITOR REAL (pixels)
 
-    P_cabeça = E_xy + E_z * tan(direção da face)     (cm, plano da câmera)
+A calibração mostra alvos conhecidos (grade) e, com essas amostras, ajusta,
+nesta ordem:
 
-é o ponto para onde a face aponta no plano da tela. Isso já compensa
-rotação e translação da cabeça. O olho entra por medidas brutas (íris
-horizontal u, íris vertical v, íris entre as pálpebras lid_v e abertura do
-olho), multiplicadas pela distância E_z (o mesmo ângulo de olho cobre mais
-centímetros quando se está mais longe) e por sec²(ângulo da cabeça), a
-derivada de tan(cabeça + olho) em relação ao olho:
+1. O GLOBO de cada olho (``eyeball.EyeballModel.fit``): para cada olho e
+   eixo, a posição de repouso da pupila e o raio efetivo, por mínimos
+   quadrados robustos; e o peso de cada olho no ponto da tela. É isto que
+   faz o feixe passar pelo alvo.
+2. A CORREÇÃO monitor virtual -> real: o ponto atingido no monitor virtual
+   (etapa 4) ainda tem erros que não são do olho: largura física da tela
+   suposta, posição da webcam, campo de visão da câmera, viés da pose do
+   MediaPipe. A correção é um polinômio pequeno nas coordenadas do monitor
+   virtual, somado ao ponto virtual:
 
-    x = c + a·P_cabeça + Σ_k b_k · E_z · sec²(yaw_cabeça)   · φ_k(olho)
-    y = c + a·P_cabeça + Σ_k b_k · E_z · sec²(pitch_cabeça) · φ_k(olho)
+       real = virtual + a₀ (+ a₁·u + a₂·v) (+ a₃·u² + a₄·uv + a₅·v²)
 
-φ = [u, v, lid_v, abertura] (+ termos quadráticos no grau 2). O modelo é
-LINEAR nos coeficientes: mínimos quadrados com ridge, sem otimização
-iterativa e sem mínimos locais. A força do ridge é escolhida por validação
-cruzada deixando um alvo de fora (leave-one-target-out), e o erro dessa
-validação é reportado: ele estima o erro em pontos não vistos, ao contrário
-do erro de ajuste, que esconde sobreajuste.
+   com (u, v) o ponto virtual normalizado pela tela, ajustada por ridge
+   (penalidade em direção à identidade). Os candidatos são: nenhuma
+   correção (geometria pura), só deslocamento, afim e quadrática.
 
-A etapa em que a pessoa mantém o olhar no centro e gira a cabeça é o que
-determina o coeficiente de P_cabeça. Sem ela, o modelo continua funcionando
-com a cabeça parada.
+A escolha do tipo de correção e da força do ridge é por validação cruzada:
+cada alvo fica fora do ajuste por vez (o globo E a correção são reajustados
+sem ele), e o erro nesse alvo estima o erro em pontos novos.
+
+O teste da cabeça (opcional, tecla K ou --cabeca) NÃO entra no ajuste: é usado só
+como TESTE (cabeça em poses novas). Nas sessões gravadas, treinar com ela
+melhorava a validação em ~3 px, e ela é inadequada para quem não consegue
+mover a cabeça.
 """
 
 from __future__ import annotations
@@ -43,83 +47,78 @@ from pathlib import Path
 
 import numpy as np
 
+from .eyeball import EYE_NAMES, EyeballModel
 from .face_tracker import FaceObservation
+from .gaze import RAW_FACE, RAW_R, RAW_SIZE, has_refined_pupil
+from . import geometry
+from .geometry import VirtualScreen
 
-FEATURE_VERSION = 5  # incremente se o formato mudar (invalida calibrações antigas)
+FEATURE_VERSION = 10  # incremente se o layout de ``raw`` mudar (invalida calibrações antigas)
 
-RAW_SIZE = 20        # R (9) + E (3) + (u, v, lid_v, abertura) x 2 fontes da íris
-# Colunas das medidas do olho para cada fonte da posição da íris.
-EYE_COLS = {"mediapipe": slice(12, 16), "refinada": slice(16, 20)}
-ALPHAS = (1e-4, 1e-3, 1e-2, 0.1, 1.0)   # candidatos de ridge (features padronizadas)
-# Desvio-padrão mínimo das colunas na padronização. Sem isso, uma coluna
-# quase constante (ex.: cabeça parada durante a calibração) teria o ruído
-# amplificado e o coeficiente "explodiria" quando a cabeça se mexe.
-HEAD_STD_FLOOR_CM = 1.0
-EYE_STD_FLOOR = 1e-3
+CORRECTIONS = ("nenhuma", "deslocamento", "afim", "quadratica")
+ALPHAS = (1e-3, 1e-2, 1e-1)       # ridge da correção (coordenadas normalizadas)
+
+HEAD_DIRECTIONS = ("direita", "esquerda", "cima", "baixo")
+HEAD_STILL_DEG = 2.0       # desvio abaixo disto não é "pose nova"
+MIN_HEAD_TEST = 5          # amostras mínimas de uma direção para entrar no teste
 
 
-# ------------------------------------------------------------------ geometria
-def head_screen_point(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Ponto para onde a face aponta no plano z = 0 da câmera (cm) e as
-    tangentes (tan yaw, tan pitch) da direção da face.
-
-    raw: (n, 20). Devolve ((n, 2), (n, 2)).
-    """
+# ------------------------------------------------------------------ cabeça
+def head_angles(raw: np.ndarray) -> np.ndarray:
+    """(n, 2) yaw e pitch da cabeça em graus (mesma convenção de HeadPose.euler_deg)."""
     raw = np.atleast_2d(raw)
-    R = raw[:, :9].reshape(-1, 3, 3)
-    E = raw[:, 9:12]
-    fwd = -R[:, :, 2]                         # a face olha para -z da cabeça
-    fz = np.minimum(fwd[:, 2], -1e-3)         # voltada para a câmera: fz < 0
-    tans = fwd[:, :2] / -fz[:, None]
-    return E[:, :2] + E[:, 2:3] * tans, tans
+    fwd = -raw[:, RAW_R].reshape(-1, 3, 3)[:, :, 2]
+    yaw = np.degrees(np.arctan2(-fwd[:, 0], -fwd[:, 2]))
+    pitch = np.degrees(np.arctan2(-fwd[:, 1], np.hypot(fwd[:, 0], fwd[:, 2])))
+    return np.column_stack([yaw, pitch])
 
 
-def eye_terms(raw: np.ndarray, degree: int, ref: np.ndarray | None = None,
-              source: str = "mediapipe") -> np.ndarray:
-    """φ(olho): [u, v, lid_v, abertura] (+ u², u·lid_v, lid_v², u·v no grau 2).
-
-    ref: valores de referência (média da calibração) subtraídos antes. As
-    medidas não são zero com o olho "reto" (a abertura, por exemplo, é ~0.3);
-    sem centralizar, multiplicar por E_z faria a distância deslocar o cursor
-    mesmo com o olho parado.
-    """
-    raw = np.atleast_2d(raw)
-    m = raw[:, EYE_COLS[source]] - (0.0 if ref is None else ref)
-    u, v, lv, ap = m[:, 0], m[:, 1], m[:, 2], m[:, 3]
-    cols = [u, v, lv, ap]
-    if degree >= 2:
-        cols += [u * u, u * lv, lv * lv, u * v]
-    return np.column_stack(cols)
+def head_direction(delta: np.ndarray) -> np.ndarray:
+    """Direção dominante de cada desvio de pose (n, 2) -> índice em HEAD_DIRECTIONS."""
+    delta = np.atleast_2d(delta)
+    horiz = np.abs(delta[:, 0]) >= np.abs(delta[:, 1])
+    return np.where(horiz, np.where(delta[:, 0] > 0, 0, 1),
+                    np.where(delta[:, 1] > 0, 2, 3))
 
 
-def design_matrices(raw: np.ndarray, degree: int, ref: np.ndarray | None = None,
-                    source: str = "mediapipe") -> tuple[np.ndarray, np.ndarray]:
-    """Matrizes de regressão (sem intercepto) para x e para y da tela."""
-    raw = np.atleast_2d(raw)
-    P, tans = head_screen_point(raw)
-    Ez = raw[:, 11:12]
-    phi = eye_terms(raw, degree, ref, source)
-    sec2 = 1.0 + tans ** 2
-    Xx = np.hstack([P, Ez * sec2[:, 0:1] * phi])
-    Xy = np.hstack([P, Ez * sec2[:, 1:2] * phi])
-    return Xx, Xy
+def head_test_error(model: "CalibrationModel", head_raw: np.ndarray, head_target,
+                    grid_raw: np.ndarray | None = None,
+                    max_deg: tuple[float, float] | None = (15.0, 12.0),
+                    base: np.ndarray | None = None) -> dict:
+    """Erro (px) com a cabeça em poses novas, nas amostras da etapa da cabeça
+    (que não entram no ajuste). Para cada direção (direita, esquerda, cima,
+    baixo), a mediana da distância de cada amostra ao alvo; o resultado é a
+    média das direções. Amostras além de ``max_deg`` (yaw, pitch) da pose da
+    grade são descartadas: nesses ângulos os landmarks do olho deixam de ser
+    confiáveis. ``base``: pose (yaw, pitch) de referência; sem ela, a mediana
+    da pose em ``grid_raw``."""
+    hr = np.atleast_2d(head_raw)
+    if base is None:
+        base = np.median(head_angles(grid_raw), axis=0)
+    delta = head_angles(hr) - np.asarray(base, dtype=float)
+    use = np.max(np.abs(delta), axis=1) >= HEAD_STILL_DEG
+    if max_deg is not None:
+        use &= (np.abs(delta[:, 0]) <= max_deg[0]) & (np.abs(delta[:, 1]) <= max_deg[1])
+    direction = head_direction(delta)
+    err = np.hypot(*(model.predict(hr) - np.asarray(head_target, dtype=float)).T)
+    by_dir = {}
+    for q, name in enumerate(HEAD_DIRECTIONS):
+        sel = use & (direction == q) & np.isfinite(err)
+        if sel.sum() >= MIN_HEAD_TEST:
+            by_dir[name] = float(np.median(err[sel]))
+    out = {"n_cabeca_total": int(len(hr)), "n_cabeca_usadas": int(use.sum())}
+    if by_dir:
+        out["erro_cabeca_px"] = float(np.mean(list(by_dir.values())))
+        out["erro_cabeca_por_direcao_px"] = by_dir
+    return out
 
 
-def polynomial_terms(X: np.ndarray, degree: int) -> np.ndarray:
-    """[1, a, b] (grau 1) ou [1, a, b, a², ab, b²] (grau 2) para X = [a, b]."""
-    X = np.atleast_2d(X)
-    a, b = X[:, 0], X[:, 1]
-    cols = [np.ones_like(a), a, b]
-    if degree >= 2:
-        cols += [a * a, a * b, b * b]
-    return np.column_stack(cols)
-
-
+# ------------------------------------------------------------- utilidades
 def outlier_mask(samples: np.ndarray, threshold: float) -> np.ndarray:
     """Máscara de amostras a manter (escore-Z modificado via MAD < limiar).
 
     Iglewicz & Hoaglin (1993): z = 0.6745 (x - mediana) / MAD; 3.5 é o
-    limiar usual. Remove frames isolados ruins (sacada atrasada, quase-piscada).
+    limiar usual. Remove quadros isolados ruins (sacada atrasada, quase-piscada).
     """
     samples = np.atleast_2d(samples)
     if len(samples) < 5:
@@ -132,13 +131,9 @@ def outlier_mask(samples: np.ndarray, threshold: float) -> np.ndarray:
     return keep
 
 
-def reject_outliers(samples: np.ndarray, threshold: float) -> np.ndarray:
-    return np.atleast_2d(samples)[outlier_mask(samples, threshold)]
-
-
 def build_grid(screen_w: int, screen_h: int, cols: int, rows: int,
                margin_ratio: float) -> list[tuple[float, float]]:
-    """Alvos de calibração em pixels, percorridos em zigue-zague."""
+    """Alvos de calibração em pixels, em zigue-zague (a calibração sorteia a ordem de visita)."""
     xs = np.linspace(margin_ratio, 1 - margin_ratio, cols) * screen_w
     ys = np.linspace(margin_ratio, 1 - margin_ratio, rows) * screen_h
     points = []
@@ -160,116 +155,142 @@ class PointResult:
                               self.prediction[1] - self.target[1]))
 
 
-# --------------------------------------------------------------------- modelo
-def _std_floor(n_cols: int) -> np.ndarray:
-    floor = np.full(n_cols, EYE_STD_FLOOR)
-    floor[:2] = HEAD_STD_FLOOR_CM   # as duas primeiras colunas são P_cabeça
-    return floor
+# ------------------------------------------- correção monitor virtual -> real
+def correction_basis(V: np.ndarray, screen_size, kind: str) -> np.ndarray:
+    """Colunas do polinômio da correção no ponto virtual V (n, 2) em px."""
+    V = np.atleast_2d(V)
+    u = V[:, 0] / screen_size[0] - 0.5
+    v = V[:, 1] / screen_size[1] - 0.5
+    cols = [np.ones(len(V))]
+    if kind in ("afim", "quadratica"):
+        cols += [u, v]
+    if kind == "quadratica":
+        cols += [u * u, u * v, v * v]
+    return np.column_stack(cols)
 
 
-def _ridge(X, y, w, alpha, floor):
-    """Ridge ponderado com padronização; intercepto não penalizado."""
-    mean = np.average(X, axis=0, weights=w)
-    std = np.maximum(np.sqrt(np.average((X - mean) ** 2, axis=0, weights=w)), floor)
-    Z = np.column_stack([np.ones(len(X)), (X - mean) / std])
-    Zw = Z * w[:, None]
-    reg = alpha * w.sum() * np.eye(Z.shape[1])
+def fit_correction(V, Y, w, kind: str, alpha: float, screen_size) -> np.ndarray:
+    """Coeficientes (k, 2) da correção: Y ≈ V + base(V) @ coef. Ridge nos
+    termos não constantes (encolhe em direção à identidade)."""
+    if kind == "nenhuma":
+        return np.zeros((0, 2))
+    ok = np.all(np.isfinite(V), axis=1)
+    B = correction_basis(V[ok], screen_size, kind)
+    r = (Y - V)[ok]
+    ww = w[ok]
+    reg = alpha * ww.sum() * np.eye(B.shape[1])
     reg[0, 0] = 0.0
-    coef = np.linalg.solve(Z.T @ Zw + reg, Zw.T @ y)
-    return coef, mean, std
+    return np.linalg.solve(B.T @ (B * ww[:, None]) + reg, (B * ww[:, None]).T @ r)
 
 
-def _ridge_predict(X, coef, mean, std):
-    return coef[0] + ((X - mean) / std) @ coef[1:]
+def apply_correction(V, coef, kind: str, screen_size) -> np.ndarray:
+    V = np.atleast_2d(V)
+    if kind == "nenhuma":
+        return V.copy()
+    return V + correction_basis(V, screen_size, kind) @ coef
 
 
+# ------------------------------------------------------------------ modelo
 class CalibrationModel:
-    def __init__(self, degree: int = 2, ridge_alpha: float | None = None,
-                 eye_source: str = "mediapipe"):
-        self.degree = degree
-        self.eye_source = eye_source            # fonte da posição da íris (EYE_COLS)
-        self.ridge_alpha = ridge_alpha          # None = escolhe por validação cruzada
-        self.params: list | None = None         # [(coef, mean, std) de x, de y]
-        self.eye_ref = np.zeros(4)              # referencia das medidas do olho
-        self.offset = np.zeros(2)               # correção de "recentralizar"
-        self.screen_size: tuple[int, int] | None = None
+    """Pipeline completo de uma amostra bruta até o pixel do monitor real."""
+
+    def __init__(self, screen: VirtualScreen, eyeball: EyeballModel | None = None,
+                 correction: str = "nenhuma", coef: np.ndarray | None = None,
+                 fitted: bool = False):
+        self.screen = screen
+        self.eyeball = eyeball if eyeball is not None else EyeballModel()
+        self.correction = correction
+        self.coef = np.zeros((0, 2)) if coef is None else np.asarray(coef, dtype=np.float64)
+        self.fitted = fitted
+        self.offset = np.zeros(2)               # recentralização (R) e correções por alvo
         self.created_at: str | None = None
         self.info: dict = {}
+        # Postura da calibração: pose mediana da cabeça na grade (yaw, pitch),
+        # posição mediana do rosto (cm) e a faixa coberta (graus). Usados no
+        # aviso de postura fora da calibração.
+        self.head_ref = np.zeros(2)
+        self.pos_ref = np.zeros(3)
+        self.head_span = np.zeros(2)
+
+    @property
+    def screen_size(self) -> tuple[int, int]:
+        return tuple(self.screen.size_px)
 
     @property
     def is_fitted(self) -> bool:
-        return self.params is not None
+        return self.fitted
 
-    # -------------------------------------------------------------- ajuste
-    def _fit_xy(self, raw, Y, w, alpha):
-        Xx, Xy = design_matrices(raw, self.degree, self.eye_ref, self.eye_source)
-        floor = _std_floor(Xx.shape[1])
-        return [_ridge(Xx, Y[:, 0], w, alpha, floor), _ridge(Xy, Y[:, 1], w, alpha, floor)]
+    # ------------------------------------------------------------ pipeline
+    def virtual_px_per_eye(self, raw) -> np.ndarray:
+        """(n, 2 olhos, 2) pixel do MONITOR VIRTUAL atingido pelo feixe de cada olho."""
+        return self.eyeball.screen_points(np.atleast_2d(raw), self.screen)[0]
 
-    def _predict_with(self, params, raw):
-        Xx, Xy = design_matrices(raw, self.degree, self.eye_ref, self.eye_source)
-        return np.column_stack([_ridge_predict(Xx, *params[0]),
-                                _ridge_predict(Xy, *params[1])])
-
-    def fit(self, raw: np.ndarray, Y: np.ndarray, weights: np.ndarray | None,
-            screen_size: tuple[int, int], groups: np.ndarray | None = None):
-        """raw: (n, 20); Y: (n, 2) pixels-alvo; weights: (n,) ou None.
-
-        groups: (n,) índice do alvo de cada amostra (-1 = sempre no treino,
-        ex.: etapa da cabeça). Usado na validação cruzada que escolhe o ridge
-        e estima o erro em pontos não vistos.
-        """
-        raw = np.asarray(raw, dtype=np.float64)
-        Y = np.asarray(Y, dtype=np.float64)
-        w = np.ones(len(raw)) if weights is None else np.asarray(weights, dtype=np.float64)
-
-        self.eye_ref = np.average(raw[:, EYE_COLS[self.eye_source]], axis=0, weights=w)
-        loo: dict[float, list[float]] = {}
-        ids = [] if groups is None else [g for g in np.unique(groups) if g >= 0]
-        if len(ids) >= 5:
-            candidates = ALPHAS if self.ridge_alpha is None else (self.ridge_alpha,)
-            for alpha in candidates:
-                errs = []
-                for g in ids:
-                    tr, te = groups != g, groups == g
-                    params = self._fit_xy(raw[tr], Y[tr], w[tr], alpha)
-                    pred = np.median(self._predict_with(params, raw[te]), axis=0)
-                    errs.append(float(np.hypot(*(pred - Y[te][0]))))
-                loo[alpha] = errs
-            alpha = min(loo, key=lambda a: np.mean(loo[a]))
-        else:
-            alpha = self.ridge_alpha if self.ridge_alpha is not None else 1e-2
-
-        self.params = self._fit_xy(raw, Y, w, alpha)
-        resid = self._predict_with(self.params, raw) - Y
-        mse = float(np.sum(w * np.sum(resid ** 2, axis=1)) / w.sum())
-        self.offset = np.zeros(2)
-        self.screen_size = tuple(int(v) for v in screen_size)
-        self.created_at = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.info = {"rmse_ajuste_px": float(np.sqrt(mse)), "ridge_alpha": float(alpha)}
-        if loo:
-            self.info["erro_loo_medio_px"] = float(np.mean(loo[alpha]))
-            self.info["erro_loo_por_alvo_px"] = [float(e) for e in loo[alpha]]
+    def virtual_px(self, raw) -> np.ndarray:
+        """Etapas 2-4: pixel (n, 2) do MONITOR VIRTUAL (média ponderada dos olhos)."""
+        return self.eyeball.screen_points(np.atleast_2d(raw), self.screen)[1]
 
     def predict(self, raw: np.ndarray) -> np.ndarray:
-        """Aceita (20,) ou (n, 20); devolve (2,) ou (n, 2) em pixels."""
-        if not self.is_fitted:
-            raise RuntimeError("Modelo de calibração ainda não ajustado.")
+        """Aceita (RAW_SIZE,) ou (n, RAW_SIZE); devolve (2,) ou (n, 2) pixels do
+        monitor real (NaN se o olhar não atinge o plano da tela)."""
         raw = np.asarray(raw, dtype=np.float64)
-        out = self._predict_with(self.params, raw) + self.offset
+        out = apply_correction(self.virtual_px(raw), self.coef, self.correction,
+                               self.screen_size) + self.offset
         return out[0] if raw.ndim == 1 else out
+
+    def predict_per_eye(self, raw) -> np.ndarray:
+        """(n, 2 olhos, 2) pixel do monitor real previsto por CADA olho sozinho
+        (feixe do olho no monitor virtual + a mesma correção e o mesmo offset).
+        NaN com o olho fechado. Usado nas métricas por olho da validação."""
+        per_eye = self.virtual_px_per_eye(np.atleast_2d(raw))
+        out = np.full(per_eye.shape, np.nan)
+        for k in range(2):
+            ok = np.all(np.isfinite(per_eye[:, k]), axis=1)
+            if ok.any():
+                out[ok, k] = apply_correction(per_eye[ok, k], self.coef, self.correction,
+                                              self.screen_size) + self.offset
+        return out
+
+    # -------------------------------------------------------------- postura
+    def posture_deviation(self, raw: np.ndarray) -> dict:
+        """Quanto a postura atual se afasta da calibração: ``ang`` (yaw, pitch:
+        graus além da faixa calibrada, >= 0) e ``pos_cm`` (deslocamento do rosto)."""
+        raw = np.atleast_2d(raw)
+        delta = np.abs(head_angles(raw)[0] - self.head_ref)
+        beyond = np.maximum(delta - self.head_span, 0.0)
+        return {"ang": beyond,
+                "pos_cm": float(np.linalg.norm(raw[0, RAW_FACE] - self.pos_ref))}
+
+    def correct_with_known_target(self, raw: np.ndarray, target, gain: float = 0.3,
+                                  max_step_px: float = 80.0) -> np.ndarray:
+        """Corrige o offset com amostras de um momento em que o usuário olhava
+        para um ponto CONHECIDO (ex.: centro da tecla selecionada). Move o
+        offset ``gain`` do caminho até o erro medido, limitado a ``max_step_px``.
+        Devolve a correção aplicada (px)."""
+        pred = np.nanmedian(np.atleast_2d(self.predict(np.atleast_2d(raw))), axis=0)
+        step = gain * (np.asarray(target, dtype=float) - pred)
+        if not np.all(np.isfinite(step)):
+            return np.zeros(2)
+        norm = float(np.linalg.norm(step))
+        if norm > max_step_px:
+            step *= max_step_px / norm
+        self.offset = self.offset + step
+        return step
 
     # ----------------------------------------------------------------- I/O
     def to_dict(self) -> dict:
         return {
             "feature_version": FEATURE_VERSION,
-            "degree": self.degree,
-            "ridge_alpha": self.ridge_alpha,
-            "eye_source": self.eye_source,
-            "params": [[c.tolist(), m.tolist(), s.tolist()] for c, m, s in self.params],
-            "eye_ref": self.eye_ref.tolist(),
+            "camera_hfov_deg": geometry.ASSUMED_HFOV_DEG,
+            "screen": {"size_px": list(self.screen.size_px), "width_cm": self.screen.width_cm,
+                       "gap_cm": self.screen.gap_cm},
+            "eyeball": self.eyeball.to_dict(),
+            "correction": self.correction,
+            "coef": self.coef.tolist(),
             "offset": self.offset.tolist(),
-            "screen_size": list(self.screen_size),
+            "head_ref": self.head_ref.tolist(),
+            "pos_ref": self.pos_ref.tolist(),
+            "head_span": self.head_span.tolist(),
+            "screen_size": list(self.screen.size_px),
             "created_at": self.created_at,
             "info": self.info,
         }
@@ -292,32 +313,60 @@ class CalibrationModel:
         if d.get("feature_version") != FEATURE_VERSION:
             print("[Calibração] Arquivo salvo é de uma versão antiga; recalibre.")
             return None
+        if abs(float(d.get("camera_hfov_deg", -1)) - geometry.ASSUMED_HFOV_DEG) > 1e-6:
+            print("[Calibração] Arquivo salvo é de outro campo de visão da câmera; recalibre.")
+            return None
         if tuple(d.get("screen_size", ())) != tuple(screen_size):
             print("[Calibração] Arquivo salvo é de outra resolução de tela; recalibre.")
             return None
-        m = cls(d["degree"], d.get("ridge_alpha"), d.get("eye_source", "mediapipe"))
-        m.params = [tuple(np.array(a) for a in p) for p in d["params"]]
-        m.eye_ref = np.array(d["eye_ref"])
+        return cls.from_dict(d)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CalibrationModel":
+        s = d["screen"]
+        m = cls(VirtualScreen(tuple(s["size_px"]), float(s["width_cm"]), float(s["gap_cm"])),
+                EyeballModel.from_dict(d["eyeball"]), d["correction"],
+                np.array(d["coef"], dtype=np.float64).reshape(-1, 2), fitted=True)
         m.offset = np.array(d.get("offset", [0.0, 0.0]))
-        m.screen_size = tuple(d["screen_size"])
+        m.head_ref = np.array(d.get("head_ref", [0.0, 0.0]))
+        m.pos_ref = np.array(d.get("pos_ref", [0.0, 0.0, 0.0]))
+        m.head_span = np.array(d.get("head_span", [0.0, 0.0]))
         m.created_at = d.get("created_at")
         m.info = d.get("info", {})
         return m
 
 
+# ------------------------------------------------------------------- dados
 @dataclass
 class CalibrationData:
-    """Amostras coletadas: por alvo da grade e na etapa de cabeça em movimento."""
+    """Amostras coletadas: por alvo da grade e na etapa da cabeça (opcional)."""
 
-    # lista de (alvo_px, features (n,2), raw (n,20))
+    # lista de (alvo_px, features (n, 2), raw (n, RAW_SIZE))
     grid: list = field(default_factory=list)
     head_target: tuple[float, float] | None = None
     head_features: np.ndarray | None = None
     head_raw: np.ndarray | None = None
-    # Opcional: landmarks de cada amostra (listas de FaceObservation), para
-    # recalcular as medidas com outra versão do estimador (tools/reavaliar.py).
+    # Landmarks de cada amostra (listas de FaceObservation), para recalcular
+    # as medidas com outra versão do estimador (tools/reavaliar.py).
     grid_obs: list = field(default_factory=list)
     head_obs: list = field(default_factory=list)
+    # Instante (s) de cada amostra da grade (mesma ordem de ``grid``).
+    grid_times: list = field(default_factory=list)
+    # Calibração por perseguição (procedures.CalibrationProcedure): um alvo em
+    # movimento; cada amostra tem o SEU alvo (posição do ponto naquele
+    # instante). Arrays (n, 2), (n, 2), (n, RAW_SIZE) e (n,).
+    pursuit_targets: np.ndarray | None = None
+    pursuit_features: np.ndarray | None = None
+    pursuit_raw: np.ndarray | None = None
+    pursuit_times: np.ndarray | None = None
+    pursuit_obs: list = field(default_factory=list)
+    # Versão do layout das medidas gravadas (``raw``). Diferente da atual:
+    # só serve depois de recalcular a partir dos landmarks.
+    feature_version: int = FEATURE_VERSION
+
+    @property
+    def stale(self) -> bool:
+        return self.feature_version != FEATURE_VERSION
 
     def save(self, path: Path):
         """Grava as medidas brutas (.npz) para reanálise offline."""
@@ -330,41 +379,49 @@ class CalibrationData:
             arrays[f"raw_{i}"] = np.atleast_2d(r)
             if i < len(self.grid_obs):
                 _pack_obs(arrays, f"obs_{i}", self.grid_obs[i])
+            if i < len(self.grid_times):
+                arrays[f"t_{i}"] = np.asarray(self.grid_times[i], dtype=float)
         if self.head_raw is not None:
             arrays["head_target"] = np.asarray(self.head_target, dtype=float)
             arrays["head_feats"] = np.atleast_2d(self.head_features)
             arrays["head_raw"] = np.atleast_2d(self.head_raw)
             _pack_obs(arrays, "obs_head", self.head_obs)
+        if self.pursuit_raw is not None and len(self.pursuit_raw):
+            arrays["pursuit_targets"] = np.atleast_2d(self.pursuit_targets)
+            arrays["pursuit_feats"] = np.atleast_2d(self.pursuit_features)
+            arrays["pursuit_raw"] = np.atleast_2d(self.pursuit_raw)
+            arrays["pursuit_t"] = np.asarray(self.pursuit_times, dtype=float)
+            _pack_obs(arrays, "obs_pursuit", self.pursuit_obs)
         np.savez_compressed(path, **arrays)
 
     @classmethod
     def load(cls, path: Path) -> "CalibrationData":
+        """Carrega um .npz gravado. Dados de etapas removidas (boca, checagens
+        de deriva) em gravações antigas são ignorados."""
         z = np.load(path)
-        data = cls()
+        data = cls(feature_version=int(z["feature_version"]) if "feature_version" in z else 0)
         i = 0
         while f"alvo_{i}" in z:
-            data.grid.append((tuple(z[f"alvo_{i}"]), z[f"feats_{i}"],
-                              _upgrade_raw(z[f"raw_{i}"])))
+            data.grid.append((tuple(z[f"alvo_{i}"]), z[f"feats_{i}"], z[f"raw_{i}"]))
             data.grid_obs.append(_unpack_obs(z, f"obs_{i}"))
+            if f"t_{i}" in z:
+                data.grid_times.append(z[f"t_{i}"])
             i += 1
+        if len(data.grid_times) != len(data.grid):
+            data.grid_times = []
         if "head_raw" in z:
             data.head_target = tuple(z["head_target"])
-            data.head_features, data.head_raw = z["head_feats"], _upgrade_raw(z["head_raw"])
+            data.head_features, data.head_raw = z["head_feats"], z["head_raw"]
             data.head_obs = _unpack_obs(z, "obs_head")
+        if "pursuit_raw" in z:
+            data.pursuit_targets, data.pursuit_features = z["pursuit_targets"], z["pursuit_feats"]
+            data.pursuit_raw, data.pursuit_times = z["pursuit_raw"], z["pursuit_t"]
+            data.pursuit_obs = _unpack_obs(z, "obs_pursuit")
         return data
 
     @property
     def has_landmarks(self) -> bool:
         return bool(self.grid_obs) and all(len(o) for o in self.grid_obs)
-
-
-def _upgrade_raw(raw: np.ndarray) -> np.ndarray:
-    """Sessões antigas (16 colunas, sem íris refinada): repete as medidas
-    do MediaPipe nas colunas da fonte refinada."""
-    raw = np.atleast_2d(raw)
-    if raw.shape[1] == 16:
-        raw = np.hstack([raw, raw[:, 12:16]])
-    return raw
 
 
 def _pack_obs(arrays: dict, key: str, observations: list):
@@ -393,75 +450,171 @@ def _unpack_obs(z, key: str) -> list:
     return out
 
 
+# --------------------------------------------------------------- ajuste
+def _candidates(n_targets: int, max_degree: int) -> list[tuple[str, float]]:
+    out = [("nenhuma", 0.0), ("deslocamento", 0.0)]
+    if n_targets >= 4:
+        out += [("afim", a) for a in ALPHAS]
+    if n_targets >= 9 and max_degree >= 2:
+        out += [("quadratica", a) for a in ALPHAS]
+    return out
+
+
 def fit_from_samples(
     data: CalibrationData,
     screen_size: tuple[int, int],
-    degree: int,
-    ridge_alpha: float | None,
-    mad_threshold: float,
-    head_weight_points: float = 1.0,
+    screen_width_cm: float | None = None,
+    mad_threshold: float = 3.5,
+    head_max_deg: tuple[float, float] | None = (15.0, 12.0),
+    max_degree: int = 2,
+    assumed_width_cm: float = 34.5,
+    corrections: tuple[str, ...] | None = None,
+    pupil_source: str | None = None,
+    correction: tuple[str, float] | None = None,
+    weight_eyes: bool = True,
+    pursuit_weight: float = 6.0,
 ) -> tuple[CalibrationModel, list[PointResult], dict]:
-    """Ajusta o modelo. Devolve (modelo, resultados por alvo, estatísticas)."""
-    raws, Ys, ws, gs, cleaned = [], [], [], [], []
+    """Ajusta o pipeline. Devolve (modelo, resultados por alvo, estatísticas).
+
+    screen_width_cm: largura física da tela (cm). Sem ela, o monitor virtual
+    usa ``assumed_width_cm`` e a correção absorve a diferença de escala.
+    max_degree: 1 = correções até afim; 2 = também a quadrática.
+    corrections: restringe os tipos de correção candidatos (análises offline).
+    correction: (tipo, alpha) fixo; a validação cruzada só mede o erro.
+    pupil_source: fonte da pupila (padrão: média do MediaPipe com a refinada,
+    se houver; nas sessões gravadas, errou menos que cada uma sozinha).
+    weight_eyes: peso de cada olho pelo seu erro (False: pesos iguais).
+    pursuit_weight: peso TOTAL das amostras da perseguição, em "número de
+    alvos fixos" (cada alvo fixo pesa 1). Elas entram sempre no treino; a
+    validação cruzada continua deixando de fora só os alvos fixos.
+    """
+    if data.stale:
+        raise ValueError("Medidas gravadas com outra versão do estimador; recalcule "
+                         "a partir dos landmarks (tools/reavaliar.py).")
+    screen = VirtualScreen(tuple(int(v) for v in screen_size),
+                           float(screen_width_cm or assumed_width_cm))
+    cleaned = []    # (índice, alvo, raw) de cada alvo utilizável
     for i, (target, feats, raw) in enumerate(data.grid):
-        keep = outlier_mask(feats, mad_threshold)
-        r = np.atleast_2d(raw)[keep]
-        cleaned.append((target, r))
-        raws.append(r)
-        Ys.append(np.tile(target, (len(r), 1)))
-        ws.append(np.full(len(r), 1.0 / len(r)))   # cada alvo pesa 1
-        gs.append(np.full(len(r), i))
+        raw = np.atleast_2d(raw)
+        if len(raw) < 3 or raw.shape[1] != RAW_SIZE:
+            continue   # alvo sem amostras suficientes (rosto perdido): ignora
+        cleaned.append((i, target, raw[outlier_mask(feats, mad_threshold)]))
+    if not cleaned:
+        raise ValueError("Nenhum alvo com amostras suficientes para calibrar.")
 
-    has_head = data.head_raw is not None and len(data.head_raw) >= 5
-    if has_head:
-        hr = np.atleast_2d(data.head_raw)
-        raws.append(hr)
-        Ys.append(np.tile(data.head_target, (len(hr), 1)))
-        # A etapa de cabeça pesa o equivalente a `head_weight_points` alvos.
-        ws.append(np.full(len(hr), head_weight_points / len(hr)))
-        gs.append(np.full(len(hr), -1))
+    raw_all = np.vstack([r for _, _, r in cleaned])
+    Y_all = np.vstack([np.tile(t, (len(r), 1)) for _, t, r in cleaned])
+    w_all = np.concatenate([np.full(len(r), 1.0 / len(r)) for _, _, r in cleaned])  # alvo pesa 1
+    g_all = np.concatenate([np.full(len(r), i) for i, _, r in cleaned])
+    # Perseguição: cada amostra com o seu alvo; sempre no treino (grupo -1).
+    n_pursuit = 0
+    pr = None if data.pursuit_raw is None else np.atleast_2d(data.pursuit_raw)
+    if pr is not None and len(pr) >= 20 and pr.shape[1] == RAW_SIZE and pursuit_weight > 0:
+        n_pursuit = len(pr)
+        raw_all = np.vstack([raw_all, pr])
+        Y_all = np.vstack([Y_all, np.atleast_2d(data.pursuit_targets)])
+        w_all = np.concatenate([w_all, np.full(n_pursuit, pursuit_weight / n_pursuit)])
+        g_all = np.concatenate([g_all, np.full(n_pursuit, -1)])
+    T_all = screen.px_to_cm(Y_all)
+    src = pupil_source or ("media" if has_refined_pupil(raw_all) else "mediapipe")
 
-    if len(data.grid) < 9:
-        degree = 1  # poucos alvos para os termos quadráticos
+    if correction is not None:
+        cands = [("nenhuma", 0.0), (correction[0], float(correction[1]))]
+    else:
+        # A perseguição cobre a tela de forma contínua: conta como alvos
+        # (pursuit_weight) para liberar correções com mais termos.
+        cands = _candidates(len(cleaned) + (int(pursuit_weight) if n_pursuit else 0),
+                            max_degree)
+        if corrections is not None:
+            cands = [c for c in cands if c[0] in corrections or c[0] == "nenhuma"]
 
-    raw_all, Y_all = np.vstack(raws), np.vstack(Ys)
-    w_all, g_all = np.concatenate(ws), np.concatenate(gs)
-    # Fontes da íris a testar: a refinada só se ela existir nesta sessão.
-    sources = ["mediapipe"]
-    if not np.allclose(raw_all[:, EYE_COLS["refinada"]], raw_all[:, EYE_COLS["mediapipe"]]):
-        sources.append("refinada")
-    candidates = []
-    for src in sources:
-        m = CalibrationModel(degree, ridge_alpha, src)
-        m.fit(raw_all, Y_all, w_all, screen_size, groups=g_all)
-        candidates.append(m)
-    # Escolhe pelo erro em alvos não vistos (LOO); sem LOO, fica no MediaPipe.
-    model = min(candidates, key=lambda m: m.info.get("erro_loo_medio_px", np.inf))
-    if "erro_loo_medio_px" not in model.info:
-        model = candidates[0]
-    model.info["usa_etapa_cabeca"] = bool(has_head)
-    model.info["fonte_iris"] = model.eye_source
-    for m in candidates:
-        if "erro_loo_medio_px" in m.info:
-            model.info[f"erro_loo_{m.eye_source}_px"] = m.info["erro_loo_medio_px"]
+    # Validação cruzada (um alvo fora por vez): o globo é reajustado sem ele e
+    # as correções candidatas são ajustadas sobre esse globo.
+    scores: dict = {}
+    if len(cleaned) >= 5:
+        preds = {c: {} for c in cands}
+        for g in np.unique(g_all[g_all >= 0]):
+            tr, te = g_all != g, g_all == g
+            eb = EyeballModel.fit(raw_all[tr], T_all[tr], w_all[tr], src,
+                                  weight_eyes=weight_eyes)
+            tmp = CalibrationModel(screen, eb)
+            V_tr, V_te = tmp.virtual_px(raw_all[tr]), tmp.virtual_px(raw_all[te])
+            for kind, alpha in cands:
+                coef = fit_correction(V_tr, Y_all[tr], w_all[tr], kind, alpha, screen_size)
+                preds[(kind, alpha)][int(g)] = apply_correction(V_te, coef, kind, screen_size)
+        for c in cands:
+            ids = sorted(preds[c])
+            errs = [float(np.hypot(*(np.nanmedian(preds[c][g], axis=0)
+                                     - Y_all[g_all == g][0]))) for g in ids]
+            scores[c] = (errs, ids)
+        if correction is not None:
+            best = cands[-1]
+        else:
+            kinds = None if corrections is None else (tuple(corrections) or ("nenhuma",))
+            allowed = [c for c in scores if kinds is None or c[0] in kinds]
+            best = min(allowed, key=lambda c: np.nanmean(scores[c][0]))
+    elif correction is not None:
+        best = cands[-1]
+    else:
+        best = ("deslocamento", 0.0) if corrections is None or "deslocamento" in corrections \
+            else ("nenhuma", 0.0)
+    kind, alpha = best
+
+    eyeball = EyeballModel.fit(raw_all, T_all, w_all, src, weight_eyes=weight_eyes)
+    model = CalibrationModel(screen, eyeball, kind, fitted=True)
+    V_all = model.virtual_px(raw_all)
+    model.coef = fit_correction(V_all, Y_all, w_all, kind, alpha, screen_size)
+    model.created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    resid = model.predict(raw_all) - Y_all
+    ok = np.all(np.isfinite(resid), axis=1)
+    info = {
+        "fonte_pupila": src, "correcao": kind, "ridge_alpha": float(alpha),
+        "largura_tela_cm": screen.width_cm, "largura_conhecida": bool(screen_width_cm),
+        "rmse_ajuste_px": float(np.sqrt(np.sum(w_all[ok] * np.sum(resid[ok] ** 2, 1))
+                                        / w_all[ok].sum())),
+        "globo": {name: {"raio_cm": float(eyeball.r[k]),
+                         "repouso_pupila_cm": eyeball.c[k].tolist(),
+                         "ganho_pupila": eyeball.gain[k].tolist(),
+                         "peso": float(eyeball.eye_weights[k])}
+                  for k, name in enumerate(EYE_NAMES)},
+        "erro_angular_ajuste_graus": eyeball.info.get("erro_angular_ajuste_graus"),
+        "n_alvos_fixos": len(cleaned),
+    }
+    if n_pursuit:
+        pe = np.hypot(*(model.predict(pr) - np.atleast_2d(data.pursuit_targets)).T)
+        info["n_perseguicao"] = n_pursuit
+        info["perseguicao_peso"] = float(pursuit_weight)
+        info["erro_ajuste_perseguicao_px"] = float(np.nanmedian(pe))
+    if scores:
+        errs, ids = scores[best]
+        info["erro_loo_medio_px"] = float(np.nanmean(errs))
+        info["erro_loo_por_alvo_px"] = [float(e) for e in errs]
+        info["erro_loo_alvos"] = [int(i) for i in ids]
+        info["erro_loo_monitor_virtual_px"] = float(np.nanmean(scores[("nenhuma", 0.0)][0]))
+        info["candidatos"] = [{"correcao": c[0], "alpha": c[1],
+                               "erro_loo_px": float(np.nanmean(v[0]))}
+                              for c, v in scores.items()]
+    model.info = info
+
+    # Postura de referência (aviso de postura fora da calibração), só dos
+    # alvos fixos.
+    fixed = g_all >= 0
+    angles = head_angles(raw_all[fixed])
+    model.head_ref = np.median(angles, axis=0)
+    model.head_span = np.percentile(np.abs(angles - model.head_ref), 95, axis=0)
+    model.pos_ref = np.median(raw_all[fixed][:, RAW_FACE], axis=0)
 
     results = []
-    for target, r in cleaned:
-        pred = np.median(model.predict(r), axis=0)
+    for _, target, r in cleaned:
+        pred = np.nanmedian(model.predict(r), axis=0)
         results.append(PointResult(target, (float(pred[0]), float(pred[1])), len(r)))
 
     stats = dict(model.info)
-    if has_head:
-        preds = model.predict(np.atleast_2d(data.head_raw))
-        err = np.hypot(*(preds - np.asarray(data.head_target)).T)
-        stats["erro_mediano_cabeca_px"] = float(np.median(err))
+    if data.head_raw is not None and len(np.atleast_2d(data.head_raw)) >= MIN_HEAD_TEST \
+            and np.atleast_2d(data.head_raw).shape[1] == RAW_SIZE:
+        head = head_test_error(model, data.head_raw, data.head_target, raw_all[g_all >= 0],
+                               head_max_deg)
+        model.info.update(head)
+        stats.update(head)
     return model, results, stats
-
-
-def uncalibrated_mapping(features: np.ndarray, screen_size: tuple[int, int],
-                         half_yaw: float, half_pitch: float) -> np.ndarray:
-    """Mapeamento linear fixo usado só para visualizar antes de calibrar."""
-    w, h = screen_size
-    x = w / 2 * (1 + features[0] / half_yaw)
-    y = h / 2 * (1 - features[1] / half_pitch)
-    return np.array([x, y])
